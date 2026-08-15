@@ -49,7 +49,7 @@ ComputePODDAtom::ComputePODDAtom(LAMMPS *lmp, int narg, char **arg) :
   memory->create(map, ntypes + 1, "compute_pod_global:map");
   map_element2type(narg - 5, arg + 5, podptr->nelements);
 
-  cutmax = podptr->rcut;
+  cutmax = podptr->rcutmax;
 
   nmax = 0;
   nijmax = 0;
@@ -134,7 +134,9 @@ void ComputePODDAtom::compute_peratom()
   int inum = list->inum;
   int nClusters = podptr->nClusters;
   int Mdesc = podptr->Mdesc;
-  double rcutsq = podptr->rcut*podptr->rcut;
+  int nelements = podptr->nelements;
+  bool localeapod = podptr->localeapod;
+  double **rcutsq = podptr->rcutsq;
 
   // determine the maximum number of neighbor list candidates for all local atoms
   // and allocate temporary memory accordingly.  a minimum of one guarantees that
@@ -158,21 +160,25 @@ void ComputePODDAtom::compute_peratom()
 
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
-
+    
     // get neighbor list for atom i
-    lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, i);
+    lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, nelements, i);
 
     if (nij > 0) {
       // peratom base descriptors
       double *bd = &podptr->bd[0];
       double *bdd = &podptr->bdd[0];
-      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, tj, nij);
+      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
 
       if (nClusters>1) {
         // peratom env descriptors
         double *pd = &podptr->pd[0];
         double *pdd = &podptr->pdd[0];
-        podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0] - 1,  nij);
+        if (localeapod) {
+          podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+        } else {
+          podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+        }
         for (int n=0; n<nij; n++) {
           int ain = 3*ai[n];
           int ajn = 3*aj[n];
@@ -223,26 +229,27 @@ double ComputePODDAtom::memory_usage()
 
 
 void ComputePODDAtom::lammpsNeighborList(double **x, int **firstneigh, tagint *atomid, int *atomtypes,
-                               int *numneigh, double rcutsq, int gi)
+                               int *numneigh, double **rcutsq, int nelements, int gi)
 {
   nij = 0;
-  int itype = map[atomtypes[gi]] + 1;
+  int itype = map[atomtypes[gi]];
   ti[nij] = itype;
   int m = numneigh[gi];
   for (int l = 0; l < m; l++) {           // loop over each atom around atom i
     int gj = firstneigh[gi][l];           // atom j
+    int jtype = map[atomtypes[gj]];   // type of neighboring atom j
     double delx = x[gj][0] - x[gi][0];    // xj - xi
     double dely = x[gj][1] - x[gi][1];    // xj - xi
     double delz = x[gj][2] - x[gi][2];    // xj - xi
     double rsq = delx * delx + dely * dely + delz * delz;
-    if (rsq < rcutsq && rsq > 1e-20) {
+    if (rsq < rcutsq[itype][jtype] && rsq > 1e-20) {
       rij[nij * 3 + 0] = delx;
       rij[nij * 3 + 1] = dely;
       rij[nij * 3 + 2] = delz;
       ai[nij] = atomid[gi]-1;
       aj[nij] = atomid[gj]-1;
       ti[nij] = itype;
-      tj[nij] = map[atomtypes[gj]] + 1;
+      tj[nij] = jtype;
       nij++;
     }
   }

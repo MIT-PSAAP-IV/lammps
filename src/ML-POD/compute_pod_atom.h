@@ -33,7 +33,7 @@ class ComputePODAtom : public Compute {
   void compute_peratom() override;
   double memory_usage() override;
   void lammpsNeighborList(double **x, int **firstneigh, tagint *atomid, int *atomtype,
-                          int *numneigh, double rcutsq, int i);
+                          int *numneigh, double **rcutsq, int nelements, int i);
   void map_element2type(int narg, char **arg, int nelements);
 
  private:
@@ -53,6 +53,10 @@ class ComputePODAtom : public Compute {
   int *aj;    // IDs of atoms J for all pairs (I, J)
   int *ti;    // types of atoms I for all pairs (I, J)
   int *tj;    // types of atoms J  for all pairs (I, J)
+
+  //int uncertaintyflag;   // 1 => output 8 AL uncertainty columns instead of descriptors
+  double *uqmetrics;
+  double uqout[9];
 };
 
 }    // namespace LAMMPS_NS

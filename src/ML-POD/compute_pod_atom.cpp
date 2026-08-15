@@ -34,27 +34,32 @@ enum { SCALAR, VECTOR, ARRAY };
 ComputePODAtom::ComputePODAtom(LAMMPS *lmp, int narg, char **arg) :
     Compute(lmp, narg, arg), list(nullptr), podptr(nullptr), pod(nullptr), tmpmem(nullptr),
     rij(nullptr), elements(nullptr), map(nullptr), ai(nullptr), aj(nullptr), ti(nullptr),
-    tj(nullptr)
+    tj(nullptr), uqmetrics(nullptr)
 {
   int nargmin = 6;
 
   if (narg < nargmin) error->all(FLERR, "Illegal compute {} command", style);
-  if (comm->nprocs > 1) error->all(FLERR, "compute command does not support multi processors");
 
   std::string pod_file = std::string(arg[3]);      // pod input file
   std::string coeff_file = std::string(arg[4]);    // coefficient input file
   podptr = new EAPOD(lmp, pod_file, coeff_file);
 
+  if (podptr->uncertaintyflag) {
+    memory->destroy(uqmetrics);
+    int tmpmemuq = 5*podptr->nClusters + podptr->nComponents + 3*podptr->Mdesc + 9;
+    memory->create(uqmetrics, tmpmemuq, "compute_pod_atom:unc");
+  }
+
   int ntypes = atom->ntypes;
-  memory->create(map, ntypes + 1, "compute_pod_global:map");
+  memory->create(map, ntypes + 1, "compute_pod_atom:map");
   map_element2type(narg - 5, arg + 5, podptr->nelements);
 
-  cutmax = podptr->rcut;
-
+  cutmax = podptr->rcutmax;
   nmax = 0;
   nijmax = 0;
 
-  size_peratom_cols = podptr->Mdesc * podptr->nClusters;
+  if (podptr->uncertaintyflag) size_peratom_cols = 9;
+  else                         size_peratom_cols = podptr->Mdesc * podptr->nClusters;
   peratom_flag = 1;
 }
 
@@ -66,6 +71,7 @@ ComputePODAtom::~ComputePODAtom()
     for (int i = 0; i < atom->ntypes; i++) delete[] elements[i];
     delete[] elements;
   }
+  memory->destroy(uqmetrics);
   memory->destroy(map);
   memory->destroy(pod);
   delete podptr;
@@ -108,8 +114,8 @@ void ComputePODAtom::compute_peratom()
   if (atom->natoms > nmax) {
     memory->destroy(pod);
     nmax = atom->natoms;
-    int numdesc = podptr->Mdesc * podptr->nClusters;
-    memory->create(pod, nmax, numdesc,"sna/atom:sna");
+    size_array_rows = nmax;
+    memory->create(pod, size_array_rows, size_peratom_cols, "pod/atom:pod");
     array_atom = pod;
   }
 
@@ -128,9 +134,13 @@ void ComputePODAtom::compute_peratom()
   int *type = atom->type;
   int *ilist = list->ilist;
   int inum = list->inum;
+  int nelements = podptr->nelements;
   int nClusters = podptr->nClusters;
   int Mdesc = podptr->Mdesc;
-  double rcutsq = podptr->rcut*podptr->rcut;
+  bool eapod = podptr->eapod;
+  bool localeapod = podptr->localeapod;
+  bool uncertaintyflag = podptr->uncertaintyflag;
+  double **rcutsq = podptr->rcutsq;
 
   // determine the maximum number of neighbor list candidates for all local atoms
   // and allocate temporary memory accordingly.  a minimum of one guarantees that
@@ -156,29 +166,30 @@ void ComputePODAtom::compute_peratom()
     int i = ilist[ii];
 
     // get neighbor list for atom i
-    lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, i);
+    lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, nelements, i);
 
     if (nij > 0) {
-      // peratom base descriptors
-      double *bd = &podptr->bd[0];
+      double *bd  = &podptr->bd[0];
       double *bdd = &podptr->bdd[0];
-      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, tj, nij);
+      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
 
-      if (nClusters>1) {
-        // peratom env descriptors
-        double *pd = &podptr->pd[0];
+      if (uncertaintyflag) {
+        podptr->peratom_uncertainty(uqout, bd, bdd, nij, uqmetrics, ti);
+        for (int m = 0; m < 9; m++) pod[i][m] = uqout[m];
+      }
+      else if (eapod) {
+        double *pd  = &podptr->pd[0];
         double *pdd = &podptr->pdd[0];
-        podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0] - 1,  nij);
+        if (localeapod)
+          podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+        else
+          podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
         for (int k = 0; k < nClusters; k++)
-          for (int m = 0; m < Mdesc; m++) {
-            int mk = m + Mdesc*k;
-            pod[i][mk] = pd[k]*bd[m];
-          }
+          for (int m = 0; m < Mdesc; m++)
+            pod[i][m + Mdesc * k] = pd[k] * bd[m];
       }
       else {
-        for (int m = 0; m < Mdesc; m++) {
-         pod[i][m] = bd[m];
-        }
+        for (int m = 0; m < Mdesc; m++) pod[i][m] = bd[m];
       }
     }
   }
@@ -196,26 +207,27 @@ double ComputePODAtom::memory_usage()
 }
 
 void ComputePODAtom::lammpsNeighborList(double **x, int **firstneigh, tagint *atomid, int *atomtypes,
-                               int *numneigh, double rcutsq, int gi)
+                               int *numneigh, double **rcutsq, int nelements, int gi)
 {
   nij = 0;
-  int itype = map[atomtypes[gi]] + 1;
-  int m = numneigh[gi];
+  int itype = map[atomtypes[gi]];
   ti[nij] = itype;
+  int m = numneigh[gi];
   for (int l = 0; l < m; l++) {           // loop over each atom around atom i
     int gj = firstneigh[gi][l];           // atom j
+    int jtype = map[atomtypes[gj]];   // type of neighboring atom j
     double delx = x[gj][0] - x[gi][0];    // xj - xi
     double dely = x[gj][1] - x[gi][1];    // xj - xi
     double delz = x[gj][2] - x[gi][2];    // xj - xi
     double rsq = delx * delx + dely * dely + delz * delz;
-    if (rsq < rcutsq && rsq > 1e-20) {
+    if (rsq < rcutsq[itype][jtype] && rsq > 1e-20) {
       rij[nij * 3 + 0] = delx;
       rij[nij * 3 + 1] = dely;
       rij[nij * 3 + 2] = delz;
       ai[nij] = atomid[gi]-1;
       aj[nij] = atomid[gj]-1;
       ti[nij] = itype;
-      tj[nij] = map[atomtypes[gj]] + 1;
+      tj[nij] = jtype;
       nij++;
     }
   }

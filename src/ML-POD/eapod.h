@@ -56,79 +56,128 @@ class EAPOD : protected Pointers {
 
   void init4body(int Pa4);
 
-  void snapshots(double *rbf, double *xij, int N);
-
-  void eigenvaluedecomposition(double *Phi, double *Lambda, int N);
-
+  void eigenvaluedecomposition(double *Phi, double *Lambda, double rin, double rmax, int N);
+  
   void myneighbors(double *rij, double *x, int *ai, int *aj, int *ti, int *tj, int *jlist,
                    int *pairnumsum, int *atomtype, int *alist, int i);
+  
+  void init_bessel_const();
 
-  void radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz, double *rij,
-                   double *besselparams, double rin, double rmax, int besseldegree,
-                   int inversedegree, int nbesselpars, int N);
+  void init_spline_radialbasis();
+  void radialbasis_spline(double *rbf, double *rbfx, double *rbfy, double *rbfz,
+                          double *rij, int *ti, int *tj, int N);
 
+  void radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz, double *rij, double **rin, double **invrdiff,
+                   int *ti, int *tj, int besseldegree, int inversedegree, int nbesselpars, int N);
+  
+  void radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
+                 double *rbft, double *rbfxt, double *rbfyt, double *rbfzt,
+                 int *ti, int *tj, int N);
+  
+  void radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
+                 double *rbft, double *rbfxt, double *rbfyt, double *rbfzt, int N);
+  
   void angularbasis(double *abf, double *abfx, double *abfy, double *abfz, double *rij, double *tm,
                     int *pq, int N, int K);
-
+  
   void radialangularbasis(double *sumU, double *U, double *Ux, double *Uy, double *Uz, double *rbf,
                           double *rbfx, double *rbfy, double *rbfz, double *abf, double *abfx,
-                          double *abfy, double *abfz, int *atomtype, int N, int K, int M, int Ne);
-
-  void MatMul(double *c, double *a, double *b, int r1, int c1, int c2);
-
-  void scalarproduct(double *d, double c, int N);
-
-  double dotproduct(double *c, double *d, int ndesc);
-
-  void mvproduct(double *fij, double *c, double *dd, int N, int ndesc);
+                          double *abfy, double *abfz, double *tm, int *atomtype, int N, int K, int M, int Ne);
 
  public:
   std::vector<std::string> species;
 
-  double rin;
-  double rcut;
+  struct BesselConst {
+    double neg_alpha;
+    double pi_inv_t1;
+    double dx_factor;
+  };
+
+  std::vector<BesselConst> bessel_const_storage;
+  // bessel_const[ntypes][ntypes][nbesselpars]
+  inline const BesselConst* bessel_const(int it, int jt) const {
+   return &bessel_const_storage[(it * nelements + jt) * nbesselpars];
+  }
+
+  int **elemindex;
+  double **rin;
+  double **rcut;
+  double **rcutsq;
+  double **rdiff;
+  double **invrdiff;
+  double rcutmax;
+  double rinmin;
+  double rdiffmax;
+  double invrdiffmax;
   int true4BodyDesc;
 
   int nelements;    // number of elements
   int pbc[3];
-  int *elemindex;
 
   int onebody;    // one-body descriptors
+  int nbesselrbf;
   int besseldegree;
   int inversedegree;
-  int pdegree[2];
   int nbesselpars;
   int timing;
   double comptime[20];
-  double besselparams[3];
+  double *besselparams;
   double *Phi;       // eigenvectors
   double *Lambda;    // eigenvalues
   double *coeff;     // coefficients
+  // --- precomputed radial-basis spline (fast inference path) ---
+  bool use_spline;          // enable cubic-Hermite spline evaluation of rbf
+  int  nspline_grid;        // number of spline nodes per element pair
+  int  nspline_bins;        // = nspline_grid - 1
+  double *rbf_spline_coeffs;// [pair][bin][k][4] cubic Hermite coeffs (in local t)
+  double *spline_r0;        // [nelements*nelements] grid start (r) per pair
+  double *spline_invdr;     // [nelements*nelements] 1/bin-width per pair
   //double *newcoeff ;  // coefficients
   double *tmpmem;
 
   // environmental variables
+  bool uncertaintyflag;
+  bool eapod; // flag for EAPOD
+  bool localeapod; // flag for Local-EAPOD
   int nClusters;      // number of environment clusters
+  int clusterSearchBox; // Range to search for active clusters around centroids
+  int nMaxActiveClusters; // maximum (possible) number of active clusters
   int nComponents;    // number of principal components
   //int nNeighbors; // numbe of neighbors
   int Mdesc;    // number of base descriptors
+  double nActiveClusters; // average number of active clusters
 
   double *Proj;         // PCA Projection matrix
   double *Centroids;    // centroids of the clusters
+  double *ClusterFcut;        // Cutoff values from the cut-off function for each atom (nClusters)
+  double *ClusterDFcut;       // Cutoff values from the derivative of the cut-off function for each atom (nClusters)
+  double *invLeftClusterRcut2;   // Left-hand side squared cutoff redius for each cluster (nClusters)
+  double *invRightClusterRcut2;  // Right-hand side squared cutoff redius for each cluster (nClusters)
+  double *leftClusterEdges;   // Left-hand side edge activation position for each cluster (nClusters)
+  double *rightClusterEdges;  // Right-hand side edge activation position for each cluster (nClusters)
+  double *invPcaSpan;         // 1/(span centroid) per PCA component and element type (nComponents*nelements)
+  int *clusterOccupancy;      // training-atom count per cluster and element type (nClusters*nelements)
+
   double *bd;           // base descriptors
   double *bdd;          // derivatives of the base descriptors with respect to the atomic positions
   double *pd;           //  multi-environment descriptors
-  double *
-      pdd;    // derivative of the multi-environment descriptors with respect to the atomic positions
+  double *pdd;          // derivative of the multi-environment descriptors with respect to the atomic positions
 
   int nproj;         // number of elements in projection matrix (nComponents * Mdesc * nelements)
   int ncentroids;    // number of centroids (nComponents * nClusters * nelements)
+
+  int hat_p;   // order of hat basis function (cluster)
+  int hat_q;   // order of hat function (cluster)
+  int hat_p1;
+  int hat_q1;
+  int h_pq;
 
   int Njmax;
   int nCoeffPerElement;    // number of coefficients per element = (nl1 + Mdesc*nClusters)
   int nCoeffAll;    // number of coefficients for all elements = (nl1 + Mdesc*nClusters)*nelements
   int ncoeff;       // number of coefficients in the input file
   int ns;           // number of snapshots for radial basis functions
+
   int nd1, nd2, nd3, nd4, nd5, nd6, nd7, nd;    // number of global descriptors
   int nl1, nl2, nl3, nl4, nl5, nl6, nl7, nl;    // number of local descriptors
   int nrbf2, nrbf3, nrbf4, nrbfmax;             // number of radial basis functions
@@ -136,10 +185,17 @@ class EAPOD : protected Pointers {
   int P3, P4;                                   // angular polynomial degrees
   int K3, K4, Q4;                               // number of monomials
   int *pn3, *pq3, *pc3;                         // arrays to compute 3-body angular basis functions
-  int *pq4, *pa4, *pb4, *pc4;                   // arrays to compute 3-body angular basis functions
+  int *pa4, *pb4, *pc4;                         // arrays to compute 4-body angular basis functions
   int *tmpint;
   int nintmem;    // number of integers in tmpint array
   int ndblmem;    // number of doubles in tmpmem array
+
+  int L3min, L3max;
+  int L4min, L4max;
+
+  int nabf3_active, nabf4_active;
+  int *p3_active, *p4_active;         // dense active -> full channel index
+  int *dabf3_active, *dabf4_active;   // degree per active channel
 
   // four-body descriptors
   int *ind23, *ind32, nrbf23, nabf23, P23, n23, n32, nl23, nd23;
@@ -163,9 +219,7 @@ class EAPOD : protected Pointers {
 
   void read_pod_file(const std::string &pod_file);
   void read_model_coeff_file(const std::string &coeff_file);
-  int read_coeff_file(const std::string &coeff_file);
-  int read_projection_matrix(const std::string &proj_file);
-  int read_centroids(const std::string &centroids_file);
+  void read_cluster_occupancy_file(const std::string &coeff_file);
 
   int estimate_temp_memory(int Nj);
   void free_temp_memory();
@@ -175,20 +229,42 @@ class EAPOD : protected Pointers {
 
   void mknewcoeff(double *c, int nc);
 
-  void twobodydesc(double *d2, double *rbf, int *tj, int N);
+  static inline int binom(int n, int k);
+  static inline int npa(int d);
+  static inline int nmono(int d);
+  static inline int trinom(int p, int q, int r);
+  static inline int monomial_idx(int p, int q, int r);
+  static inline int fourbody_channels(int Pa, int *pa, int *deg);
+
+  void snapshots(double *rbf, double *xij, double rin, double rmax, int N);
+  void init_active_angular_ranges();
+
+  static inline void cutoff_exp(double r, double invrmax, double e_v, double &fcut, double &dfcut);
+  static inline void cutoff_poly_sq(double r, double invrmax, double &fcut, double &dfcut);
+  static inline void cutoff_hat(double r, double invrmax, double &fcut, double &dfcut);
+  static inline void cluster_cutoff_hat(double pc, double inv_rcut2, double &fcut, double &dfcut);
+  static inline void cluster_cutoff_poly_sq(double pc, double inv_rcut2, double &fcut, double &dfcut);
+  static inline void cluster_cutoff_hat_train(double u, double &fcut, double &dfcut_du);
+  static inline void cluster_cutoff_poly_sq_train(double u, double &fcut, double &dfcut);
+
+  static inline void find_active_clusters(double pca, double* ledges, double* redges,
+                                          const int nClusters, const int nMaxActiveClusters,
+                                          int& ks, int& ke);
+
+  void twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne);
   void twobodydescderiv(double *d2, double *dd2, double *rbf, double *rbfx, double *rbfy,
                         double *rbfz, int *tj, int N);
   void twobody_forces(double *fij, double *cb2, double *rbfx, double *rbfy, double *rbfz, int *tj,
                       int Nj);
 
-  void threebodydesc(double *d3, double *sumU);
+  void threebodydesc(double *d3, double *sumU, int Ne);
   void threebodydescderiv(double *dd3, double *sumU, double *Ux, double *Uy, double *Uz,
-                          int *atomtype, int N);
+                          int *tj, int N);
   void threebody_forcecoeff(double *fb3, double *cb3, double *sumU);
 
   void fourbodydesc(double *d4, double *sumU);
   void fourbodydescderiv(double *d4, double *dd4, double *sumU, double *Ux, double *Uy, double *Uz,
-                         int *atomtype, int N);
+                         int *tj, int N);
   void fourbody_forcecoeff(double *fb4, double *cb4, double *sumU);
 
   void allbody_forces(double *fij, double *forcecoeff, double *rbf, double *rbfx, double *rbfy,
@@ -203,13 +279,17 @@ class EAPOD : protected Pointers {
   void descriptors(double *gd, double *gdd, double *basedesc, double *x, int *atomtype, int *alist,
                    int *jlist, int *pairnumsum, int natom);
 
-  void peratombase_descriptors(double *bd, double *bdd, double *rij, double *temp, int *tj, int Nj);
+  void peratombase_descriptors(double *bd, double *bdd, double *rij, double *temp, int *ti, int *tj, int Nj);
   double peratombase_coefficients(double *cb, double *bd, int *ti);
   double peratom_environment_descriptors(double *cb, double *bd, double *tm, int *ti);
+  double peratom_local_environment_descriptors(double *cb, double *bd, double *tm, int *ti);
 
   void peratomenvironment_descriptors(double *P, double *dP_dR, double *B, double *dB_dR,
                                       double *tmp, int elem, int nNeighbors);
 
+  void peratomlocalenvironment_descriptors(double *P, double *dP_dR, double *B, double *dB_dR,
+                                      double *tmp, int elem, int nNeighbors);
+  
   void base_descriptors(double *basedesc, double *x, int *atomtype, int *alist, int *jlist,
                         int *pairnumsum, int natom);
 
@@ -232,6 +312,14 @@ class EAPOD : protected Pointers {
                       int *ind2, int n12, int N);
   void crossdesc_reduction(double *cb1, double *cb2, double *c12, double *d1, double *d2, int *ind1,
                            int *ind2, int n12);
+
+  void calculateClusterEdges(int nClusters, double nActiveClusters, int nComponents, int nelements);
+
+  void calculatePcaSpan();
+
+  void peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti);
+
+  
 };
 
 }    // namespace LAMMPS_NS

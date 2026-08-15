@@ -77,7 +77,7 @@ class FitPOD : public Command {
     std::unordered_map<std::string, double> we_map;
     std::unordered_map<std::string, double> wf_map;
 
-    double fitting_weights[12];
+    double fitting_weights[24];
   };
 
   struct neighborstruct {
@@ -113,12 +113,18 @@ class FitPOD : public Command {
 
   int save_descriptors;
   int compute_descriptors;
+  int save_pca_histogram;      // 0/1 flag: write PCA descriptor histogram
+  int pca_histogram_num_bins;  // number of in-span bins
   datastruct traindata;
   datastruct testdata;
   datastruct envdata;
   descriptorstruct desc;
   neighborstruct nb;
   class EAPOD *fastpodptr;
+
+  double *radialW0;
+  double *radialW1;
+  double *radialW2;
 
   // functions for collecting/collating arrays
   void podCumsum(int *output, int *input, int length);
@@ -174,26 +180,41 @@ class FitPOD : public Command {
   void select_data(datastruct &newdata, const datastruct &data);
   void read_data_files(const std::string &data_file, const std::vector<std::string> &species);
   int latticecoords(double *y, int *alist, double *x, double *a1, double *a2, double *a3,
-                    double rcut, int *pbc, int nx);
-  int podneighborlist(int *neighlist, int *numneigh, double *r, double rcutsq, int nx, int N,
-                      int dim);
-  int podfullneighborlist(double *y, int *alist, int *neighlist, int *numneigh, int *numneighsum,
-                          double *x, double *a1, double *a2, double *a3, double rcut, int *pbc,
-                          int nx);
-  void estimate_memory_neighborstruct(const datastruct &data, int *pbc, double rcut, int nelements);
+                    double rcutmax, int *pbc, int nx);
+  int podfullneighborlist(double *y, int *alist, int *neighlist, int *numneigh,
+                          int *numneighsum, double *x, double *a1, double *a2, 
+                          double *a3, double **rcutsq, int *pbc, int *atomtype, 
+                          int nx, int nelements);
+  int podneighborlist(int *neighlist, int *numneigh, double *r, double **rcutsq,
+                      int *atomtype, int *alist, int nx, int N, int dim, int nelements);
+  void estimate_memory_neighborstruct(const datastruct &data, int *pbc, double rcutmax, int nelements);
   void allocate_memory_neighborstruct();
   void allocate_memory_descriptorstruct(int nd);
   void estimate_memory_fastpod(const datastruct &data);
+  void deallocate_memory_datastruct(datastruct &data);
   void local_descriptors_fastpod(const datastruct &data, int ci);
   void base_descriptors_fastpod(const datastruct &data, int ci);
-  void least_squares_matrix(const datastruct &data, int ci);
+  void least_squares_matrix(const datastruct &data, int ci, double eweight, double *fweight);
   void least_squares_fit(const datastruct &data);
   void descriptors_calculation(const datastruct &data);
   void environment_cluster_calculation(const datastruct &data);
+  void environment_proj_calculation(const datastruct &data);
+  void training_cluster_calculation(const datastruct &data);
+  void environment_pipeline(const datastruct &data, int mode);
+// mode: 0 = env clusters (proj + kmeans),
+//       1 = projection only,
+//       2 = training kmeans only (uses existing projection)
+
   void print_analysis(const datastruct &data, double *outarray, double *errors);
   void error_analysis(const datastruct &data, double *coeff);
   double energyforce_calculation_fastpod(double *force, const datastruct &data, int ci);
   void energyforce_calculation(const datastruct &data);
+
+  void compute_loss_weights(const datastruct &data, double *ew, double *fw);
+  void add_radial_smoothness(double *A, int nCoeffAll, double w0, double w1, double w2);
+  void build_pair_distance_density(const datastruct &data, std::vector<double> &rho, int Nrho);
+  inline void radial_smoothness_matrices(double *rho = nullptr, int Nrho = 0, double eps = 0.0);
+  inline void radial_regularization_matrix(double *Wreg, double w0, double w1, double w2);
 };
 }    // namespace LAMMPS_NS
 #endif
