@@ -100,7 +100,8 @@ FitPOD::descriptorstruct::descriptorstruct() :
   nClusters = 0;
 }
 
-FitPOD::FitPOD(LAMMPS *_lmp) : Command(_lmp), fastpodptr(nullptr)
+FitPOD::FitPOD(LAMMPS *_lmp) : Command(_lmp), fastpodptr(nullptr),
+              radialW0(nullptr), radialW1(nullptr), radialW2(nullptr)
 {
   save_descriptors = 0;
   compute_descriptors = 0;
@@ -139,7 +140,7 @@ void FitPOD::command(int narg, char **arg)
   estimate_memory_fastpod(testdata);
   allocate_memory_descriptorstruct(fastpodptr->nCoeffAll);
 
-  if (coeff_file != "") podArrayCopy(desc.c, fastpodptr->coeff, fastpodptr->nCoeffAll);
+  if (!coeff_file.empty()) podArrayCopy(desc.c, fastpodptr->coeff, fastpodptr->nCoeffAll);
 
   if (((int) envdata.data_path.size() > 1)) {
     const bool same_env_and_train_path = (envdata.data_path == traindata.data_path);
@@ -165,7 +166,7 @@ void FitPOD::command(int narg, char **arg)
   if (compute_descriptors == 0) {
 
     // compute POD coefficients using least-squares method
-    if (coeff_file == "") {
+    if (coeff_file.empty()) {
       least_squares_fit(traindata);
 
       if (comm->me == 0) {    // save coefficients into a text file
@@ -261,6 +262,10 @@ void FitPOD::command(int narg, char **arg)
   memory->destroy(nb.pairlist);
   memory->destroy(nb.y);
 
+  memory->destroy(radialW0);
+  memory->destroy(radialW1);
+  memory->destroy(radialW2);
+
   delete fastpodptr;
 }
 
@@ -308,7 +313,7 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
       // ignore
     }
 
-    if (words.size() == 0) continue;
+    if (words.empty()) continue;
 
     auto keywd = words[0];
 
@@ -526,7 +531,7 @@ int FitPOD::get_number_atom_exyz(std::vector<int> &num_atom, int &num_atom_sum, 
       // ignore
     }
 
-    if (words.size() == 0) continue;
+    if (words.empty()) continue;
 
     int natom;
     if (words.size() == 1) {
@@ -599,7 +604,7 @@ void FitPOD::read_exyz_file(double *lattice, double *stress, double *energy, dou
       // ignore
     }
 
-    if (words.size() == 0) continue;
+    if (words.empty()) continue;
 
     ValueTokenizer text(utils::trim_comment(line), "\"' \t\n\r\f");
     if (text.contains("attice")) {
@@ -743,7 +748,7 @@ void FitPOD::get_data(datastruct &data, const std::vector<std::string> &species)
     utils::logmesg(lmp, "number of atoms in all files: {}\n", data.num_atom_sum);
   }
 
-  if (data.data_files.size() < 1)
+  if (data.data_files.empty())
     error->all(FLERR,
                "Cannot fit potential without data files. The data paths may not be valid. Please "
                "check the data paths in the POD data file.");
@@ -1781,17 +1786,24 @@ void FitPOD::least_squares_fit(const datastruct &data)
   std::vector<double> fwt(data.num_atom_sum);
   compute_loss_weights(data, ew.data(), fwt.data());
 
-  int  adapt = (int) data.fitting_weights[22];
-  double eps = data.fitting_weights[23];
+  const double sw0 = data.fitting_weights[18];
+  const double sw1 = data.fitting_weights[19];
+  const double sw2 = data.fitting_weights[20];
+  const bool need_smooth = (sw0 != 0.0) || (sw1 != 0.0) || (sw2 != 0.0);
+
+  int    adapt = (int) data.fitting_weights[22];
+  double eps   = data.fitting_weights[23];
   if (eps <= 0.0) eps = 1e-2;
 
-  if (adapt) {
-    const int Nrho = 200;
-    std::vector<double> rho;
-    build_pair_distance_density(data, rho, Nrho);
-    radial_smoothness_matrices(rho.data(), Nrho, eps);  // density-adaptive
-  } else {
-    radial_smoothness_matrices(nullptr, 0, 0.0);        // uniform gains
+  if (need_smooth) {
+    if (adapt) {
+      const int Nrho = 200;
+      std::vector<double> rho;
+      build_pair_distance_density(data, rho, Nrho);
+      radial_smoothness_matrices(rho.data(), Nrho, eps);
+    } else {
+      radial_smoothness_matrices(nullptr, 0, 0.0);
+    }
   }
 
   for (int ci = 0; ci < nconfig; ci++) {
@@ -1981,6 +1993,8 @@ inline void FitPOD::radial_smoothness_matrices(double *rho, int Nrho, double eps
   double rcutmax = fastpodptr->rcutmax;
   double rdiffmax = fastpodptr->rdiffmax;
   double *Phi = fastpodptr->Phi;
+
+  if (radialW0 != nullptr) return;   // build once
 
   int N = 2000;
   double *xij, *S, *Q, *D1, *D2, *tw, *r2, *gain;

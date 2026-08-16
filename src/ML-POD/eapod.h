@@ -196,6 +196,7 @@ class EAPOD : protected Pointers {
   int nabf3_active, nabf4_active;
   int *p3_active, *p4_active;         // dense active -> full channel index
   int *dabf3_active, *dabf4_active;   // degree per active channel
+  int *deg4_full;   // per-channel angular degree for full 4-body enumeration (length nabf4)
 
   // four-body descriptors
   int *ind23, *ind32, nrbf23, nabf23, P23, n23, n32, nl23, nd23;

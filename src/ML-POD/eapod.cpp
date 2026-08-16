@@ -50,7 +50,8 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
     pb4(nullptr), pc4(nullptr), tmpint(nullptr), ind23(nullptr), ind32(nullptr), ind33(nullptr),
     ind34(nullptr), ind43(nullptr), ind44(nullptr), ind33l(nullptr), ind33r(nullptr),
     ind34l(nullptr), ind34r(nullptr), ind44l(nullptr), ind44r(nullptr),
-    p3_active(nullptr), p4_active(nullptr), dabf3_active(nullptr), dabf4_active(nullptr),
+    p3_active(nullptr), dabf3_active(nullptr),
+    p4_active(nullptr), dabf4_active(nullptr), deg4_full(nullptr),
     rbf_spline_coeffs(nullptr), spline_r0(nullptr), spline_invdr(nullptr)
 {
   nelements = 1;
@@ -108,7 +109,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   // read pod input file to podstruct
   read_pod_file(pod_file);
 
-  if (coeff_file != "") {
+  if (!coeff_file.empty()) {
     read_model_coeff_file(coeff_file);
   }
 }
@@ -161,6 +162,7 @@ EAPOD::~EAPOD()
   memory->destroy(p4_active);
   memory->destroy(dabf3_active);
   memory->destroy(dabf4_active);
+  memory->destroy(deg4_full);
   memory->destroy(rbf_spline_coeffs);
   memory->destroy(spline_r0);
   memory->destroy(spline_invdr);
@@ -204,7 +206,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
       // ignore
     }
 
-    if (words.size() == 0) continue;
+    if (words.empty()) continue;
 
     const auto &keywd = words[0];
 
@@ -340,15 +342,12 @@ void EAPOD::read_pod_file(const std::string &pod_file)
         P44 = utils::inumeric(FLERR,words[1],false,lmp);
     }
   }
+  if (nrbf2 < nrbf3) error->all(FLERR,"number of three-body radial basis functions must be equal or less than number of two-body radial basis functions");
   if (nrbf3 < nrbf4) error->all(FLERR,"number of four-body radial basis functions must be equal or less than number of three-body radial basis functions");
   if (nrbf4 < nrbf33) error->all(FLERR,"number of five-body radial basis functions must be equal or less than number of four-body radial basis functions");
   if (nrbf4 < nrbf34) error->all(FLERR,"number of six-body radial basis functions must be equal or less than number of four-body radial basis functions");
   if (nrbf4 < nrbf44) error->all(FLERR,"number of seven-body radial basis functions must be equal or less than number of four-body radial basis functions");
-  nrbfmax = (nrbf2 < nrbf3) ? nrbf3 : nrbf2;
-  nrbfmax = (nrbfmax < nrbf4) ? nrbf4 : nrbfmax;
-  nrbfmax = (nrbfmax < nrbf33) ? nrbf33 : nrbfmax;
-  nrbfmax = (nrbfmax < nrbf34) ? nrbf34 : nrbfmax;
-  nrbfmax = (nrbfmax < nrbf44) ? nrbf44 : nrbfmax;
+  nrbfmax = nrbf2;
 
   nbesselrbf = besseldegree*nbesselpars;
   ns = nbesselrbf + inversedegree;
@@ -2817,7 +2816,7 @@ void EAPOD::snapshots(double *rbf, double *xij, double rinij, double rdiffij, in
 }
 
 /* ----------------------------------------------------------------------
-   Per-atom active-learning uncertainty quantities (parameter-free).
+   Per-atom active-learning uncertainty quantities
    out[0] = full atomic energy (one-body + blended many-body)  [eV]    (diagnostic)
    out[1] = P-weighted committee std of E_k                    [eV]    (Method B, primary)
    out[2] = uniform committee std over active clusters         [eV]    (Method B, variant)
@@ -2995,15 +2994,13 @@ void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, do
 int EAPOD::estimate_temp_memory(int Nj)
 {
   // Determine the maximum number of radial basis functions and angular basis functions
-  int Kmax = (K3 > K4) ? K3 : K4;
-  int nrbf34 = (nrbf3 > nrbf4) ? nrbf3 : nrbf4;
-  int nrbfmax = (nrbf2 > nrbf34) ? nrbf2 : nrbf34;
-  int Knrbf34 = (K3*nrbf3 > K4*nrbf4) ? K3*nrbf3 : K4*nrbf4;
+  int Kmax = MAX(K3, K4);
+  int Knrbf34 = MAX(K3*nrbf3, K4*nrbf4);
 
   // Determine the maximum number of local descriptors
-  int nld = (nl23 > nl33) ? nl23 : nl33;
-  nld = (nld > nl34) ? nld : nl34;
-  nld = (nld > nl44) ? nld : nl44;
+  int nld = MAX(nl23, nl33);
+  nld = MAX(nld, nl34);
+  nld = MAX(nld, nl44);
 
   // rij, fij, and d2, dd2, d3, dd3, d4, dd4
   int nmax1 = 6*Nj + nl2 + 3*Nj*nl2 + nl3 + 3*Nj*nl3 + nl4 + 3*Nj*nl4 + nld + 3*Nj*nld;
@@ -3024,7 +3021,7 @@ int EAPOD::estimate_temp_memory(int Nj)
   int nmax6 = 4*(Nj+1)*Kmax;
 
   // Determine the maximum amount of memory needed for U, Ux, Uy, Uz, sumU, cU, rbf, rbfx, rbfy, rbfz, abf, abfx, abfy, abfz
-  int nmax7 = (nmax5 > nmax6) ? nmax5 : nmax6;
+  int nmax7 = MAX(nmax5, nmax6);
   int nmax8 = nmax2 + nmax3 + nmax4 + nmax7;
 
   // Determine the total amount of memory needed for all double memory
@@ -3534,56 +3531,46 @@ inline int EAPOD::fourbody_channels(int Pa, int *pa, int *deg)
 
 void EAPOD::init_active_angular_ranges()
 {
-  // Derive degrees for each 4-body channel from the partition enumeration.
-  int *deg4 = new int[nabf4];
-  fourbody_channels(P4, nullptr, deg4);
-
   // cleanup in case this is called again
   memory->destroy(p3_active);
   memory->destroy(p4_active);
   memory->destroy(dabf3_active);
   memory->destroy(dabf4_active);
 
-  // count active 3-body channels (full channel index p has degree = p)
+  // 3-body: for a full channel p, its degree equals p
   nabf3_active = 0;
-  for (int p = 0; p < nabf3; ++p) {
-    int deg = p;
-    if (deg >= L3min && deg <= L3max) nabf3_active++;
+  for (int p = 0; p < nabf3; ++p)
+    if (p >= L3min && p <= L3max) ++nabf3_active;
+
+  memory->create(p3_active,    nabf3_active, "p3_active");
+  memory->create(dabf3_active, nabf3_active, "dabf3_active");
+
+  for (int p = 0, a = 0; p < nabf3; ++p) {
+    if (p >= L3min && p <= L3max) {
+      p3_active[a]    = p;
+      dabf3_active[a] = p;
+      ++a;
+    }
   }
 
-  // count active 4-body channels
+  // 4-body: use cached degrees
   nabf4_active = 0;
   for (int p = 0; p < nabf4; ++p) {
-    int deg = deg4[p];
-    if (deg >= L4min && deg <= L4max) nabf4_active++;
+    const int d = deg4_full[p];
+    if (d >= L4min && d <= L4max) ++nabf4_active;
   }
 
-  memory->create(p3_active,     nabf3_active, "p3_active");
-  memory->create(p4_active,     nabf4_active, "p4_active");
-  memory->create(dabf3_active,  nabf3_active, "dabf3_active");
-  memory->create(dabf4_active,  nabf4_active, "dabf4_active");
+  memory->create(p4_active,    nabf4_active, "p4_active");
+  memory->create(dabf4_active, nabf4_active, "dabf4_active");
 
-  int a = 0;
-  for (int p = 0; p < nabf3; ++p) {
-    int deg = p;
-    if (deg >= L3min && deg <= L3max) {
-      p3_active[a] = p;
-      dabf3_active[a] = deg;
-      a++;
+  for (int p = 0, a = 0; p < nabf4; ++p) {
+    const int d = deg4_full[p];
+    if (d >= L4min && d <= L4max) {
+      p4_active[a]    = p;
+      dabf4_active[a] = d;
+      ++a;
     }
   }
-
-  a = 0;
-  for (int p = 0; p < nabf4; ++p) {
-    int deg = deg4[p];
-    if (deg >= L4min && deg <= L4max) {
-      p4_active[a] = p;
-      dabf4_active[a] = deg;
-      a++;
-    }
-  }
-
-  delete[] deg4;
 }
 
 /**
@@ -3615,61 +3602,53 @@ void EAPOD::init4body(int Pa4)
   // Set the number of monomials for the angular basis functions of the four-body descriptors
   K4 = npa(Pa4+1);
 
-  // Set the number of angular basis functions for the four-body descriptors
+  // Enumerate 4-body channels: get count, offsets, and per-channel degrees.
   nabf4 = fourbody_channels(Pa4, nullptr, nullptr);
-
-  // Allocate memory for the coefficients and monomial indices
-  memory->create(pa4, nabf4+1, "pa4");
-
-  // Compute offsets into pb4/pc4 arrays and determine total row count Q4
-  fourbody_channels(Pa4, pa4, nullptr);
+  memory->create(pa4,       nabf4 + 1, "pa4");
+  memory->create(deg4_full, nabf4,     "deg4_full");
+  fourbody_channels(Pa4, pa4, deg4_full);
   Q4 = pa4[nabf4];
 
   memory->create(pb4, Q4*3, "pb4");
   memory->create(pc4, Q4, "pc4");
 
-  // Initialize the arrays
   init4bodyarray(pa4, pb4, pc4, Pa4);
 }
 
 void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int Pa)
 {
-  // Max degree
-  int maxPa = Pa + 1;
-  for (int d = 0; d <= maxPa; ++d) np[d] = npa(d);
-  // Total monomial count: K = npa[maxPa]
-  int K = np[maxPa];
+  const int maxD = Pa + 1;
+  for (int d = 0; d <= maxD; ++d) np[d] = npa(d);
+  const int K = np[maxD];
 
-  pc[0] = 1; pq[0] = 0; pq[K] = 0;
-  
+  // seed: monomial (0,0,0)
+  pc[0] = 1;
+  pq[0] = 0;    // parent monomial index (unused for d=0)
+  pq[K] = 0;    // recursion direction   (unused for d=0)
+
   int idx = 1;
-  for (int d = 1; d < maxPa; ++d) {
+  for (int d = 1; d < maxD; ++d) {
     for (int r = 0; r <= d; ++r) {
       for (int q = 0; q <= d - r; ++q) {
-        int p = d - q - r;
+        const int p = d - q - r;
         pc[idx] = trinom(p, q, r);
 
-        int r_dec = MIN(r, 1);    // decr r when r>0
-        int q_gt  = MIN(q, 1);
-        int r_eq = 1 - r_dec;
-        int q_eq = 1 - q_gt;
+        int pp = p, qq = q, rr = r, dir;
+        if      (r > 0) { rr = r - 1; dir = 3; }
+        else if (q > 0) { qq = q - 1; dir = 2; }
+        else            { pp = p - 1; dir = 1; }
 
-        int p_dec = r_eq * q_eq;  // decr p when q=0,r=0
-        int q_dec = r_eq * q_gt;  // decr q when r=0,q>0
-
-        pq[idx + K] = p_dec + 2 * q_dec + 3 * r_dec;  // direction (1,2,3)
-        pq[idx]     = monomial_idx(p - p_dec, q - q_dec, r - r_dec);
-
-        idx++;
+        pq[idx]     = monomial_idx(pp, qq, rr);
+        pq[idx + K] = dir;
+        ++idx;
       }
     }
   }
 }
 
-void EAPOD::init4bodyarray(int *ns4, int *pb4, int *pc4, int Pa)
+void EAPOD::init4bodyarray(int *pa4, int *pb4, int *pc4, int Pa)
 {
-  const int nabf = fourbody_channels(Pa, nullptr, nullptr);
-  const int Q    = ns4[nabf];   // total number of rows
+  const int Q = pa4[nabf4];
 
   int iq = 0;
   for (int d = 0; d <= Pa; ++d) {
@@ -3677,7 +3656,6 @@ void EAPOD::init4bodyarray(int *ns4, int *pb4, int *pc4, int Pa)
       for (int c = MIN(a, d - a); c >= 0; --c) {
         const int b = d - a - c;
         if (b > c) break;
-        // m1 in ORD(a+c), m2 in ORD(a+b), m3 in ORD(b+c)
         for (int s1 = 0; s1 <= a + c; ++s1) {
           for (int r1 = 0; r1 <= s1; ++r1) {
             const int p1 = a + c - s1, q1 = s1 - r1;
@@ -3687,22 +3665,21 @@ void EAPOD::init4bodyarray(int *ns4, int *pb4, int *pc4, int Pa)
                 for (int s3 = 0; s3 <= b + c; ++s3) {
                   for (int r3 = 0; r3 <= s3; ++r3) {
                     const int p3 = b + c - s3, q3 = s3 - r3;
-                    // solve u = (m1+m2-m3)/2
                     const int tp = p1 + p2 - p3, tq = q1 + q2 - q3, tr = r1 + r2 - r3;
                     if ((tp < 0) || (tq < 0) || (tr < 0)) continue;
-                    if (((tp | tq | tr) & 1) != 0)     continue;   // parity check
+                    if (((tp | tq | tr) & 1) != 0)     continue;
                     const int up = tp / 2, uq = tq / 2, ur = tr / 2;
                     const int vp = p2 - up, vq = q2 - uq, vr = r2 - ur;
                     const int wp = p1 - up, wq = q1 - uq, wr = r1 - ur;
                     if ((vp < 0) || (vq < 0) || (vr < 0)) continue;
                     if ((wp < 0) || (wq < 0) || (wr < 0)) continue;
 
-                    pb4[iq      ] = monomial_idx(p1, q1, r1);     // m1 index
-                    pb4[iq +   Q] = monomial_idx(p2, q2, r2);     // m2 index
-                    pb4[iq + 2*Q] = monomial_idx(p3, q3, r3);     // m3 index
-                    pc4[iq]       = trinom(up, uq, ur) *
-                                    trinom(vp, vq, vr) *
-                                    trinom(wp, wq, wr);           // coefficient
+                    pb4[iq        ] = monomial_idx(p1, q1, r1);
+                    pb4[iq +     Q] = monomial_idx(p2, q2, r2);
+                    pb4[iq + 2 * Q] = monomial_idx(p3, q3, r3);
+                    pc4[iq]         = trinom(up, uq, ur) *
+                                      trinom(vp, vq, vr) *
+                                      trinom(wp, wq, wr);
                     ++iq;
                   }
                 }
