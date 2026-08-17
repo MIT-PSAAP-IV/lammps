@@ -80,9 +80,10 @@ class EAPOD : protected Pointers {
   void angularbasis(double *abf, double *abfx, double *abfy, double *abfz, double *rij, double *tm,
                     int *pq, int N, int K);
   
-  void radialangularbasis(double *sumU, double *U, double *Ux, double *Uy, double *Uz, double *rbf,
+  void radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz, double *rbf,
                           double *rbfx, double *rbfy, double *rbfz, double *abf, double *abfx,
-                          double *abfy, double *abfz, double *tm, int *atomtype, int N, int K, int M, int Ne);
+                          double *abfy, double *abfz, double *tm, int *atomtype, int N, int K,
+                          int M, int Ne);
 
  public:
   std::vector<std::string> species;
@@ -149,8 +150,6 @@ class EAPOD : protected Pointers {
 
   double *Proj;         // PCA Projection matrix
   double *Centroids;    // centroids of the clusters
-  double *ClusterFcut;        // Cutoff values from the cut-off function for each atom (nClusters)
-  double *ClusterDFcut;       // Cutoff values from the derivative of the cut-off function for each atom (nClusters)
   double *invLeftClusterRcut2;   // Left-hand side squared cutoff redius for each cluster (nClusters)
   double *invRightClusterRcut2;  // Right-hand side squared cutoff redius for each cluster (nClusters)
   double *leftClusterEdges;   // Left-hand side edge activation position for each cluster (nClusters)

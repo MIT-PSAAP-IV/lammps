@@ -1436,7 +1436,6 @@ void FitPOD::environment_pipeline(const datastruct &data, int mode)
   int Mdesc       = fastpodptr->Mdesc;
   int nClusters   = fastpodptr->nClusters;
   int nelements   = fastpodptr->nelements;
-  int nMaxActiveClusters = fastpodptr->nMaxActiveClusters;
   double nActiveClusters = fastpodptr->nActiveClusters;
 
   if (do_proj && fastpodptr->Proj == nullptr)
@@ -1454,11 +1453,6 @@ void FitPOD::environment_pipeline(const datastruct &data, int mode)
       memory->create(fastpodptr->leftClusterEdges, nClusters * nComponents * nelements, "fitpod:leftClusterEdges");
     if (fastpodptr->rightClusterEdges == nullptr)
       memory->create(fastpodptr->rightClusterEdges, nClusters * nComponents * nelements, "fitpod:rightClusterEdges");
-    // temp memory for extra training arrays
-    if (fastpodptr->ClusterFcut == nullptr)
-      memory->create(fastpodptr->ClusterFcut, nMaxActiveClusters * nComponents * nelements, "fitpod:ClusterFcut");
-    if (fastpodptr->ClusterDFcut == nullptr)
-      memory->create(fastpodptr->ClusterDFcut, nMaxActiveClusters * nComponents * nelements, "fitpod:ClusterDFcut");
   }
 
   int nAtoms = 0, nTotalAtoms = 0;

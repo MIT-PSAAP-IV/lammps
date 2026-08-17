@@ -878,11 +878,10 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
   int n4 = Nj*K3;
   int n5 = K3*nrbf3*nelements;
 
-  double *U = &temp[0]; // Nj*K3*nrbf3
-  double *Ux = &temp[n1]; // Nj*K3*nrbf3
-  double *Uy = &temp[2*n1]; // Nj*K3*nrbf3
-  double *Uz = &temp[3*n1]; // Nj*K3*nrbf3
-  double *sumU = &temp[4*n1]; // K3*nrbf3*nelements
+  double *Ux = &temp[0]; // Nj*K3*nrbf3
+  double *Uy = &temp[n1]; // Nj*K3*nrbf3
+  double *Uz = &temp[2*n1]; // Nj*K3*nrbf3
+  double *sumU = &temp[3*n1]; // K3*nrbf3*nelements
 
   double *rbf = &temp[4*n1 + n5]; // Nj*nrbf2
   double *rbfx = &temp[4*n1 + n5 + n2]; // Nj*nrbf2
@@ -911,7 +910,7 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
 
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
 
-    radialangularbasis(sumU, U, Ux, Uy, Uz, rbf, rbfx, rbfy, rbfz,
+    radialangularbasis(sumU, Ux, Uy, Uz, rbf, rbfx, rbfy, rbfz,
             abf, abfx, abfy, abfz, tm, tj, Nj, K3, nrbf3, nelements);
 
     threebodydesc(d3, sumU, nelements);
@@ -1355,11 +1354,10 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   int n4 = Nj*K3;
   int n5 = K3*nrbf3*nelements;
 
-  double *U = &temp[0]; // Nj*K3*nrbf3
-  double *Ux = &temp[n1]; // Nj*K3*nrbf3
-  double *Uy = &temp[2*n1]; // Nj*K3*nrbf3
-  double *Uz = &temp[3*n1]; // Nj*K3*nrbf3
-  double *sumU = &temp[4*n1]; // K3*nrbf3*nelements
+  double *Ux = &temp[0]; // Nj*K3*nrbf3
+  double *Uy = &temp[n1]; // Nj*K3*nrbf3
+  double *Uz = &temp[2*n1]; // Nj*K3*nrbf3
+  double *sumU = &temp[3*n1]; // K3*nrbf3*nelements
 
   double *rbf = &temp[4*n1 + n5]; // Nj*nrbf2
   double *rbfx = &temp[4*n1 + n5 + n2]; // Nj*nrbf2
@@ -1388,7 +1386,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
 
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
 
-    radialangularbasis(sumU, U, Ux, Uy, Uz, rbf, rbfx, rbfy, rbfz,
+    radialangularbasis(sumU, Ux, Uy, Uz, rbf, rbfx, rbfy, rbfz,
             abf, abfx, abfy, abfz, tm, tj, Nj, K3, nrbf3, nelements);
 
     threebodydesc(d3, sumU, nelements);
@@ -2536,7 +2534,6 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
  * @brief Calculates the radial-angular basis functions and their derivatives.
  *
  * @param sumU  Pointer to the array to store the sum of the basis functions.
- * @param U     Pointer to the array to store the radial-angular basis functions.
  * @param Ux    Pointer to the array to store the derivative of U with respect to x.
  * @param Uy    Pointer to the array to store the derivative of U with respect to y.
  * @param Uz    Pointer to the array to store the derivative of U with respect to z.
@@ -2555,7 +2552,7 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
  * @param M     Number of radial basis functions.
  * @param Ne    Number of elements.
  */
-void EAPOD::radialangularbasis(double *sumU, double *U, double *Ux, double *Uy, double *Uz,
+void EAPOD::radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz,
                                double *rbf, double *rbfx, double *rbfy, double *rbfz,
                                double *abf, double *abfx, double *abfy, double *abfz,
                                double *tm, int *tj, int N, int K, int M, int Ne)
@@ -2573,12 +2570,10 @@ void EAPOD::radialangularbasis(double *sumU, double *U, double *Ux, double *Uy, 
         for (int n = 0; n < N; ++n, ++ia, ++ib, ++ii) {
           double c1 = rbf[ib];
           double c2 = abf[ia];
-          double u  = c1 * c2;
-          U[ii]  = u;
           Ux[ii] = abfx[ia] * c1 + c2 * rbfx[ib];
           Uy[ii] = abfy[ia] * c1 + c2 * rbfy[ib];
           Uz[ii] = abfz[ia] * c1 + c2 * rbfz[ib];
-          sum += u;
+          sum += c1 * c2;
         }
         sumU[sumIdx] = sum;
       }
@@ -2594,12 +2589,10 @@ void EAPOD::radialangularbasis(double *sumU, double *U, double *Ux, double *Uy, 
         for (int n = 0; n < N; ++n, ++ia, ++ib, ++ii) {
           double c1 = rbf[ib];
           double c2 = abf[ia];
-          double u  = c1 * c2;
-          U[ii]  = u;
           Ux[ii] = abfx[ia] * c1 + c2 * rbfx[ib];
           Uy[ii] = abfy[ia] * c1 + c2 * rbfy[ib];
           Uz[ii] = abfz[ia] * c1 + c2 * rbfz[ib];
-          tm[tj[n]] += u;  // accumulate per element type
+          tm[tj[n]] += c1 * c2;  // accumulate per element type
         }
         // contiguous writeback
         for (int e = 0; e < Ne; ++e) sumU[sumBase + e] = tm[e];
@@ -3005,8 +2998,8 @@ int EAPOD::estimate_temp_memory(int Nj)
   // rij, fij, and d2, dd2, d3, dd3, d4, dd4
   int nmax1 = 6*Nj + nl2 + 3*Nj*nl2 + nl3 + 3*Nj*nl3 + nl4 + 3*Nj*nl4 + nld + 3*Nj*nld;
 
-  // U, Ux, Uy, Uz
-  int nmax2 = 4*Nj*Knrbf34;
+  // Ux, Uy, Uz
+  int nmax2 = 3*Nj*Knrbf34;
 
   // sumU and cU
   int nmax3 = 2*nelements*Knrbf34;
@@ -3020,7 +3013,7 @@ int EAPOD::estimate_temp_memory(int Nj)
   // abf, abfx, abfy, abfz
   int nmax6 = 4*(Nj+1)*Kmax;
 
-  // Determine the maximum amount of memory needed for U, Ux, Uy, Uz, sumU, cU, rbf, rbfx, rbfy, rbfz, abf, abfx, abfy, abfz
+  // Determine the maximum amount of memory needed for Ux, Uy, Uz, sumU, cU, rbf, rbfx, rbfy, rbfz, abf, abfx, abfy, abfz
   int nmax7 = MAX(nmax5, nmax6);
   int nmax8 = nmax2 + nmax3 + nmax4 + nmax7;
 
@@ -3028,7 +3021,7 @@ int EAPOD::estimate_temp_memory(int Nj)
   ndblmem = (nmax1 + nmax8);
 
   int eatmpmem = nComponents;
-  if (localeapod) eatmpmem += nMaxActiveClusters*(1 + nComponents + nMaxActiveClusters + 2*Mdesc);
+  if (localeapod) eatmpmem += nMaxActiveClusters*(1 + nComponents + nMaxActiveClusters + 2*Mdesc + 2);
   else if (eapod) eatmpmem += nClusters*(1 + nComponents + nClusters + 2*Mdesc);
 
   int nmax9 = 6*Nj + eatmpmem;
@@ -3259,10 +3252,12 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
 {
   double *pca = &tmp[0];
   double *D = &tmp[nComponents];
-  double *dD_dpca = &tmp[nComponents + nMaxActiveClusters];
-  double *dD_dB = &tmp[nComponents + nMaxActiveClusters + nMaxActiveClusters*nComponents];
-  double *dP_dD = &tmp[nComponents + nMaxActiveClusters + nMaxActiveClusters*nComponents + nMaxActiveClusters*Mdesc];
-  double *dP_dB = &tmp[nComponents + nMaxActiveClusters + nMaxActiveClusters*nComponents + nMaxActiveClusters*Mdesc + nMaxActiveClusters*nClusters];
+  double *clusterFcut = &tmp[nComponents + nMaxActiveClusters];
+  double *clusterDFcut = &tmp[nComponents + 2*nMaxActiveClusters];
+  double *dD_dpca = &tmp[nComponents + 3*nMaxActiveClusters];
+  double *dD_dB = &tmp[nComponents + 4*nMaxActiveClusters + nMaxActiveClusters*nComponents];
+  double *dP_dD = &tmp[nComponents + 4*nMaxActiveClusters + nMaxActiveClusters*nComponents + nMaxActiveClusters*Mdesc];
+  double *dP_dB = &tmp[nComponents + 4*nMaxActiveClusters + nMaxActiveClusters*nComponents + nMaxActiveClusters*Mdesc + nMaxActiveClusters*nClusters];
   
   double *ProjMat = &Proj[nComponents * Mdesc * elem];
   double *centroids = &Centroids[nComponents * nClusters * elem];
@@ -3271,9 +3266,6 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
   double *invrcut2 = &invRightClusterRcut2[nComponents * nClusters * elem];
   double *ledges = &leftClusterEdges[nComponents * nClusters * elem];
   double *redges = &rightClusterEdges[nComponents * nClusters * elem];
-
-  double *clusterFcut = &ClusterFcut[nComponents * nMaxActiveClusters * elem];
-  double *clusterDFcut = &ClusterDFcut[nComponents * nMaxActiveClusters * elem];
 
   for (int j = 0; j < nClusters; j++) {
     P[j] = 0.0;
