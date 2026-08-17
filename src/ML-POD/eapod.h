@@ -110,7 +110,6 @@ class EAPOD : protected Pointers {
   double rinmin;
   double rdiffmax;
   double invrdiffmax;
-  int true4BodyDesc;
 
   int nelements;    // number of elements
   int pbc[3];
@@ -196,9 +195,6 @@ class EAPOD : protected Pointers {
   int *p3_active, *p4_active;         // dense active -> full channel index
   int *dabf3_active, *dabf4_active;   // degree per active channel
   int *deg4_full;   // per-channel angular degree for full 4-body enumeration (length nabf4)
-
-  // four-body descriptors
-  int *ind23, *ind32, nrbf23, nabf23, P23, n23, n32, nl23, nd23;
 
   // five-body descriptors
   int *ind33, nrbf33, nabf33, P33, n33, nl33, nd33;
@@ -303,9 +299,6 @@ class EAPOD : protected Pointers {
                      int *pairnumsum, int natom);
 
   void tallyforce(double *force, double *fij, int *ai, int *aj, int N);
-
-  void fourbodydesc23(double *d23, double *d2, double *d3);
-  void fourbodydescderiv23(double *dd23, double *d2, double *d3, double *dd2, double *dd3, int N);
 
   void crossdesc(double *d12, double *d1, double *d2, int *ind1, int *ind2, int n12);
   void crossdescderiv(double *dd12, double *d1, double *d2, double *dd1, double *dd2, int *ind1,

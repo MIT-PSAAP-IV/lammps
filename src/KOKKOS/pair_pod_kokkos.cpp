@@ -383,7 +383,6 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   nl2 = podptr->nl2;  // number of two-body descriptors
   nl3 = podptr->nl3;  // number of three-body descriptors
   nl4 = podptr->nl4;  // number of four-body descriptors
-  nl23 = podptr->nl23; // number of two-body x three-body descriptors
   nl33 = podptr->nl33; // number of three-body x three-body descriptors
   nl34 = podptr->nl34; // number of three-body x four-body descriptors
   nl44 = podptr->nl44; // number of four-body x four-body descriptors

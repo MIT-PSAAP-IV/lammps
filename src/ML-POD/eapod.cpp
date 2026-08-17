@@ -47,7 +47,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
     invPcaSpan(nullptr), clusterOccupancy(nullptr),
     bd(nullptr), bdd(nullptr), pd(nullptr), pdd(nullptr),
     pn3(nullptr), pq3(nullptr), pc3(nullptr), pa4(nullptr),
-    pb4(nullptr), pc4(nullptr), tmpint(nullptr), ind23(nullptr), ind32(nullptr), ind33(nullptr),
+    pb4(nullptr), pc4(nullptr), tmpint(nullptr), ind33(nullptr),
     ind34(nullptr), ind43(nullptr), ind44(nullptr), ind33l(nullptr), ind33r(nullptr),
     ind34l(nullptr), ind34r(nullptr), ind44l(nullptr), ind44r(nullptr),
     p3_active(nullptr), dabf3_active(nullptr),
@@ -69,7 +69,6 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   besseldegree = 4;
   inversedegree = 8;
   nbesselpars = 3;
-  true4BodyDesc = 1;
   nbesselrbf = nbesselpars*besseldegree;
   ns = nbesselrbf + inversedegree;
   Njmax = 100;
@@ -79,8 +78,6 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   nrbf4 = 0;
   nabf3 = 5;
   nabf4 = 0;
-  nrbf23 = 0;
-  nabf23 = 0;
   nrbf33 = 0;
   nabf33 = 0;
   nrbf34 = 0;
@@ -90,7 +87,6 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   nabf44 = 0;
   P3 = 4;
   P4 = 0;
-  P23 = 0;
   P33 = 0;
   P34 = 0;
   P44 = 0;
@@ -145,8 +141,6 @@ EAPOD::~EAPOD()
   memory->destroy(pa4);
   memory->destroy(pb4);
   memory->destroy(pc4);
-  memory->destroy(ind23);
-  memory->destroy(ind32);
   memory->destroy(ind33);
   memory->destroy(ind34);
   memory->destroy(ind43);
@@ -465,32 +459,24 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   nd2 = nl2*Ne;
   nd3 = nl3*Ne;
   nd4 = nl4*Ne;
-
-  n23 = nrbf23*Ne;
-  n32 = nabf23*nrbf23*nebf3;
   n33 = nabf33*nrbf33*nebf3;
   n34 = nabf34*nrbf34*nebf3;
   n43 = nabf43*nrbf34*nebf4;
   n44 = nabf44*nrbf44*nebf4;
 
-  nl23 = n23*n32;
   nl34 = n34*n43;
   nl33 = n33*(n33+1)/2;
   nl44 = n44*(n44+1)/2;
 
-  nd23 = nl23*Ne;
   nd33 = nl33*Ne;
   nd34 = nl34*Ne;
   nd44 = nl44*Ne;
 
-  memory->create(ind23, n23, "ind23");
-  memory->create(ind32, n32, "ind32");
   memory->create(ind33, n33, "ind33");
   memory->create(ind34, n34, "ind34");
   memory->create(ind43, n43, "ind43");
   memory->create(ind44, n44, "ind44");
 
-  indexmap3(ind32, nabf23, nrbf23, nebf3, nabf3_active, nrbf3);
   indexmap3(ind33, nabf33, nrbf33, nebf3, nabf3_active, nrbf3);
   indexmap3(ind34, nabf34, nrbf34, nebf3, nabf3_active, nrbf3);
   indexmap3(ind43, nabf43, nrbf34, nebf4, nabf4_active, nrbf4);
@@ -527,9 +513,9 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   nd34 = ngd34;
   nd44 = ngd44;
 
-  Mdesc = nl2 + nl3 + nl4 + nl23 + nl33 + nl34 + nl44;
-  nl = nl1 + nl2 + nl3 + nl4 + nl23 + nl33 + nl34 + nl44;
-  nd = nd1 + nd2 + nd3 + nd4 + nd23 + nd33 + nd34 + nd44;
+  Mdesc = nl2 + nl3 + nl4 + nl33 + nl34 + nl44;
+  nl = nl1 + nl2 + nl3 + nl4 + nl33 + nl34 + nl44;
+  nd = nd1 + nd2 + nd3 + nd4 + nd33 + nd34 + nd44;
   nCoeffPerElement = nl1 + Mdesc*nClusters;
   nCoeffAll = nCoeffPerElement*nelements;
 
@@ -583,14 +569,8 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     utils::logmesg(lmp, "two-body radial basis functions: {}\n", nrbf2);
     utils::logmesg(lmp, "three-body radial basis functions: {}\n", nrbf3);
     utils::logmesg(lmp, "three-body angular degree: {}\n", P3);
-    if (P23 < P4) {
-      utils::logmesg(lmp, "four-body radial basis functions: {}\n", nrbf4);
-      utils::logmesg(lmp, "four-body angular degree: {}\n", P4);
-    }
-    else {
-      utils::logmesg(lmp, "four-body radial basis functions: {}\n", nrbf23);
-      utils::logmesg(lmp, "four-body angular degree: {}\n", P23);
-    }
+    utils::logmesg(lmp, "four-body radial basis functions: {}\n", nrbf4);
+    utils::logmesg(lmp, "four-body angular degree: {}\n", P4);
     utils::logmesg(lmp, "five-body radial basis functions: {}\n", nrbf33);
     utils::logmesg(lmp, "five-body angular degree: {}\n", P33);
     utils::logmesg(lmp, "six-body radial basis functions: {}\n", nrbf34);
@@ -600,7 +580,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     utils::logmesg(lmp, "number of local descriptors per element for one-body potential: {}\n", nl1);
     utils::logmesg(lmp, "number of local descriptors per element for two-body potential: {}\n", nl2);
     utils::logmesg(lmp, "number of local descriptors per element for three-body potential: {}\n", nl3);
-    utils::logmesg(lmp, "number of local descriptors per element for four-body potential: {}\n", nl4+nl23);
+    utils::logmesg(lmp, "number of local descriptors per element for four-body potential: {}\n", nl4);
     utils::logmesg(lmp, "number of local descriptors per element for five-body potential: {}\n", nl33);
     utils::logmesg(lmp, "number of local descriptors per element for six-body potential: {}\n", nl34);
     utils::logmesg(lmp, "number of local descriptors per element for seven-body potential: {}\n", nl44);
@@ -859,18 +839,16 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
   double *d2 =  &bd1[0]; // nl2
   double *d3 =  &bd1[nl2]; // nl3
   double *d4 =  &bd1[nl2 + nl3]; // nl4
-  double *d23 =  &bd1[nl2 + nl3 + nl4]; // nl23
-  double *d33 =  &bd1[nl2 + nl3 + nl4 + nl23]; // nl33
-  double *d34 =  &bd1[nl2 + nl3 + nl4 + nl23 + nl33]; // nl34
-  double *d44 =  &bd1[nl2 + nl3 + nl4 + nl23 + nl33 + nl34]; // nl44
+  double *d33 =  &bd1[nl2 + nl3 + nl4]; // nl33
+  double *d34 =  &bd1[nl2 + nl3 + nl4 + nl33]; // nl34
+  double *d44 =  &bd1[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
   double *dd2 = &bdd1[0]; // 3*Nj*nl2
   double *dd3 = &bdd1[3*Nj*nl2]; // 3*Nj*nl3
   double *dd4 = &bdd1[3*Nj*(nl2+nl3)]; // 3*Nj*nl4
-  double *dd23 = &bdd1[3*Nj*(nl2+nl3+nl4)]; // 3*Nj*nl23
-  double *dd33 = &bdd1[3*Nj*(nl2+nl3+nl4+nl23)]; // 3*Nj*nl33
-  double *dd34 = &bdd1[3*Nj*(nl2+nl3+nl4+nl23+nl33)]; // 3*Nj*nl34
-  double *dd44 = &bdd1[3*Nj*(nl2+nl3+nl4+nl23+nl33+nl34)]; // 3*Nj*nl44
+  double *dd33 = &bdd1[3*Nj*(nl2+nl3+nl4)]; // 3*Nj*nl33
+  double *dd34 = &bdd1[3*Nj*(nl2+nl3+nl4+nl33)]; // 3*Nj*nl34
+  double *dd44 = &bdd1[3*Nj*(nl2+nl3+nl4+nl33+nl34)]; // 3*Nj*nl44
 
   int n1 = Nj*K3*nrbf3;
   int n2 = Nj*nrbfmax;
@@ -915,11 +893,6 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
 
     threebodydesc(d3, sumU, nelements);
     threebodydescderiv(dd3, sumU, Ux, Uy, Uz, tj, Nj);
-
-    if ((nl23>0) && (Nj>2)) {
-      fourbodydesc23(d23, d2, d3);
-      fourbodydescderiv23(dd23, d2, d3, dd2, dd3, 3*Nj);
-    }
 
     if ((nl33>0) && (Nj>3)) {
       crossdesc(d33, d3, d3, ind33l, ind33r, nl33);
@@ -1343,10 +1316,9 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   double *d2 =  &bd[0]; // nl2
   double *d3 =  &bd[nl2]; // nl3
   double *d4 =  &bd[nl2 + nl3]; // nl4
-  double *d23 =  &bd[nl2 + nl3 + nl4]; // nl23
-  double *d33 =  &bd[nl2 + nl3 + nl4 + nl23]; // nl33
-  double *d34 =  &bd[nl2 + nl3 + nl4 + nl23 + nl33]; // nl34
-  double *d44 =  &bd[nl2 + nl3 + nl4 + nl23 + nl33 + nl34]; // nl44
+  double *d33 =  &bd[nl2 + nl3 + nl4]; // nl33
+  double *d34 =  &bd[nl2 + nl3 + nl4 + nl33]; // nl34
+  double *d44 =  &bd[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
   int n1 = Nj*K3*nrbf3;
   int n2 = Nj*nrbfmax;
@@ -1390,8 +1362,6 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
             abf, abfx, abfy, abfz, tm, tj, Nj, K3, nrbf3, nelements);
 
     threebodydesc(d3, sumU, nelements);
-
-    if ((nl23>0) && (Nj>2)) fourbodydesc23(d23, d2, d3);
 
     if ((nl33>0) && (Nj>3)) crossdesc(d33, d3, d3, ind33l, ind33r, nl33);
 
@@ -1674,21 +1644,6 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *probd
 
     }
   }
-}
-
-void EAPOD::fourbodydesc23(double *d23, double *d2, double *d3)
-{
-  for (int j = 0; j<n32; j++)
-    for (int i = 0; i<n23; i++)
-      d23[i + n23*j] = d2[ind23[i]]*d3[ind32[j]];
-}
-
-void EAPOD::fourbodydescderiv23(double* dd23, double *d2, double *d3, double *dd2, double *dd3, int N)
-{
-  for (int j = 0; j<n32; j++)
-    for (int i = 0; i<n23; i++)
-      for (int n=0; n<N; n++)
-        dd23[n + N*i + N*n23*j] = d2[ind23[i]]*dd3[n + N*ind32[j]] + dd2[n + N*ind23[i]]*d3[ind32[j]];
 }
 
 void EAPOD::crossdesc(double *d12, double *d1, double *d2, int *ind1, int *ind2, int n12)
@@ -2991,8 +2946,7 @@ int EAPOD::estimate_temp_memory(int Nj)
   int Knrbf34 = MAX(K3*nrbf3, K4*nrbf4);
 
   // Determine the maximum number of local descriptors
-  int nld = MAX(nl23, nl33);
-  nld = MAX(nld, nl34);
+  int nld = MAX(nl33, nl34);
   nld = MAX(nld, nl44);
 
   // rij, fij, and d2, dd2, d3, dd3, d4, dd4
