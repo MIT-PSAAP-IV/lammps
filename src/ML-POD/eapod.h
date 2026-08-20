@@ -64,26 +64,21 @@ class EAPOD : protected Pointers {
   void init_bessel_const();
 
   void init_spline_radialbasis();
-  void radialbasis_spline(double *rbf, double *rbfx, double *rbfy, double *rbfz,
-                          double *rij, int *ti, int *tj, int N);
+  void radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N);
 
-  void radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz, double *rij, double **rin, double **invrdiff,
+  void radialbasis(double *rbf, double *drbf, double *rij, double **rin, double **invrdiff,
                    int *ti, int *tj, int besseldegree, int inversedegree, int nbesselpars, int N);
   
-  void radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
-                 double *rbft, double *rbfxt, double *rbfyt, double *rbfzt,
-                 int *ti, int *tj, int N);
-  
-  void radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
-                 double *rbft, double *rbfxt, double *rbfyt, double *rbfzt, int N);
+  void radialPhi(double *rbf, double *drbf, double *rbft, double *drbft, int *ti, int *tj, int N);
   
   void angularbasis(double *abf, double *abfx, double *abfy, double *abfz, double *rij, double *tm,
                     int *pq, int N, int K);
+
+  void radialangularsum(double *sumU, double *rbf, double *abf, int *tj, int Nj, int K, int M, int Ne);
   
-  void radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz, double *rbf,
-                          double *rbfx, double *rbfy, double *rbfz, double *abf, double *abfx,
-                          double *abfy, double *abfz, double *tm, int *atomtype, int N, int K,
-                          int M, int Ne);
+  void radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz, double *rbf, double *drbf, double *rij,
+                          double *abf, double *abfx, double *abfy, double *abfz,
+                          double *tm, int *atomtype, int N, int K, int M, int Ne);
 
  public:
   std::vector<std::string> species;
@@ -248,10 +243,8 @@ class EAPOD : protected Pointers {
                                           int& ks, int& ke);
 
   void twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne);
-  void twobodydescderiv(double *d2, double *dd2, double *rbf, double *rbfx, double *rbfy,
-                        double *rbfz, int *tj, int N);
-  void twobody_forces(double *fij, double *cb2, double *rbfx, double *rbfy, double *rbfz, int *tj,
-                      int Nj);
+  void twobodydescderiv(double *d2, double *dd2, double *rbf, double *drbf, double *rij, int *tj, int N);
+  void twobody_forces(double *fij, double *cb2, double *drbf, double *rij, int *tj, int Nj);
 
   void threebodydesc(double *d3, double *sumU, int Ne);
   void threebodydescderiv(double *dd3, double *sumU, double *Ux, double *Uy, double *Uz,
@@ -263,11 +256,8 @@ class EAPOD : protected Pointers {
                          int *tj, int N);
   void fourbody_forcecoeff(double *fb4, double *cb4, double *sumU);
 
-  void allbody_forces(double *fij, double *forcecoeff, double *rbf, double *rbfx, double *rbfy,
-                      double *rbfz, double *abf, double *abfx, double *abfy, double *abfz, int *tj,
-                      int Nj);
-  void allbody_forces(double *fij, double *forcecoeff, double *Ux, double *Uy, double *Uz, int *tj,
-                      int Nj);
+  void allbody_forces(double *fij, double *forcecoeff, double *rbf, double *drbf, double *rij,
+                      double *abf, double *abfx, double *abfy, double *abfz, int *tj, int Nj);
 
   void descriptors(double *gd, double *gdd, double *basedesc, double *probdesc, double *x,
                    int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom);
@@ -311,8 +301,6 @@ class EAPOD : protected Pointers {
   void calculatePcaSpan();
 
   void peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti);
-
-  
 };
 
 }    // namespace LAMMPS_NS

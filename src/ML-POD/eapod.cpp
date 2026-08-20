@@ -403,14 +403,9 @@ void EAPOD::read_pod_file(const std::string &pod_file)
       rdiff[i][j] = rdiff_ij;
       invrdiff[i][j] = 1.0 / rdiff_ij;
       rcutsq[i][j] = rcut_ij * rcut_ij;
-      if (rcut_ij > rcutmax) {
-        rcutmax = rcut_ij;
-      }
-      if (rin_ij < rinmin) {
-        rinmin = rin_ij;
-      }
+      if (rcut_ij > rcutmax) rcutmax = rcut_ij;
+      if (rin_ij < rinmin) rinmin = rin_ij;
     }
-    
   }
 
   rdiffmax = rcutmax - rinmin;
@@ -459,6 +454,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   nd2 = nl2*Ne;
   nd3 = nl3*Ne;
   nd4 = nl4*Ne;
+
   n33 = nabf33*nrbf33*nebf3;
   n34 = nabf34*nrbf34*nebf3;
   n43 = nabf43*nrbf34*nebf4;
@@ -861,34 +857,30 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
   double *Uz = &temp[2*n1]; // Nj*K3*nrbf3
   double *sumU = &temp[3*n1]; // K3*nrbf3*nelements
 
-  double *rbf = &temp[4*n1 + n5]; // Nj*nrbf2
-  double *rbfx = &temp[4*n1 + n5 + n2]; // Nj*nrbf2
-  double *rbfy = &temp[4*n1 + n5 + 2*n2]; // Nj*nrbf2
-  double *rbfz = &temp[4*n1 + n5 + 3*n2]; // Nj*nrbf2
+  double *rbf = &temp[3*n1 + n5]; // Nj*nrbf2
+  double *drbf = &temp[3*n1 + n5 + n2]; // Nj*nrbf2
 
   if (use_spline) {
-    radialbasis_spline(rbf, rbfx, rbfy, rbfz, rij, ti, tj, Nj);
+    radialbasis_spline(rbf, drbf, rij, ti, tj, Nj);
   } else {
-    double *rbft = &temp[4*n1 + n5 + 4*n2]; // Nj*ns
-    double *rbfxt = &temp[4*n1 + n5 + 4*n2 + n3]; // Nj*ns
-    double *rbfyt = &temp[4*n1 + n5 + 4*n2 + 2*n3]; // Nj*ns
-    double *rbfzt = &temp[4*n1 + n5 + 4*n2 + 3*n3]; // Nj*ns
-    radialbasis(rbft, rbfxt, rbfyt, rbfzt, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
-    radialPhi(rbf, rbfx, rbfy, rbfz, rbft, rbfxt, rbfyt, rbfzt, ti, tj, Nj);
+    double *rbft = &temp[3*n1 + n5 + 2*n2]; // Nj*ns
+    double *drbft = &temp[3*n1 + n5 + 2*n2 + n3]; // Nj*ns
+    radialbasis(rbft, drbft, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
+    radialPhi(rbf, drbf, rbft, drbft, ti, tj, Nj);
   }
 
-  twobodydescderiv(d2, dd2, rbf, rbfx, rbfy, rbfz, tj, Nj);
+  twobodydescderiv(d2, dd2, rbf, drbf, rij, tj, Nj);
 
   if ((nl3 > 0) && (Nj>1)) {
-    double *abf = &temp[4*n1 + n5 + 4*n2]; // Nj*K3
-    double *abfx = &temp[4*n1 + n5 + 4*n2 + n4]; // Nj*K3
-    double *abfy = &temp[4*n1 + n5 + 4*n2 + 2*n4]; // Nj*K3
-    double *abfz = &temp[4*n1 + n5 + 4*n2 + 3*n4]; // Nj*K3
-    double *tm = &temp[4*n1 + n5 + 4*n2 + 4*n4]; // 4*K3
+    double *abf = &temp[3*n1 + n5 + 2*n2]; // Nj*K3
+    double *abfx = &temp[3*n1 + n5 + 2*n2 + n4]; // Nj*K3
+    double *abfy = &temp[3*n1 + n5 + 2*n2 + 2*n4]; // Nj*K3
+    double *abfz = &temp[3*n1 + n5 + 2*n2 + 3*n4]; // Nj*K3
+    double *tm = &temp[3*n1 + n5 + 2*n2 + 4*n4]; // 4*K3
 
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
 
-    radialangularbasis(sumU, Ux, Uy, Uz, rbf, rbfx, rbfy, rbfz,
+    radialangularbasis(sumU, Ux, Uy, Uz, rbf, drbf, rij,
             abf, abfx, abfy, abfz, tm, tj, Nj, K3, nrbf3, nelements);
 
     threebodydesc(d3, sumU, nelements);
@@ -1142,20 +1134,17 @@ double EAPOD::peratom_environment_descriptors(double *cb, double *bd, double *tm
   return ei;
 }
 
-void EAPOD::twobody_forces(double *fij, double *cb2, double *rbfx, double *rbfy, double *rbfz, int *tj, int Nj)
+void EAPOD::twobody_forces(double *fij, double *cb2, double *drbf, double *rij, int *tj, int Nj)
 {
-  // Calculate the two-body descriptors and their derivatives
-  int totalIterations = nrbf2 * Nj;
-  for (int idx = 0; idx < totalIterations; idx++) {
-    int n = idx / nrbf2; // Recalculate m
-    int m = idx % nrbf2; // Recalculate n
-
-    int i2 = n + Nj * m; // Index of the radial basis function for atom n and RBF m
-    int i1 = 3*n;
-    double c = cb2[m + nrbf2*tj[n]];
-    fij[0 + i1] += c*rbfx[i2];
-    fij[1 + i1] += c*rbfy[i2];
-    fij[2 + i1] += c*rbfz[i2];
+  for (int n = 0; n < Nj; ++n) {
+    const double *c = &cb2[nrbf2*tj[n]];
+    double fr = 0.0;
+    for (int m = 0; m < nrbf2; ++m)
+      fr += c[m]*drbf[n + Nj*m];
+    const int i1 = 3*n;
+    fij[i1] += fr * rij[0 + i1];
+    fij[i1+1] += fr * rij[1 + i1];
+    fij[i1+2] += fr * rij[2 + i1];
   }
 }
 
@@ -1279,87 +1268,89 @@ void EAPOD::fourbody_forcecoeff(double *fb4, double *cb4, double *sumU)
   }
 }
 
-void EAPOD::allbody_forces(double *fij, double *forcecoeff, double *Ux, double *Uy, double *Uz, int *tj, int Nj)
+void EAPOD::allbody_forces(double *fij, double *forcecoeff, double *rbf, double *drbf, double *rij,
+                           double *abf, double *abfx, double *abfy, double *abfz, int *tj, int Nj)
 {
-  for (int j = 0; j < Nj; ++j) {
-    int i2 = tj[j];
-    double fx = 0;
-    double fy = 0;
-    double fz = 0;
-    for (int m = 0; m < nrbf3; m++)
-      for (int k = 0; k < K3; k++) {
-        double fc = forcecoeff[i2 + nelements * k + nelements * K3 * m];
-        int idxU = j + Nj*k + Nj * K3 * m;  // Pre-compute the index for abf
-        fx += fc * Ux[idxU]; // K3*nrbf3*Nij
-        fy += fc * Uy[idxU];
-        fz += fc * Uz[idxU];
+  const int Ne = nelements, K = K3;
+
+  for (int n = 0; n < Nj; ++n) {
+    const int e = tj[n];
+    double fdRA  = 0.0;
+    double fRdAx = 0.0;
+    double fRdAy = 0.0;
+    double fRdAz = 0.0;
+    for (int k = 0; k < K; ++k) {
+      double fdR = 0.0;
+      double fR = 0.0;
+      for (int m = 0; m < nrbf3; ++m) {
+        const double fc = forcecoeff[e + Ne * (k + K * m)];
+        const int id = n + Nj * m;
+        fdR += fc * drbf[id];
+        fR  += fc * rbf [id];
       }
-    int baseIdx = 3 * j;
-    fij[baseIdx]     += fx;
-    fij[baseIdx + 1] += fy;
-    fij[baseIdx + 2] += fz;
+      const int ia = n + Nj * k;
+      fdRA += fdR * abf [ia];
+      fRdAx += fR * abfx[ia];
+      fRdAy += fR * abfy[ia];
+      fRdAz += fR * abfz[ia];
+    }
+    const int i1 = 3 * n;
+    fij[i1]     += fRdAx + fdRA * rij[i1];
+    fij[i1 + 1] += fRdAy + fdRA * rij[i1 + 1];
+    fij[i1 + 2] += fRdAz + fdRA * rij[i1 + 2];
   }
 }
 
 double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
         int *ti, int *tj, int Nj)
 {
+  //double *coeff1 = &coeff[nCoeffPerElement*ti[0]];
   if (Nj==0) return coeff[nCoeffPerElement*ti[0]];
 
   int N = 3*Nj;
   for (int n=0; n<N; n++) fij[n] = 0.0;
 
-  //double *coeff1 = &coeff[nCoeffPerElement*ti[0]];
   double e = 0.0;
   for (int i=0; i<Mdesc; i++) bd[i] = 0.0;
 
-  double *d2 =  &bd[0]; // nl2
-  double *d3 =  &bd[nl2]; // nl3
-  double *d4 =  &bd[nl2 + nl3]; // nl4
-  double *d33 =  &bd[nl2 + nl3 + nl4]; // nl33
-  double *d34 =  &bd[nl2 + nl3 + nl4 + nl33]; // nl34
-  double *d44 =  &bd[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
+  double *d2  = &bd[0]; // nl2
+  double *d3  = &bd[nl2]; // nl3
+  double *d4  = &bd[nl2 + nl3]; // nl4
+  double *d33 = &bd[nl2 + nl3 + nl4]; // nl33
+  double *d34 = &bd[nl2 + nl3 + nl4 + nl33]; // nl34
+  double *d44 = &bd[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
-  int n1 = Nj*K3*nrbf3;
   int n2 = Nj*nrbfmax;
   int n3 = Nj*ns;
   int n4 = Nj*K3;
   int n5 = K3*nrbf3*nelements;
 
-  double *Ux = &temp[0]; // Nj*K3*nrbf3
-  double *Uy = &temp[n1]; // Nj*K3*nrbf3
-  double *Uz = &temp[2*n1]; // Nj*K3*nrbf3
-  double *sumU = &temp[3*n1]; // K3*nrbf3*nelements
+  double *sumU = &temp[0]; // K3*nrbf3*nelements
 
-  double *rbf = &temp[4*n1 + n5]; // Nj*nrbf2
-  double *rbfx = &temp[4*n1 + n5 + n2]; // Nj*nrbf2
-  double *rbfy = &temp[4*n1 + n5 + 2*n2]; // Nj*nrbf2
-  double *rbfz = &temp[4*n1 + n5 + 3*n2]; // Nj*nrbf2
+  double *rbf = &temp[n5]; // Nj*nrbf2
+  double *drbf = &temp[n5 + n2]; // Nj*nrbf2
 
   if (use_spline) {
-    radialbasis_spline(rbf, rbfx, rbfy, rbfz, rij, ti, tj, Nj);
+    radialbasis_spline(rbf, drbf, rij, ti, tj, Nj);
   } else {
-    double *rbft = &temp[4*n1 + n5 + 4*n2]; // Nj*ns
-    double *rbfxt = &temp[4*n1 + n5 + 4*n2 + n3]; // Nj*ns
-    double *rbfyt = &temp[4*n1 + n5 + 4*n2 + 2*n3]; // Nj*ns
-    double *rbfzt = &temp[4*n1 + n5 + 4*n2 + 3*n3]; // Nj*ns
-    radialbasis(rbft, rbfxt, rbfyt, rbfzt, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
-    radialPhi(rbf, rbfx, rbfy, rbfz, rbft, rbfxt, rbfyt, rbfzt, ti, tj, Nj);
+    double *rbft = &temp[n5 + 2*n2]; // Nj*ns
+    double *drbft = &temp[n5 + 2*n2 + n3]; // Nj*ns
+    radialbasis(rbft, drbft, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
+    radialPhi(rbf, drbf, rbft, drbft, ti, tj, Nj);
   }
 
   twobodydesc(d2, rbf, tj, Nj, nelements);
 
-  if ((nl3 > 0) && (Nj>1)) {
-    double *abf = &temp[4*n1 + n5 + 4*n2]; // Nj*K3
-    double *abfx = &temp[4*n1 + n5 + 4*n2 + n4]; // Nj*K3
-    double *abfy = &temp[4*n1 + n5 + 4*n2 + 2*n4]; // Nj*K3
-    double *abfz = &temp[4*n1 + n5 + 4*n2 + 3*n4]; // Nj*K3
-    double *tm = &temp[4*n1 + n5 + 4*n2 + 4*n4]; // 4*K3
+  double *abf = &temp[n5 + 2*n2]; // Nj*K3
+  double *abfx = &temp[n5 + 2*n2 + n4]; // Nj*K3
+  double *abfy = &temp[n5 + 2*n2 + 2*n4]; // Nj*K3
+  double *abfz = &temp[n5 + 2*n2 + 3*n4]; // Nj*K3
+  double *tm = &temp[n5 + 2*n2 + 4*n4]; // 4*K3
 
+  if ((nl3 > 0) && (Nj>1)) {
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
 
-    radialangularbasis(sumU, Ux, Uy, Uz, rbf, rbfx, rbfy, rbfz,
-            abf, abfx, abfy, abfz, tm, tj, Nj, K3, nrbf3, nelements);
+    radialangularsum(sumU, rbf, abf, tj, Nj, K3, nrbf3, nelements);
 
     threebodydesc(d3, sumU, nelements);
 
@@ -1374,29 +1365,29 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   }
 
   double *cb = &bdd[0];
-  if (localeapod) e += peratom_local_environment_descriptors(cb, bd, &temp[4*n1 + n5 + 4*n2], ti);
-  else if (eapod) e += peratom_environment_descriptors(cb, bd, &temp[4*n1 + n5 + 4*n2], ti);
+  if (localeapod) e += peratom_local_environment_descriptors(cb, bd, tm, ti);
+  else if (eapod) e += peratom_environment_descriptors(cb, bd, tm, ti);
   else            e += peratombase_coefficients(cb, bd, ti);
 
-  double *cb2 =  &cb[0]; // nl3
-  double *cb3 =  &cb[nl2]; // nl3
-  double *cb4 =  &cb[(nl2 + nl3)]; // nl4
-  double *cb33 = &cb[(nl2 + nl3 + nl4)]; // nl33
-  double *cb34 = &cb[(nl2 + nl3 + nl4 + nl33)]; // nl34
-  double *cb44 = &cb[(nl2 + nl3 + nl4 + nl33 + nl34)]; // nl44
+  double *cb2  = &cb[0]; // nl3
+  double *cb3  = &cb[nl2]; // nl3
+  double *cb4  = &cb[nl2 + nl3]; // nl4
+  double *cb33 = &cb[nl2 + nl3 + nl4]; // nl33
+  double *cb34 = &cb[nl2 + nl3 + nl4 + nl33]; // nl34
+  double *cb44 = &cb[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
   if ((nl33>0) && (Nj>3)) crossdesc_reduction(cb3, cb3, cb33, d3, d3, ind33l, ind33r, nl33);
   if ((nl34>0) && (Nj>4)) crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34);
   if ((nl44>0) && (Nj>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44);
 
-  twobody_forces(fij, cb2, rbfx, rbfy, rbfz, tj, Nj);
+  twobody_forces(fij, cb2, drbf, rij, tj, Nj);
 
   // Initialize forcecoeff to zero
-  double *forcecoeff = &cb[(nl2 + nl3 + nl4)]; // nl33
+  double *forcecoeff = &cb[nl2 + nl3 + nl4]; // nl33
   std::fill(forcecoeff, forcecoeff + nelements * K3 * nrbf3, 0.0);
   if ((nl3 > 0) && (Nj>1)) threebody_forcecoeff(forcecoeff, cb3, sumU);
   if ((nl4 > 0) && (Nj>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU);
-  if ((nl3 > 0) && (Nj>1)) allbody_forces(fij, forcecoeff, Ux, Uy, Uz, tj, Nj);
+  if ((nl3 > 0) && (Nj>1)) allbody_forces(fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz, tj, Nj);
 
   return e;
 }
@@ -1948,57 +1939,39 @@ void EAPOD::threebodydescderiv(double *dd3, double *sumU, double *Ux, double *Uy
 
 void EAPOD::twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne)
 {
-  for (int m=0; m<nl2; m++) d2[m] = 0.0;
-
   if (Ne == 1) {
     for (int m = 0, mN = 0; m < nrbf2; ++m, mN += N) {
       double sum = 0.0;
-      for (int n = 0, i2 = mN; n < N; ++n, ++i2) {
+      for (int n = 0, i2 = mN; n < N; ++n, ++i2)
         sum += rbf[i2];
-      }
       d2[m] = sum;
     }
   } else {
+    for (int m=0; m<nl2; m++) d2[m] = 0.0;
     for (int n = 0; n < N; ++n) {
-      int d2idx = nrbf2 * tj[n]; // base for this neighbor's element bin
-      int i2 = n;                // rbf index for m=0 at fixed n
-      for (int m = 0; m < nrbf2; ++m, ++d2idx, i2 += N) {
+      int d2idx = nrbf2 * tj[n];
+      int i2 = n;
+      for (int m = 0; m < nrbf2; ++m, ++d2idx, i2 += N)
         d2[d2idx] += rbf[i2];
-      }
     }
   }
 }
 
-/**
- * @brief Calculates the two-body descriptor derivatives for a given set of atoms.
- *
- * @param d2   Pointer to the array of two-body descriptors.
- * @param dd2  Pointer to the array of two-body descriptor derivatives.
- * @param rbf  Pointer to the array of radial basis functions.
- * @param rbfx Pointer to the array of radial basis function derivatives with respect to x.
- * @param rbfy Pointer to the array of radial basis function derivatives with respect to y.
- * @param rbfz Pointer to the array of radial basis function derivatives with respect to z.
- * @param tj   Pointer to the array of atom types of neighboring atoms.
- * @param N    Number of neighboring atoms.
- */
-void EAPOD::twobodydescderiv(double *d2, double *dd2, double *rbf, double *rbfx,
-        double *rbfy, double *rbfz, int *tj, int N)
+void EAPOD::twobodydescderiv(double *d2, double *dd2, double *rbf, double *drbf, double *rij, int *tj, int N)
 {
-  // Initialize the two-body descriptors and their derivatives to zero
-  for (int m=0; m<nl2; m++)
-    d2[m] = 0.0;
-  for (int m=0; m<3*N*nl2; m++)
-    dd2[m] = 0.0;
+  for (int m=0; m<nl2; m++) d2[m] = 0.0;
+  for (int m=0; m<3*N*nl2; m++) dd2[m] = 0.0;
 
   // Calculate the two-body descriptors and their derivatives
   for (int m=0; m<nrbf2; m++) {
     for (int n=0; n<N; n++) {
-      int i2 = n + N*m; // Index of the radial basis function for atom n and RBF m
-      int i1 = n + N*m + N*nrbf2*tj[n]; // Index of the descriptor for atom n, RBF m, and atom type tj[n]
-      d2[m + nrbf2*tj[n]] += rbf[i2]; // Add the radial basis function to the corresponding descriptor
-      dd2[0 + 3*i1] += rbfx[i2];
-      dd2[1 + 3*i1] += rbfy[i2];
-      dd2[2 + 3*i1] += rbfz[i2];
+      int i2 = n + N*m;
+      int i1 = n + N*m + N*nrbf2*tj[n];
+      double drbfi2 = drbf[i2];
+      d2[m + nrbf2*tj[n]] += rbf[i2];
+      dd2[0 + 3*i1] += drbfi2 * rij[0 + 3*n];
+      dd2[1 + 3*i1] += drbfi2 * rij[1 + 3*n];
+      dd2[2 + 3*i1] += drbfi2 * rij[2 + 3*n];
     }
   }
 }
@@ -2074,9 +2047,7 @@ inline void EAPOD::cutoff_hat(double r, double invrmax,
  * @brief Calculates the radial basis functions and their derivatives.
  *
  * @param rbf           Pointer to the array of radial basis functions.
- * @param rbfx          Pointer to the array of derivatives of radial basis functions with respect to x.
- * @param rbfy          Pointer to the array of derivatives of radial basis functions with respect to y.
- * @param rbfz          Pointer to the array of derivatives of radial basis functions with respect to z.
+ * @param drbf          Pointer to the array of derivatives of radial basis functions with respect to r.
  * @param rij           Pointer to the relative positions of neighboring atoms and atom i.
  * @param rin           Minimum distance for radial basis functions.
  * @param rmax          Maximum distance for radial basis functions.
@@ -2085,11 +2056,9 @@ inline void EAPOD::cutoff_hat(double r, double invrmax,
  * @param nbesselpars   Number of Bessel function parameters.
  * @param N             Number of neighboring atoms.
  */
-void EAPOD::radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz,
-                        double *rij, double **rin, double **invrdiff,
+void EAPOD::radialbasis(double *rbf, double *drbf, double *rij, double **rin, double **invrdiff,
                         int *ti, int *tj,
-                        int besseldegree, int inversedegree,
-                        int nbesselpars, int N)
+                        int besseldegree, int inversedegree, int nbesselpars, int N)
 {
   const int itype = ti[0];
 
@@ -2102,9 +2071,6 @@ void EAPOD::radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz,
     double zij = rij[3*n + 2];
     double dij    = sqrt(xij*xij + yij*yij + zij*zij);
     double invdij = 1.0 / dij;
-    double dr1 = xij * invdij;
-    double dr2 = yij * invdij;
-    double dr3 = zij * invdij;
 
     double invrmax = invrdiff[itype][jtype];
     double r       = dij - rin[itype][jtype];
@@ -2143,9 +2109,7 @@ void EAPOD::radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz,
         double drbfdr = bg1 * isinax + Kf1dx * cosax;
 
         rbf [nij] = rbfv;
-        rbfx[nij] = drbfdr * dr1;
-        rbfy[nij] = drbfdr * dr2;
-        rbfz[nij] = drbfdr * dr3;
+        drbf[nij] = drbfdr * invdij;
         ix += xpi;
         nij += N;
       }
@@ -2164,9 +2128,7 @@ void EAPOD::radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz,
       double drbfdr = dterm * inva;
 
       rbf [nij] = rbfv;
-      rbfx[nij] = drbfdr * dr1;
-      rbfy[nij] = drbfdr * dr2;
-      rbfz[nij] = drbfdr * dr3;
+      drbf[nij] = drbfdr * invdij;
       nij += N;
     }
   }
@@ -2175,8 +2137,8 @@ void EAPOD::radialbasis(double *rbf, double *rbfx, double *rbfy, double *rbfz,
 // Orthogonalize rbf with Phi (eigenvectors)
 // Apply Phi transformation for each atom pair
 // rbf = Phi * rbft
-void EAPOD::radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
-                      double *rbft, double *rbfxt, double *rbfyt, double *rbfzt,
+void EAPOD::radialPhi(double *rbf, double *drbf,
+                      double *rbft, double *drbft,
                       int *ti, int *tj, int N)
 {
   const int ns2 = ns*ns;
@@ -2186,23 +2148,17 @@ void EAPOD::radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
     int nsij = (jtype + itypene)*ns2;
     for (int k=0; k<nrbfmax; k++) {
       double sum_rbf = 0.0;
-      double sum_rbfx = 0.0;
-      double sum_rbfy = 0.0;
-      double sum_rbfz = 0.0;
+      double sum_drbf = 0.0;
 
       for (int j=0; j<ns; j++) {
         double Phis = Phi[j + k*ns + nsij];
         sum_rbf  += Phis * rbft[n + N*j];
-        sum_rbfx += Phis * rbfxt[n + N*j];
-        sum_rbfy += Phis * rbfyt[n + N*j];
-        sum_rbfz += Phis * rbfzt[n + N*j];
+        sum_drbf += Phis * drbft[n + N*j];
       }
 
       int nij = n + N * k;
       rbf[nij] = sum_rbf;
-      rbfx[nij] = sum_rbfx;
-      rbfy[nij] = sum_rbfy;
-      rbfz[nij] = sum_rbfz;
+      drbf[nij] = sum_drbf;
     }
   }
 }
@@ -2213,7 +2169,7 @@ void EAPOD::radialPhi(double *rbf, double *rbfx, double *rbfy, double *rbfz,
 
    This builds a *clamped cubic spline* per (pair,k):
      - interpolates f_k at all nodes
-     - enforces endpoint slopes from analytic df/dr (rbfx at x-axis nodes)
+     - enforces endpoint slopes from analytic df/dr (drbf)
      - is C2 across all interior knots
 ------------------------------------------------------------------------- */
 void EAPOD::init_spline_radialbasis()
@@ -2230,18 +2186,14 @@ void EAPOD::init_spline_radialbasis()
   memory->create(rbf_spline_coeffs, ne*ne*nb*nrbfmax*4, "rbf_spline_coeffs");
 
   // scratch buffers for basis sampling
-  double *rij, *rbft, *rbfxt, *rbfyt, *rbfzt;
-  double *rbf, *rbfx, *rbfy, *rbfz;
+  double *rij, *rbft, *drbft;
+  double *rbf, *drbf;
   int *tit, *tjt;
   memory->create(rij,   3*Ng,       "spl:rij");
   memory->create(rbft,  Ng*ns,      "spl:rbft");
-  memory->create(rbfxt, Ng*ns,      "spl:rbfxt");
-  memory->create(rbfyt, Ng*ns,      "spl:rbfyt");
-  memory->create(rbfzt, Ng*ns,      "spl:rbfzt");
+  memory->create(drbft, Ng*ns,      "spl:drbft");
   memory->create(rbf,   Ng*nrbfmax, "spl:rbf");
-  memory->create(rbfx,  Ng*nrbfmax, "spl:rbfx");
-  memory->create(rbfy,  Ng*nrbfmax, "spl:rbfy");
-  memory->create(rbfz,  Ng*nrbfmax, "spl:rbfz");
+  memory->create(drbf,  Ng*nrbfmax, "spl:drbf");
   memory->create(tit,   1,          "spl:tit");
   memory->create(tjt,   Ng,         "spl:tjt");
 
@@ -2278,18 +2230,18 @@ void EAPOD::init_spline_radialbasis()
       }
 
       // sample analytical rbf and df/dr at nodes
-      radialbasis(rbft, rbfxt, rbfyt, rbfzt, rij, rin, invrdiff,
+      radialbasis(rbft, drbft, rij, rin, invrdiff,
                   tit, tjt, besseldegree, inversedegree, nbesselpars, Ng);
-      radialPhi(rbf, rbfx, rbfy, rbfz, rbft, rbfxt, rbfyt, rbfzt, tit, tjt, Ng);
+      radialPhi(rbf, drbf, rbft, drbft, tit, tjt, Ng);
 
       // Build one clamped C2 cubic spline per basis channel k
       for (int k = 0; k < nrbfmax; ++k) {
         // y[i] = f(r_i)
         for (int i = 0; i < Ng; ++i) y[i] = rbf[i + Ng*k];
 
-        // endpoint slopes m0,mN are df/dr from rbfx at x-axis nodes
-        const double m0 = rbfx[0  + Ng*k];
-        const double mN = rbfx[nb + Ng*k];
+        // endpoint slopes m0,mN are df/dr from drbf
+        const double m0 = drbf[0  + Ng*k];
+        const double mN = drbf[nb + Ng*k];
 
         // Tridiagonal system for node second derivatives M[i] = f''(r_i)
         // Uniform-grid clamped cubic spline:
@@ -2334,10 +2286,8 @@ void EAPOD::init_spline_radialbasis()
   }
 
   memory->destroy(rij);
-  memory->destroy(rbft);  memory->destroy(rbfxt);
-  memory->destroy(rbfyt); memory->destroy(rbfzt);
-  memory->destroy(rbf);   memory->destroy(rbfx);
-  memory->destroy(rbfy);  memory->destroy(rbfz);
+  memory->destroy(rbft);  memory->destroy(drbft);
+  memory->destroy(rbf);   memory->destroy(drbf);
   memory->destroy(tit);   memory->destroy(tjt);
 
   memory->destroy(y);   memory->destroy(M);
@@ -2345,8 +2295,7 @@ void EAPOD::init_spline_radialbasis()
   memory->destroy(du);  memory->destroy(rhs);
 }
 
-void EAPOD::radialbasis_spline(double *rbf, double *rbfx, double *rbfy, double *rbfz,
-                               double *rij, int *ti, int *tj, int N)
+void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N)
 {
   const int ne = nelements;
   const int nb = nspline_bins;
@@ -2384,9 +2333,7 @@ void EAPOD::radialbasis_spline(double *rbf, double *rbfx, double *rbfy, double *
 
       int idx = n + N*k;
       rbf [idx] = f;
-      rbfx[idx] = h*x;
-      rbfy[idx] = h*y;
-      rbfz[idx] = h*z;
+      drbf[idx] = h;
     }
   }
 }
@@ -2485,6 +2432,36 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
   }
 }
 
+void EAPOD::radialangularsum(double *sumU, double *rbf, double *abf, int *tj,
+                             int Nj, int K, int M, int Ne)
+{
+  if (Ne == 1) {
+    for (int m = 0; m < M; ++m) {
+      const double *r = &rbf[Nj*m];
+      double *su = &sumU[K*m];
+      for (int k = 0; k < K; ++k) {
+        const double *a = &abf[Nj*k];
+        double sum = 0.0;
+        for (int n = 0; n < Nj; ++n)
+          sum += r[n] * a[n];
+        su[k] = sum;
+      }
+    }
+  } else {
+    const int NeK = Ne*K;
+    std::fill(sumU, sumU + NeK*M, 0.0);
+    for (int n = 0; n < Nj; ++n) {
+      const int e = tj[n];
+      const double *a = &abf[n];
+      for (int m = 0; m < M; ++m) {
+        const double c = rbf[n + Nj*m];
+        double *su = &sumU[e + NeK*m];
+        for (int k = 0; k < K; ++k) su[Ne*k] += c * a[Nj*k];
+      }
+    }
+  }
+}
+
 /**
  * @brief Calculates the radial-angular basis functions and their derivatives.
  *
@@ -2493,9 +2470,7 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
  * @param Uy    Pointer to the array to store the derivative of U with respect to y.
  * @param Uz    Pointer to the array to store the derivative of U with respect to z.
  * @param rbf   Pointer to the radial basis function array.
- * @param rbfx  Pointer to the derivative of rbf with respect to x.
- * @param rbfy  Pointer to the derivative of rbf with respect to y.
- * @param rbfz  Pointer to the derivative of rbf with respect to z.
+ * @param drbf  Pointer to the derivative of rbf with respect to x.
  * @param abf   Pointer to the angular basis function array.
  * @param abfx  Pointer to the derivative of abf with respect to x.
  * @param abfy  Pointer to the derivative of abf with respect to y.
@@ -2508,7 +2483,7 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
  * @param Ne    Number of elements.
  */
 void EAPOD::radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz,
-                               double *rbf, double *rbfx, double *rbfy, double *rbfz,
+                               double *rbf, double *drbf, double *rij,
                                double *abf, double *abfx, double *abfy, double *abfz,
                                double *tm, int *tj, int N, int K, int M, int Ne)
 {
@@ -2525,9 +2500,10 @@ void EAPOD::radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz,
         for (int n = 0; n < N; ++n, ++ia, ++ib, ++ii) {
           double c1 = rbf[ib];
           double c2 = abf[ia];
-          Ux[ii] = abfx[ia] * c1 + c2 * rbfx[ib];
-          Uy[ii] = abfy[ia] * c1 + c2 * rbfy[ib];
-          Uz[ii] = abfz[ia] * c1 + c2 * rbfz[ib];
+          double c3 = drbf[ib];
+          Ux[ii] = abfx[ia] * c1 + c2 * c3 * rij[3*n];
+          Uy[ii] = abfy[ia] * c1 + c2 * c3 * rij[3*n+1];
+          Uz[ii] = abfz[ia] * c1 + c2 * c3 * rij[3*n+2];
           sum += c1 * c2;
         }
         sumU[sumIdx] = sum;
@@ -2544,9 +2520,10 @@ void EAPOD::radialangularbasis(double *sumU, double *Ux, double *Uy, double *Uz,
         for (int n = 0; n < N; ++n, ++ia, ++ib, ++ii) {
           double c1 = rbf[ib];
           double c2 = abf[ia];
-          Ux[ii] = abfx[ia] * c1 + c2 * rbfx[ib];
-          Uy[ii] = abfy[ia] * c1 + c2 * rbfy[ib];
-          Uz[ii] = abfz[ia] * c1 + c2 * rbfz[ib];
+          double c3 = drbf[ib];
+          Ux[ii] = abfx[ia] * c1 + c2 * c3 * rij[3*n];
+          Uy[ii] = abfy[ia] * c1 + c2 * c3 * rij[3*n+1];
+          Uz[ii] = abfz[ia] * c1 + c2 * c3 * rij[3*n+2];
           tm[tj[n]] += c1 * c2;  // accumulate per element type
         }
         // contiguous writeback
@@ -2958,16 +2935,16 @@ int EAPOD::estimate_temp_memory(int Nj)
   // sumU and cU
   int nmax3 = 2*nelements*Knrbf34;
 
-  // rbf, rbfx, rbfy, rbfz
-  int nmax4 = 4*Nj*nrbfmax;
+  // rbf, drbf
+  int nmax4 = 2*Nj*nrbfmax;
 
-  // rbft, rbfxt, rbfyt, rbfzt
-  int nmax5 = 4*Nj*ns;
+  // rbft, drbft
+  int nmax5 = 2*Nj*ns;
 
   // abf, abfx, abfy, abfz
   int nmax6 = 4*(Nj+1)*Kmax;
 
-  // Determine the maximum amount of memory needed for Ux, Uy, Uz, sumU, cU, rbf, rbfx, rbfy, rbfz, abf, abfx, abfy, abfz
+  // Determine the maximum amount of memory needed for Ux, Uy, Uz, sumU, cU, rbf, drbf, abf, abfx, abfy, abfz
   int nmax7 = MAX(nmax5, nmax6);
   int nmax8 = nmax2 + nmax3 + nmax4 + nmax7;
 

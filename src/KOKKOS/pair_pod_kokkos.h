@@ -154,9 +154,7 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d bessel_dx_factor;
   t_pod_1d Phi;  // eigenvectors matrix ns x ns
   t_pod_1d rbf;  // radial basis functions nij x nrbfmax
-  t_pod_1d rbfx; // x-derivatives of radial basis functions nij x nrbfmax
-  t_pod_1d rbfy; // y-derivatives of radial basis functions nij x nrbfmax
-  t_pod_1d rbfz; // z-derivatives of radial basis functions nij x nrbfmax
+  t_pod_1d drbf; // x-derivatives of radial basis functions nij x nrbfmax
   t_pod_1d abf;  // angular basis functions nij x K3
   t_pod_1d abfx; // x-derivatives of angular basis functions nij x K3
   t_pod_1d abfy; // y-derivatives of angular basis functions nij x K3
@@ -202,7 +200,7 @@ class PairPODKokkos : public PairPOD {
     t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj, int gi1, int Ni);
   
   void radialbasis(
-    t_pod_1d rbft, t_pod_1d rbftx, t_pod_1d rbfty, t_pod_1d rbftz,
+    t_pod_1d rbft, t_pod_1d drbft,
     t_pod_1d rij, t_pod_2d l_rin, t_pod_2d l_invrdiff,
     t_pod_1d l_neg_alpha, t_pod_1d l_pi_inv_t1, t_pod_1d l_dx_factor,
     t_pod_1i l_ti, t_pod_1i l_tj,
@@ -210,8 +208,7 @@ class PairPODKokkos : public PairPOD {
 
   void matrixMultiply(t_pod_1d a, t_pod_1d b, t_pod_1d c, int r1, int c1, int c2);
 
-  void radialbasis_spline(t_pod_1d rbf, t_pod_1d rbfx, t_pod_1d rbfy, t_pod_1d rbfz,
-                          t_pod_1d rij, t_pod_1i ti, t_pod_1i tj, int N);
+  void radialbasis_spline(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rij, t_pod_1i ti, t_pod_1i tj, int N);
 
   void angularbasis(t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
         t_pod_1d l_rij, t_pod_1i l_pq_m, t_pod_1i l_pq_d, int K3, int N);
@@ -236,7 +233,7 @@ class PairPODKokkos : public PairPOD {
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
-  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_rbfx, t_pod_1d l_rbfy, t_pod_1d l_rbfz,
+  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf, t_pod_1d l_rij,
           t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3, t_pod_1d l_sumU, t_pod_1i l_pc3,
@@ -245,8 +242,8 @@ class PairPODKokkos : public PairPOD {
   void fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4, t_pod_1d l_sumU, t_pod_1i l_pa4,
     t_pod_1i l_pb4, t_pod_1i l_pc4, int l_nelements, int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni);
 
-  void allbody_forces(t_pod_1d fij, t_pod_1d l_forcecoeff, t_pod_1d l_rbf, t_pod_1d l_rbfx,
-    t_pod_1d l_rbfy, t_pod_1d l_rbfz, t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
+  void allbody_forces(t_pod_1d fij, t_pod_1d l_forcecoeff, t_pod_1d l_rbf, t_pod_1d l_drbf, t_pod_1d l_rij,
+    t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
     t_pod_1i l_idxi, t_pod_1i l_tj, int l_nelements, int l_nrbf3, int l_K3, int Nij);
 
   void blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij);
