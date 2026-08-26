@@ -122,10 +122,6 @@ class FitPOD : public Command {
   neighborstruct nb;
   class EAPOD *fastpodptr;
 
-  double *radialW0;
-  double *radialW1;
-  double *radialW2;
-
   // functions for collecting/collating arrays
   void podCumsum(int *output, int *input, int length);
   double podArrayNorm(double *a, int n);
@@ -211,10 +207,6 @@ class FitPOD : public Command {
   void energyforce_calculation(const datastruct &data);
 
   void compute_loss_weights(const datastruct &data, double *ew, double *fw);
-  void add_radial_smoothness(double *A, int nCoeffAll, double w0, double w1, double w2);
-  void build_pair_distance_density(const datastruct &data, std::vector<double> &rho, int Nrho);
-  inline void radial_smoothness_matrices(double *rho = nullptr, int Nrho = 0, double eps = 0.0);
-  inline void radial_regularization_matrix(double *Wreg, double w0, double w1, double w2);
 };
 }    // namespace LAMMPS_NS
 #endif
