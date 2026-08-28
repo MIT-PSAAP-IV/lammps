@@ -1331,7 +1331,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
 
   // Initialize forcecoeff to zero
   double *forcecoeff = &cb[nl2 + nl3 + nl4]; // nelements*K3*nrbf3
-  std::fill(forcecoeff, forcecoeff + nelements * K3 * nrbf3, 0.0);
+  memset(forcecoeff, 0, nelements * K3 * nrbf3 * sizeof(*forcecoeff));
   if ((nl3 > 0) && (Nj>1)) threebody_forcecoeff(forcecoeff, cb3, sumU);
   if ((nl4 > 0) && (Nj>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU);
   if ((nl3 > 0) && (Nj>1)) allbody_forces(fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz, tj, Nj);
@@ -1630,8 +1630,8 @@ void EAPOD::myneighbors(double *rij, double *x, int *ai, int *aj, int *ti, int *
 
 void EAPOD::fourbodydesc(double *d4, double *sumU)
 {
-  int Me = nelements * (nelements + 1) * (nelements + 2) / 6;
-  std::fill(d4, d4 + nabf4_active * nrbf4 * Me, 0.0);
+  const int Me = nelements * (nelements + 1) * (nelements + 2) / 6;
+  memset(d4, 0, nabf4_active * nrbf4 * Me * sizeof(*d4));
 
   for (int m = 0; m < nrbf4; m++) {
     int idxU = nelements * K3 * m;
@@ -1670,11 +1670,9 @@ void EAPOD::fourbodydesc(double *d4, double *sumU)
 void EAPOD::fourbodydescderiv(double *d4, double *dd4, double *sumU,
                               double *Ux, double *Uy, double *Uz, int *tj, int N)
 {
-  int Me = nelements * (nelements + 1) * (nelements + 2) / 6;
-  std::fill(d4,  d4  + nabf4_active * nrbf4 * Me, 0.0);
-  std::fill(dd4, dd4 + 3 * N * nabf4_active * nrbf4 * Me, 0.0);
-
-  int Q = pa4[nabf4];
+  const int Me = nelements * (nelements + 1) * (nelements + 2) / 6;
+  memset(d4, 0, nabf4_active * nrbf4 * Me * sizeof(*d4));
+  memset(dd4, 0, 3 * N * nabf4_active * nrbf4 * Me * sizeof(*dd4));
 
   if (nelements == 1) {
     for (int m = 0; m < nrbf4; m++) {
@@ -1688,8 +1686,8 @@ void EAPOD::fourbodydescderiv(double *d4, double *dd4, double *sumU,
           int iq = n1 + q;
           int c  = pc4[iq];
           int j1 = pb4[iq];
-          int j2 = pb4[iq + Q];
-          int j3 = pb4[iq + 2 * Q];
+          int j2 = pb4[iq + Q4];
+          int j3 = pb4[iq + 2 * Q4];
 
           double c1  = c * sumU[j1 + K4 * m];
           double c2  = c * sumU[j2 + K4 * m];
@@ -1733,8 +1731,8 @@ void EAPOD::fourbodydescderiv(double *d4, double *dd4, double *sumU,
           int iq = n1 + q;
           int c  = pc4[iq];
           int j1 = pb4[iq];
-          int j2 = pb4[iq + Q];
-          int j3 = pb4[iq + 2 * Q];
+          int j2 = pb4[iq + Q4];
+          int j3 = pb4[iq + 2 * Q4];
 
           int k = 0;
           for (int i1 = 0; i1 < nelements; i1++) {
@@ -1831,7 +1829,7 @@ void EAPOD::threebodydescderiv(double *dd3, double *sumU, double *Ux, double *Uy
                                int *tj, int N)
 {
   int Me = nelements * (nelements + 1) / 2;
-  std::fill(dd3, dd3 + 3 * N * nabf3_active * nrbf3 * Me, 0.0);
+  memset(dd3, 0, 3 * N * nabf3_active * nrbf3 * Me * sizeof(*dd3));
 
   if (nelements == 1) {
     for (int m = 0; m < nrbf3; m++) {
@@ -2396,7 +2394,7 @@ void EAPOD::radialangularsum(double *sumU, double *rbf, double *abf, int *tj,
     }
   } else {
     const int NeK = Ne*K;
-    std::fill(sumU, sumU + NeK*M, 0.0);
+    memset(sumU, 0,  NeK*M * sizeof(*sumU));
     for (int n = 0; n < Nj; ++n) {
       const int e = tj[n];
       const double *a = &abf[n];
@@ -2865,21 +2863,23 @@ void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, do
  */
 int EAPOD::estimate_temp_memory(int Nj)
 {
-  // Determine the maximum number of radial basis functions and angular basis functions
-  int Kmax = MAX(K3, K4);
-  int Knrbf34 = MAX(K3*nrbf3, K4*nrbf4);
-
-  // Determine the maximum number of local descriptors
+  // Maximum number of >=5-body cross descriptors: d33, d34, d44
   int nld = MAX(MAX(nl33, nl34), nl44);
 
-  // rij, fij, d2, d3, d4, dd2, dd3, dd4
-  int nmax1 = 6*Nj + (nl2 + nl3 + nl4 + nld) + 3*Nj*(nl2 + nl3 + nl4 + nld);
+  // d2, d3, d4, nld
+  int nmaxnl = nl2 + nl3 + nl4 + nld;
 
-  // Ux, Uy, Uz (training only)
-  int nmax2 = 3*Nj*Knrbf34;
+  // dd2, dd3, dd4 (training only)
+  int nmaxnd = 3*Nj*nmaxnl;
+
+  // rij, fij, d2, d3, d4, dd2, dd3, dd4
+  int nmax1 = 6*Nj + nmaxnl + nmaxnd;
+
+  // Ux, Uy, Uz (training only) K3>=K4, nrbf3>=nrbf4
+  int nmax2 = 3*Nj*K3*nrbf3;
 
   // sumU and cU
-  int nmax3 = 2*nelements*Knrbf34;
+  int nmax3 = 2*nelements*K3*nrbf3;
 
   // rbf, drbf
   int nmax4 = 2*Nj*nrbf2;
@@ -2888,13 +2888,13 @@ int EAPOD::estimate_temp_memory(int Nj)
   int nmax5 = 2*Nj*ns;
 
   // abf, abfx, abfy, abfz
-  int nmax6 = 4*(Nj+1)*Kmax;
+  int nmax6 = 4*(Nj+1)*K3;
 
   // Determine the total amount of memory needed for all double memory
   ndblmem = nmax1 + nmax2 + nmax3 + nmax4 + MAX(nmax5, nmax6);
 
   int eatmpmem = nComponents;
-  if (localeapod) eatmpmem += nMaxActiveClusters*(1 + nComponents + nMaxActiveClusters + 2*Mdesc + 2);
+  if (localeapod) eatmpmem += nMaxActiveClusters*(4*nComponents + nMaxActiveClusters + 2*Mdesc);
   else if (eapod) eatmpmem += nClusters*(1 + nComponents + nClusters + 2*Mdesc);
 
   int nmax9 = 6*Nj + eatmpmem;
@@ -3101,47 +3101,34 @@ inline void EAPOD::cluster_cutoff_poly_sq_train(double u, double &fcut, double &
 
 void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double *B, double *dB_dR, double *tmp, int elem, int nNeighbors)
 {
+  memset(P, 0, nClusters * sizeof(*P));
+  memset(dP_dR, 0, 3*nNeighbors*nClusters * sizeof(*dP_dR));
+
+  const int ncde = nComponents*Mdesc*elem;
+  const int ncce = nComponents*nClusters*elem;
+
+  double *ProjMat = &Proj[ncde];
+  double *centroids = &Centroids[ncce];
+
+  double *invlcut2 = &invLeftClusterRcut2[ncce];
+  double *invrcut2 = &invRightClusterRcut2[ncce];
+  double *ledges = &leftClusterEdges[ncce];
+  double *redges = &rightClusterEdges[ncce];
+  
+  // tmp memory treated for the nComponent dimensional PCA (general case)
+  // Local EA-POD currently only supports nComponents==1 (enforced at init)
+  const int nActClsCp = nMaxActiveClusters*nComponents;
+  const int ntmpmem = nComponents + nMaxActiveClusters*(4*nComponents + nMaxActiveClusters + 2*Mdesc);
+  memset(tmp, 0, ntmpmem * sizeof(*tmp));
+
   double *pca = &tmp[0];
   double *D = &tmp[nComponents];
-  double *clusterFcut = &tmp[nComponents + nMaxActiveClusters];
-  double *clusterDFcut = &tmp[nComponents + 2*nMaxActiveClusters];
-  double *dD_dpca = &tmp[nComponents + 3*nMaxActiveClusters];
-  double *dD_dB = &tmp[nComponents + 4*nMaxActiveClusters + nMaxActiveClusters*nComponents];
-  double *dP_dD = &tmp[nComponents + 4*nMaxActiveClusters + nMaxActiveClusters*nComponents + nMaxActiveClusters*Mdesc];
-  double *dP_dB = &tmp[nComponents + 4*nMaxActiveClusters + nMaxActiveClusters*nComponents + nMaxActiveClusters*Mdesc + nMaxActiveClusters*nClusters];
-  
-  double *ProjMat = &Proj[nComponents * Mdesc * elem];
-  double *centroids = &Centroids[nComponents * nClusters * elem];
-
-  double *invlcut2 = &invLeftClusterRcut2[nComponents * nClusters * elem];
-  double *invrcut2 = &invRightClusterRcut2[nComponents * nClusters * elem];
-  double *ledges = &leftClusterEdges[nComponents * nClusters * elem];
-  double *redges = &rightClusterEdges[nComponents * nClusters * elem];
-
-  for (int j = 0; j < nClusters; j++) {
-    P[j] = 0.0;
-  }
-
-  for (int j = 0; j < nClusters; j++) {
-    for (int n = 0; n < nNeighbors; n++) {
-      int nj = 3*n + 3*nNeighbors*j;
-      dP_dR[0 + nj] = 0.0;
-      dP_dR[1 + nj] = 0.0;
-      dP_dR[2 + nj] = 0.0;
-    }
-  }
-
-  for (int j = 0; j < nMaxActiveClusters; j++) {
-    D[j] = 0.0;
-    clusterFcut[j] = 0.0;
-  }
-
-  for (int k = 0; k < nMaxActiveClusters; k++) {
-    for (int n = 0; n < nComponents; n++) {
-      clusterDFcut[k + n * nMaxActiveClusters] = 0.0;
-      dD_dpca[k + n * nMaxActiveClusters] = 0.0;
-    }
-  }
+  double *clusterFcut = &tmp[nComponents + nActClsCp];
+  double *clusterDFcut = &tmp[nComponents + 2*nActClsCp];
+  double *dD_dpca = &tmp[nComponents + 3*nActClsCp];
+  double *dP_dD = &tmp[nComponents + 4*nActClsCp];
+  double *dD_dB = &tmp[nComponents + 4*nActClsCp + nMaxActiveClusters*nMaxActiveClusters];
+  double *dP_dB = &tmp[nComponents + 4*nActClsCp + nMaxActiveClusters*nMaxActiveClusters + nMaxActiveClusters*Mdesc];
 
   // calculate pca descriptors
   for (int k = 0; k < nComponents; k++) {
@@ -3176,15 +3163,14 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
     //cluster_cutoff_poly_sq_train(u, fcut, dfcut_du);
 
     // guards for training
-    if (std::abs(u - 1.0) <= 1e-4) {
+    if (abs(u - 1.0) <= 1e-4) {
       fcut = 0.0;
       dfcut_du = 0.0;
     }
 
-    if (std::abs(u - 0.0) <= 1e-4) {
+    if (u <= 1e-4) {
       fcut = 1.0;
       dfcut_du = 0.0;
-      //s2 += 1e-20; // fix for zero distances
     }
     
     // dfcut/dpca[n] = (df/du) * (du/dpca[n])
@@ -3218,24 +3204,12 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
     sumD += D[j];
   }
 
+  double S1 = 1.0 / sumD;
   for (int j = 0; j < kn; j++) {
-    P[j+ks] = D[j] / sumD;
+    P[j+ks] = D[j] * S1;
   }
-
-  // calculate dD_dB
-  char chn = 'N';
-  char cht = 'T';
-  double alpha = 1.0, beta = 0.0;
-  DGEMM(&chn, &chn, &kn, &Mdesc, &nComponents, &alpha, dD_dpca, &kn, ProjMat, &nComponents, &beta, dD_dB, &kn);
 
   // calculate dP_dD
-  for (int k = 0; k < kn; k++) {
-    for (int j = 0; j < kn; j++) {
-      dP_dD[j + k * kn] = 0.0;
-    }
-  }
-
-  double S1 = 1.0 / sumD;
   double S2 = S1 * S1;
   for (int j = 0; j < kn; j++) {
     for (int k = 0; k < kn; k++) {
@@ -3243,6 +3217,12 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
     }
     dP_dD[j + j * kn] += S1;
   }
+
+  // calculate dD_dB
+  char chn = 'N';
+  char cht = 'T';
+  double alpha = 1.0, beta = 0.0;
+  DGEMM(&chn, &chn, &kn, &Mdesc, &nComponents, &alpha, dD_dpca, &kn, ProjMat, &nComponents, &beta, dD_dB, &kn);
 
   // calculate dP_dB = dP_dD * dD_dB, which are derivatives of probabilities with respect to local descriptors
   DGEMM(&chn, &chn, &kn, &Mdesc, &kn, &alpha, dP_dD, &kn, dD_dB, &kn, &beta, dP_dB, &kn);
