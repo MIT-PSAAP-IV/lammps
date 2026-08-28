@@ -390,7 +390,6 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   nrbf2 = podptr->nrbf2;
   nrbf3 = podptr->nrbf3;
   nrbf4 = podptr->nrbf4;
-  nrbfmax = podptr->nrbfmax; // number of radial basis functions
   nabf3 = podptr->nabf3;     // number of three-body angular basis functions
   nabf4 = podptr->nabf4;     // number of four-body angular basis functions
   nabf3_active = podptr->nabf3_active;     // number of three-body angular basis functions
@@ -419,7 +418,7 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
 
   if (use_spline) {
     const int npair = nelements * nelements;
-    const size_t ncoef = (size_t)npair * (size_t)nspline_bins * (size_t)nrbfmax * 4ull;
+    const size_t ncoef = (size_t)npair * (size_t)nspline_bins * (size_t)nrbf2 * 4ull;
 
     MemKK::realloc_kokkos(spline_r0, "pair_pod:spline_r0", npair);
     MemKK::realloc_kokkos(spline_invdr, "pair_pod:spline_invdr", npair);
@@ -665,8 +664,8 @@ void PairPODKokkos<DeviceType>::grow_pairs(int Nij)
     MemKK::realloc_kokkos(aj, "pair_pod:aj", nijmax);
     MemKK::realloc_kokkos(ti, "pair_pod:ti", nijmax);
     MemKK::realloc_kokkos(tj, "pair_pod:tj", nijmax);
-    MemKK::realloc_kokkos(rbf, "pair_pod:rbf", nijmax * nrbfmax);
-    MemKK::realloc_kokkos(drbf, "pair_pod:drbf", nijmax * nrbfmax);
+    MemKK::realloc_kokkos(rbf, "pair_pod:rbf", nijmax * nrbf2);
+    MemKK::realloc_kokkos(drbf, "pair_pod:drbf", nijmax * nrbf2);
     int kmax = (K3 > ns) ? K3 : ns;
     MemKK::realloc_kokkos(abf, "pair_pod:abf", nijmax * kmax);
     MemKK::realloc_kokkos(abfx, "pair_pod:abfx", nijmax * kmax);
@@ -901,7 +900,7 @@ void PairPODKokkos<DeviceType>::radialbasis_spline(
 {
   const int ne = nelements;
   const int nb = nspline_bins;
-  const int nr = nrbfmax;
+  const int nr = nrbf2;
 
   auto s_r0    = spline_r0;
   auto s_invdr = spline_invdr;
@@ -1381,8 +1380,8 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     comptime[10] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
     
     begin = std::chrono::high_resolution_clock::now();
-    matrixMultiply(abf,  Phi, rbf,  Nij, ns, nrbfmax);
-    matrixMultiply(abfx, Phi, drbf, Nij, ns, nrbfmax);
+    matrixMultiply(abf,  Phi, rbf,  Nij, ns, nrbf2);
+    matrixMultiply(abfx, Phi, drbf, Nij, ns, nrbf2);
     Kokkos::fence();
     end = std::chrono::high_resolution_clock::now();
     comptime[11] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
@@ -1985,15 +1984,15 @@ void PairPODKokkos<DeviceType>::savedatafordebugging()
   saveintmatrix2binfile("podkkti.bin", ti, nij, 1);
   saveintmatrix2binfile("podkktj.bin", tj, nij, 1);
   saveintmatrix2binfile("podkkidxi.bin", idxi, nij, 1);
-  savematrix2binfile("podkkrbf.bin", rbf, nrbfmax, nij);
-  savematrix2binfile("podkkrbfx.bin", drbf, nrbfmax, nij);
+  savematrix2binfile("podkkrbf.bin", rbf, nrbf2, nij);
+  savematrix2binfile("podkkrbfx.bin", drbf, nrbf2, nij);
   int kmax = (K3 > ns) ? K3 : ns;
   savematrix2binfile("podkkabf.bin", abf,   kmax, nij);
   savematrix2binfile("podkkabfx.bin", abfx, kmax, nij);
   savematrix2binfile("podkkabfy.bin", abfy, kmax, nij);
   savematrix2binfile("podkkabfz.bin", abfz, kmax, nij);
   savematrix2binfile("podkkbd.bin", bd, ni, Mdesc);
-  savematrix2binfile("podkkaccU.bin", sumU, nelements * K3 * nrbfmax, ni);
+  savematrix2binfile("podkkaccU.bin", sumU, nelements * K3 * nrbf3, ni);
   savematrix2binfile("podkkrij.bin", rij, 3, nij);
   savematrix2binfile("podkkfij.bin", fij, 3, nij);
   savematrix2binfile("podkkei.bin", ei, ni, 1);

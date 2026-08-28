@@ -107,7 +107,7 @@ class PairPODKokkos : public PairPOD {
   int nCoeffPerElement; // number of coefficients per element = (nl1 + Mdesc*nClusters)
   int ns;      // number of snapshots for radial basis functions
   int nl1, nl2, nl3, nl4, nl33, nl34, nl44, nl;   // number of local descriptors
-  int nrbf2, nrbf3, nrbf4, nrbfmax;            // number of radial basis functions
+  int nrbf2, nrbf3, nrbf4;            // number of radial basis functions
   int nabf3, nabf4;                            // number of angular basis functions
   int K3, K4, Q4;                                  // number of monomials
   int nabf3_active, nabf4_active;

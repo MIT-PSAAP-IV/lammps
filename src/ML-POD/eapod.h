@@ -40,7 +40,6 @@ namespace LAMMPS_NS {
 
 class EAPOD : protected Pointers {
  private:
-  int indexmap3(int *indx, int n1, int n2, int n3, int N1, int N2);
   int crossindices(int *dabf1, int nabf1, int nrbf1, int nebf1, int *dabf2, int nabf2, int nrbf2,
                    int nebf2, int dabf12, int nrbf12);
   int crossindices(int *ind1, int *ind2, int *dabf1, int nabf1, int nrbf1, int nebf1, int *dabf2,
@@ -99,12 +98,8 @@ class EAPOD : protected Pointers {
   double **rin;
   double **rcut;
   double **rcutsq;
-  double **rdiff;
   double **invrdiff;
   double rcutmax;
-  double rinmin;
-  double rdiffmax;
-  double invrdiffmax;
 
   int nelements;    // number of elements
   int pbc[3];
@@ -171,14 +166,14 @@ class EAPOD : protected Pointers {
   int ncoeff;       // number of coefficients in the input file
   int ns;           // number of snapshots for radial basis functions
 
-  int nd1, nd2, nd3, nd4, nd5, nd6, nd7, nd;    // number of global descriptors
-  int nl1, nl2, nl3, nl4, nl5, nl6, nl7, nl;    // number of local descriptors
-  int nrbf2, nrbf3, nrbf4, nrbfmax;             // number of radial basis functions
-  int nabf3, nabf4;                             // number of angular basis functions
-  int P3, P4;                                   // angular polynomial degrees
-  int K3, K4, Q4;                               // number of monomials
-  int *pn3, *pq3, *pc3;                         // arrays to compute 3-body angular basis functions
-  int *pa4, *pb4, *pc4;                         // arrays to compute 4-body angular basis functions
+  int nd1, nd2, nd3, nd4, nd;    // number of global descriptors
+  int nl1, nl2, nl3, nl4, nl;    // number of local descriptors
+  int nrbf2, nrbf3, nrbf4;       // number of radial basis functions
+  int nabf3, nabf4;              // number of angular basis functions
+  int P3, P4;                    // angular polynomial degrees
+  int K3, K4, Q4;                // number of monomials
+  int *pn3, *pq3, *pc3;          // arrays to compute 3-body angular basis functions
+  int *pa4, *pb4, *pc4;          // arrays to compute 4-body angular basis functions
   int *tmpint;
   int nintmem;    // number of integers in tmpint array
   int ndblmem;    // number of doubles in tmpmem array
@@ -192,15 +187,15 @@ class EAPOD : protected Pointers {
   int *deg4_full;   // per-channel angular degree for full 4-body enumeration (length nabf4)
 
   // five-body descriptors
-  int *ind33, nrbf33, nabf33, P33, n33, nl33, nd33;
+  int nrbf33, P33, nl33, nd33;
 
   // six-body descriptors
-  int *ind34, *ind43, nrbf34, nabf34, nabf43, P34, n34, n43, nl34, nd34;
+  int nrbf34, P34, nl34, nd34;
 
   // seven-body descriptors
-  int *ind44, nrbf44, nabf44, P44, n44, nl44, nd44;
+  int nrbf44, P44, nl44, nd44;
 
-  int nld33, nld34, nld44, ngd33, ngd34, ngd44;
+  // cross descriptor indices (5-7 body)
   int *ind33l, *ind33r, *ind34l, *ind34r, *ind44l, *ind44r;
 
   EAPOD(LAMMPS *, const std::string &pod_file, const std::string &coeff_file);

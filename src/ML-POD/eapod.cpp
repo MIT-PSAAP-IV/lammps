@@ -47,8 +47,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
     invPcaSpan(nullptr), clusterOccupancy(nullptr),
     bd(nullptr), bdd(nullptr), pd(nullptr), pdd(nullptr),
     pn3(nullptr), pq3(nullptr), pc3(nullptr), pa4(nullptr),
-    pb4(nullptr), pc4(nullptr), tmpint(nullptr), ind33(nullptr),
-    ind34(nullptr), ind43(nullptr), ind44(nullptr), ind33l(nullptr), ind33r(nullptr),
+    pb4(nullptr), pc4(nullptr), tmpint(nullptr), ind33l(nullptr), ind33r(nullptr),
     ind34l(nullptr), ind34r(nullptr), ind44l(nullptr), ind44r(nullptr),
     p3_active(nullptr), dabf3_active(nullptr),
     p4_active(nullptr), dabf4_active(nullptr), deg4_full(nullptr),
@@ -79,12 +78,8 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   nabf3 = 5;
   nabf4 = 0;
   nrbf33 = 0;
-  nabf33 = 0;
   nrbf34 = 0;
-  nabf34 = 0;
-  nabf43 = 0;
   nrbf44 = 0;
-  nabf44 = 0;
   P3 = 4;
   P4 = 0;
   P33 = 0;
@@ -118,7 +113,6 @@ EAPOD::~EAPOD()
   memory->destroy(rin);
   memory->destroy(rcut);
   memory->destroy(rcutsq);
-  memory->destroy(rdiff);
   memory->destroy(invrdiff);
   memory->destroy(Proj);
   memory->destroy(Centroids);
@@ -141,10 +135,6 @@ EAPOD::~EAPOD()
   memory->destroy(pa4);
   memory->destroy(pb4);
   memory->destroy(pc4);
-  memory->destroy(ind33);
-  memory->destroy(ind34);
-  memory->destroy(ind43);
-  memory->destroy(ind44);
   memory->destroy(ind33l);
   memory->destroy(ind34l);
   memory->destroy(ind44l);
@@ -341,13 +331,12 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   if (nrbf4 < nrbf33) error->all(FLERR,"number of five-body radial basis functions must be equal or less than number of four-body radial basis functions");
   if (nrbf4 < nrbf34) error->all(FLERR,"number of six-body radial basis functions must be equal or less than number of four-body radial basis functions");
   if (nrbf4 < nrbf44) error->all(FLERR,"number of seven-body radial basis functions must be equal or less than number of four-body radial basis functions");
-  nrbfmax = nrbf2;
 
   nbesselrbf = besseldegree*nbesselpars;
   ns = nbesselrbf + inversedegree;
-  if (ns < nrbfmax) {
-    inversedegree = nrbfmax - nbesselrbf;
-    ns = nrbfmax;
+  if (ns < nrbf2) {
+    inversedegree = nrbf2 - nbesselrbf;
+    ns = nrbf2;
   }
 
   for (int i = 0; i < nbesselpars; i++)
@@ -391,25 +380,17 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   
   // Compute the maximum and minimum distances between two atoms for each element pair type
   memory->create(rcutsq, Ne, Ne, "rcutsq");
-  memory->create(rdiff, Ne, Ne, "rdiff");
   memory->create(invrdiff, Ne, Ne, "invrdiff");
   rcutmax = rcut[0][0];
-  rinmin = rin[0][0];
   for (int i = 0; i < nelements; i++) {
     for (int j = 0; j < nelements; j++) {
       double rcut_ij = rcut[i][j];
       double rin_ij = rin[i][j];
-      double rdiff_ij = rcut_ij - rin_ij;
-      rdiff[i][j] = rdiff_ij;
-      invrdiff[i][j] = 1.0 / rdiff_ij;
+      invrdiff[i][j] = 1.0 / (rcut_ij - rin_ij);
       rcutsq[i][j] = rcut_ij * rcut_ij;
       if (rcut_ij > rcutmax) rcutmax = rcut_ij;
-      if (rin_ij < rinmin) rinmin = rin_ij;
     }
   }
-
-  rdiffmax = rcutmax - rinmin;
-  invrdiffmax = 1.0 / rdiffmax;
 
   init_bessel_const();
 
@@ -433,11 +414,6 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   int nebf3 = Ne*(Ne+1)/2;
   int nebf4 = Ne*(Ne+1)*(Ne+2)/6;
 
-  nabf33 = P33 + 1;
-  nabf34 = P34 + 1;
-  nabf43 = fourbody_channels(P34, nullptr, nullptr);
-  nabf44 = fourbody_channels(P44, nullptr, nullptr);
-
   if (onebody==0)
     nd1 = 0;
   else {
@@ -451,63 +427,34 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   nl3 = nabf3_active*nrbf3*nebf3;
   nl4 = nabf4_active*nrbf4*nebf4;
 
-  nd2 = nl2*Ne;
-  nd3 = nl3*Ne;
-  nd4 = nl4*Ne;
-
-  n33 = nabf33*nrbf33*nebf3;
-  n34 = nabf34*nrbf34*nebf3;
-  n43 = nabf43*nrbf34*nebf4;
-  n44 = nabf44*nrbf44*nebf4;
-
-  nl34 = n34*n43;
-  nl33 = n33*(n33+1)/2;
-  nl44 = n44*(n44+1)/2;
-
-  nd33 = nl33*Ne;
-  nd34 = nl34*Ne;
-  nd44 = nl44*Ne;
-
-  memory->create(ind33, n33, "ind33");
-  memory->create(ind34, n34, "ind34");
-  memory->create(ind43, n43, "ind43");
-  memory->create(ind44, n44, "ind44");
-
-  indexmap3(ind33, nabf33, nrbf33, nebf3, nabf3_active, nrbf3);
-  indexmap3(ind34, nabf34, nrbf34, nebf3, nabf3_active, nrbf3);
-  indexmap3(ind43, nabf43, nrbf34, nebf4, nabf4_active, nrbf4);
-  indexmap3(ind44, nabf44, nrbf44, nebf4, nabf4_active, nrbf4);
-
-  nld33 = 0;
-  nld34 = 0;
-  nld44 = 0;
+  nl33 = 0;
+  nl34 = 0;
+  nl44 = 0;
   if (nrbf33>0) {
-    nld33 = crossindices(dabf3_active, nabf3_active, nrbf3, nebf3, dabf3_active, nabf3_active, nrbf3, nebf3, P33, nrbf33);
-    memory->create(ind33l, nld33, "ind33l");
-    memory->create(ind33r, nld33, "ind33r");
+    nl33 = crossindices(dabf3_active, nabf3_active, nrbf3, nebf3, dabf3_active, nabf3_active, nrbf3, nebf3, P33, nrbf33);
+    memory->create(ind33l, nl33, "ind33l");
+    memory->create(ind33r, nl33, "ind33r");
     crossindices(ind33l, ind33r, dabf3_active, nabf3_active, nrbf3, nebf3, dabf3_active, nabf3_active, nrbf3, nebf3, P33, nrbf33);
   }
   if (nrbf34>0) {
-    nld34 = crossindices(dabf3_active, nabf3_active, nrbf3, nebf3, dabf4_active, nabf4_active, nrbf4, nebf4, P34, nrbf34);
-    memory->create(ind34l, nld34, "ind34l");
-    memory->create(ind34r, nld34, "ind34r");
+    nl34 = crossindices(dabf3_active, nabf3_active, nrbf3, nebf3, dabf4_active, nabf4_active, nrbf4, nebf4, P34, nrbf34);
+    memory->create(ind34l, nl34, "ind34l");
+    memory->create(ind34r, nl34, "ind34r");
     crossindices(ind34l, ind34r, dabf3_active, nabf3_active, nrbf3, nebf3, dabf4_active, nabf4_active, nrbf4, nebf4, P34, nrbf34);
   }
   if (nrbf44>0) {
-    nld44 = crossindices(dabf4_active, nabf4_active, nrbf4, nebf4, dabf4_active, nabf4_active, nrbf4, nebf4, P44, nrbf44);
-    memory->create(ind44l, nld44, "ind44l");
-    memory->create(ind44r, nld44, "ind44r");
+    nl44 = crossindices(dabf4_active, nabf4_active, nrbf4, nebf4, dabf4_active, nabf4_active, nrbf4, nebf4, P44, nrbf44);
+    memory->create(ind44l, nl44, "ind44l");
+    memory->create(ind44r, nl44, "ind44r");
     crossindices(ind44l, ind44r, dabf4_active, nabf4_active, nrbf4, nebf4, dabf4_active, nabf4_active, nrbf4, nebf4, P44, nrbf44);
   }
-  ngd33 = nld33*Ne;
-  ngd34 = nld34*Ne;
-  ngd44 = nld44*Ne;
-  nl33 = nld33;
-  nl34 = nld34;
-  nl44 = nld44;
-  nd33 = ngd33;
-  nd34 = ngd34;
-  nd44 = ngd44;
+
+  nd2 = nl2*Ne;
+  nd3 = nl3*Ne;
+  nd4 = nl4*Ne;
+  nd33 = nl33*Ne;
+  nd34 = nl34*Ne;
+  nd44 = nl44*Ne;
 
   Mdesc = nl2 + nl3 + nl4 + nl33 + nl34 + nl44;
   nl = nl1 + nl2 + nl3 + nl4 + nl33 + nl34 + nl44;
@@ -847,7 +794,7 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
   double *dd44 = &bdd1[3*Nj*(nl2+nl3+nl4+nl33+nl34)]; // 3*Nj*nl44
 
   int n1 = Nj*K3*nrbf3;
-  int n2 = Nj*nrbfmax;
+  int n2 = Nj*nrbf2;
   int n3 = Nj*ns;
   int n4 = Nj*K3;
   int n5 = K3*nrbf3*nelements;
@@ -1320,7 +1267,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   double *d34 = &bd[nl2 + nl3 + nl4 + nl33]; // nl34
   double *d44 = &bd[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
-  int n2 = Nj*nrbfmax;
+  int n2 = Nj*nrbf2;
   int n3 = Nj*ns;
   int n4 = Nj*K3;
   int n5 = K3*nrbf3*nelements;
@@ -1383,7 +1330,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   twobody_forces(fij, cb2, drbf, rij, tj, Nj);
 
   // Initialize forcecoeff to zero
-  double *forcecoeff = &cb[nl2 + nl3 + nl4]; // nl33
+  double *forcecoeff = &cb[nl2 + nl3 + nl4]; // nelements*K3*nrbf3
   std::fill(forcecoeff, forcecoeff + nelements * K3 * nrbf3, 0.0);
   if ((nl3 > 0) && (Nj>1)) threebody_forcecoeff(forcecoeff, cb3, sumU);
   if ((nl4 > 0) && (Nj>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU);
@@ -2146,7 +2093,7 @@ void EAPOD::radialPhi(double *rbf, double *drbf,
   for (int n=0; n<N; n++) {
     int jtype = tj[n];
     int nsij = (jtype + itypene)*ns2;
-    for (int k=0; k<nrbfmax; k++) {
+    for (int k=0; k<nrbf2; k++) {
       double sum_rbf = 0.0;
       double sum_drbf = 0.0;
 
@@ -2183,7 +2130,7 @@ void EAPOD::init_spline_radialbasis()
 
   memory->create(spline_r0,    ne*ne,                  "spline_r0");
   memory->create(spline_invdr, ne*ne,                  "spline_invdr");
-  memory->create(rbf_spline_coeffs, ne*ne*nb*nrbfmax*4, "rbf_spline_coeffs");
+  memory->create(rbf_spline_coeffs, ne*ne*nb*nrbf2*4, "rbf_spline_coeffs");
 
   // scratch buffers for basis sampling
   double *rij, *rbft, *drbft;
@@ -2192,8 +2139,8 @@ void EAPOD::init_spline_radialbasis()
   memory->create(rij,   3*Ng,       "spl:rij");
   memory->create(rbft,  Ng*ns,      "spl:rbft");
   memory->create(drbft, Ng*ns,      "spl:drbft");
-  memory->create(rbf,   Ng*nrbfmax, "spl:rbf");
-  memory->create(drbf,  Ng*nrbfmax, "spl:drbf");
+  memory->create(rbf,   Ng*nrbf2, "spl:rbf");
+  memory->create(drbf,  Ng*nrbf2, "spl:drbf");
   memory->create(tit,   1,          "spl:tit");
   memory->create(tjt,   Ng,         "spl:tjt");
 
@@ -2235,7 +2182,7 @@ void EAPOD::init_spline_radialbasis()
       radialPhi(rbf, drbf, rbft, drbft, tit, tjt, Ng);
 
       // Build one clamped C2 cubic spline per basis channel k
-      for (int k = 0; k < nrbfmax; ++k) {
+      for (int k = 0; k < nrbf2; ++k) {
         // y[i] = f(r_i)
         for (int i = 0; i < Ng; ++i) y[i] = rbf[i + Ng*k];
 
@@ -2275,7 +2222,7 @@ void EAPOD::init_spline_radialbasis()
           const double Mi = M[bin];
           const double Mj = M[bin + 1];
 
-          double *c = &rbf_spline_coeffs[((pair*nb + bin)*nrbfmax + k)*4];
+          double *c = &rbf_spline_coeffs[((pair*nb + bin)*nrbf2 + k)*4];
           c[0] = f0;
           c[1] = (f1 - f0) - (dr2/6.0) * (2.0*Mi + Mj);
           c[2] = 0.5 * dr2 * Mi;
@@ -2299,7 +2246,7 @@ void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, 
 {
   const int ne = nelements;
   const int nb = nspline_bins;
-  const int ncs = 4*nrbfmax;
+  const int ncs = 4*nrbf2;
   const int itypene = ti[0]*ne;
 
   for (int n = 0; n < N; ++n) {
@@ -2323,7 +2270,7 @@ void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, 
 
     const double *cbase = &rbf_spline_coeffs[(pair*nb + b)*ncs];
 
-    for (int k = 0; k < nrbfmax; ++k) {
+    for (int k = 0; k < nrbf2; ++k) {
       const double *c = cbase + 4*k;
       double c0 = c[0], c1 = c[1], c2 = c[2], c3 = c[3];
 
@@ -2590,7 +2537,7 @@ void EAPOD::init2body()
     for (int j = 0; j < nelements; j++) {
       int ijpair = j + i * nelements;
       double rinij = rin[i][j];
-      double rdiffij = rdiff[i][j];
+      double rdiffij = rcut[i][j] - rinij;
       eigenvaluedecomposition(&Phi[ijpair*ns*ns], &Lambda[ijpair*ns], rinij, rdiffij, NsnElms);
     }
   }
@@ -2695,21 +2642,21 @@ void EAPOD::eigenvaluedecomposition(double *Phi, double *Lambda, double rinij, d
  */
 void EAPOD::snapshots(double *rbf, double *xij, double rinij, double rdiffij, int N)
 {
-  const double bfac    = sqrt(2.0 / rdiffij);
-  const double invrdiffij = 1.0 / rdiffij;
+  const double invrmax = 1.0 / rdiffij;
+  const double bfac = sqrt(2.0 * invrmax);
 
   for (int n = 0; n < N; ++n) {
     double dij    = xij[n];
     double invdij = 1.0 / dij;
     double r      = dij - rinij;
     double invr   = 1.0 / r;
-    double y      = r * invrdiffij;
+    double y      = r * invrmax;
 
     // cutoff choice
     double fcut, dfcut;
-    cutoff_exp(r, invrdiffij, e_v, fcut, dfcut);
-    //cutoff_poly_sq(r, invrdiffij, fcut, dfcut);
-    //cutoff_hat(r, invrdiffij, fcut, dfcut);
+    cutoff_exp(r, invrmax, e_v, fcut, dfcut);
+    //cutoff_poly_sq(r, invrmax, fcut, dfcut);
+    //cutoff_hat(r, invrmax, fcut, dfcut);
 
     double bf1 = bfac * fcut * invr;
 
@@ -2923,20 +2870,19 @@ int EAPOD::estimate_temp_memory(int Nj)
   int Knrbf34 = MAX(K3*nrbf3, K4*nrbf4);
 
   // Determine the maximum number of local descriptors
-  int nld = MAX(nl33, nl34);
-  nld = MAX(nld, nl44);
+  int nld = MAX(MAX(nl33, nl34), nl44);
 
-  // rij, fij, and d2, dd2, d3, dd3, d4, dd4
-  int nmax1 = 6*Nj + nl2 + 3*Nj*nl2 + nl3 + 3*Nj*nl3 + nl4 + 3*Nj*nl4 + nld + 3*Nj*nld;
+  // rij, fij, d2, d3, d4, dd2, dd3, dd4
+  int nmax1 = 6*Nj + (nl2 + nl3 + nl4 + nld) + 3*Nj*(nl2 + nl3 + nl4 + nld);
 
-  // Ux, Uy, Uz
+  // Ux, Uy, Uz (training only)
   int nmax2 = 3*Nj*Knrbf34;
 
   // sumU and cU
   int nmax3 = 2*nelements*Knrbf34;
 
   // rbf, drbf
-  int nmax4 = 2*Nj*nrbfmax;
+  int nmax4 = 2*Nj*nrbf2;
 
   // rbft, drbft
   int nmax5 = 2*Nj*ns;
@@ -2944,12 +2890,8 @@ int EAPOD::estimate_temp_memory(int Nj)
   // abf, abfx, abfy, abfz
   int nmax6 = 4*(Nj+1)*Kmax;
 
-  // Determine the maximum amount of memory needed for Ux, Uy, Uz, sumU, cU, rbf, drbf, abf, abfx, abfy, abfz
-  int nmax7 = MAX(nmax5, nmax6);
-  int nmax8 = nmax2 + nmax3 + nmax4 + nmax7;
-
   // Determine the total amount of memory needed for all double memory
-  ndblmem = (nmax1 + nmax8);
+  ndblmem = nmax1 + nmax2 + nmax3 + nmax4 + MAX(nmax5, nmax6);
 
   int eatmpmem = nComponents;
   if (localeapod) eatmpmem += nMaxActiveClusters*(1 + nComponents + nMaxActiveClusters + 2*Mdesc + 2);
@@ -2993,28 +2935,6 @@ void EAPOD::free_temp_memory()
   memory->destroy(bdd);
   memory->destroy(pd);
   memory->destroy(pdd);
-}
-
-/**
- * @brief Map a 3D index to a 1D index.
- *
- * @param indx The 1D index array.
- * @return int The total number of elements in the 1D index array.
- */
-int EAPOD::indexmap3(int *indx, int n1, int n2, int n3, int N1, int N2)
-{
-  int k = 0;
-  for (int i3=0; i3<n3; i3++)
-    for (int i2=0; i2<n2; i2++)
-      for (int i1=0; i1<n1; i1++)
-      {
-        // Map the 3D index to a 1D index
-        indx[k] = i1 + N1*i2 + N1*N2*i3;
-        k += 1;
-      }
-
-  // Return the total number of elements in the 1D index array
-  return k;
 }
 
 /**
@@ -3571,8 +3491,6 @@ void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int Pa)
 
 void EAPOD::init4bodyarray(int *pa4, int *pb4, int *pc4, int Pa)
 {
-  const int Q = pa4[nabf4];
-
   int iq = 0;
   for (int d = 0; d <= Pa; ++d) {
     for (int a = d; a >= 0; --a) {
@@ -3597,12 +3515,12 @@ void EAPOD::init4bodyarray(int *pa4, int *pb4, int *pc4, int Pa)
                     if ((vp < 0) || (vq < 0) || (vr < 0)) continue;
                     if ((wp < 0) || (wq < 0) || (wr < 0)) continue;
 
-                    pb4[iq        ] = monomial_idx(p1, q1, r1);
-                    pb4[iq +     Q] = monomial_idx(p2, q2, r2);
-                    pb4[iq + 2 * Q] = monomial_idx(p3, q3, r3);
-                    pc4[iq]         = trinom(up, uq, ur) *
-                                      trinom(vp, vq, vr) *
-                                      trinom(wp, wq, wr);
+                    pb4[iq       ] = monomial_idx(p1, q1, r1);
+                    pb4[iq +   Q4] = monomial_idx(p2, q2, r2);
+                    pb4[iq + 2*Q4] = monomial_idx(p3, q3, r3);
+                    pc4[iq]        = trinom(up, uq, ur) *
+                                     trinom(vp, vq, vr) *
+                                     trinom(wp, wq, wr);
                     ++iq;
                   }
                 }
