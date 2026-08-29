@@ -211,6 +211,9 @@ class EAPOD : protected Pointers {
   void free_temp_memory();
   void allocate_temp_memory(int Nj);
 
+  int estimate_temp_memory_md(int Nj);
+  void grow_rij(int Nj);
+
   //void mknewcoeff();
 
   void mknewcoeff(double *c, int nc);

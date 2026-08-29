@@ -46,12 +46,8 @@ class PairPOD : public Pair {
  protected:
   class EAPOD *fastpodptr;
   virtual void allocate();
-  void grow_atoms(int Ni);
-  void grow_pairs(int Nij);
 
-  int ni;        // total number of atoms i
   int nij;       // total number of pairs (i,j)
-  int nimax;     // maximum number of atoms i
   int nijmax;    // maximum number of pairs (i,j)
 
   int nelements; // number of elements
@@ -59,17 +55,6 @@ class PairPOD : public Pair {
   double **rin;     // inner cut-off radius
   double **rcut;    // outer cut-off radius
   double **rcutsq;  // outer cut-off radius squared
-
-  double *rij;    // (xj - xi) for all pairs (I, J)
-  double *fij;    // force for all pairs (I, J)
-  double *ei;     // energy for each atom I
-  int *typeai;    // types of atoms I only
-  int *numij;     // number of pairs (I, J) for each atom I
-  int *idxi;      // storing linear indices of atom I for all pairs (I, J)
-  int *ai;        // IDs of atoms I for all pairs (I, J)
-  int *aj;        // IDs of atoms J for all pairs (I, J)
-  int *ti;        // types of atoms I for all pairs (I, J)
-  int *tj;        // types of atoms J  for all pairs (I, J)
 };
 
 }    // namespace LAMMPS_NS

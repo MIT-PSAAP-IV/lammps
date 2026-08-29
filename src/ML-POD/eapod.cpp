@@ -70,7 +70,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   nbesselpars = 3;
   nbesselrbf = nbesselpars*besseldegree;
   ns = nbesselrbf + inversedegree;
-  Njmax = 100;
+  Njmax = 0;
   onebody = 1;
   nrbf2 = 8;
   nrbf3 = 6;
@@ -461,8 +461,6 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   nd = nd1 + nd2 + nd3 + nd4 + nd33 + nd34 + nd44;
   nCoeffPerElement = nl1 + Mdesc*nClusters;
   nCoeffAll = nCoeffPerElement*nelements;
-
-  allocate_temp_memory(Njmax);
 
   if (comm->me == 0) {
     utils::logmesg(lmp, "**************** Begin of POD Potentials ****************\n");
@@ -1273,26 +1271,26 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   int n5 = K3*nrbf3*nelements;
 
   double *sumU = &temp[0]; // K3*nrbf3*nelements
-
-  double *rbf = &temp[n5]; // Nj*nrbf2
-  double *drbf = &temp[n5 + n2]; // Nj*nrbf2
+  double *forcecoeff = &temp[n5]; // K3*nrbf3*nelements
+  double *rbf = &temp[2*n5]; // Nj*nrbf2
+  double *drbf = &temp[2*n5 + n2]; // Nj*nrbf2
 
   if (use_spline) {
     radialbasis_spline(rbf, drbf, rij, ti, tj, Nj);
   } else {
-    double *rbft = &temp[n5 + 2*n2]; // Nj*ns
-    double *drbft = &temp[n5 + 2*n2 + n3]; // Nj*ns
+    double *rbft = &temp[2*n5 + 2*n2]; // Nj*ns
+    double *drbft = &temp[2*n5 + 2*n2 + n3]; // Nj*ns
     radialbasis(rbft, drbft, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
     radialPhi(rbf, drbf, rbft, drbft, ti, tj, Nj);
   }
 
   twobodydesc(d2, rbf, tj, Nj, nelements);
 
-  double *abf = &temp[n5 + 2*n2]; // Nj*K3
-  double *abfx = &temp[n5 + 2*n2 + n4]; // Nj*K3
-  double *abfy = &temp[n5 + 2*n2 + 2*n4]; // Nj*K3
-  double *abfz = &temp[n5 + 2*n2 + 3*n4]; // Nj*K3
-  double *tm = &temp[n5 + 2*n2 + 4*n4]; // 4*K3
+  double *abf = &temp[2*n5 + 2*n2]; // Nj*K3
+  double *abfx = &temp[2*n5 + 2*n2 + n4]; // Nj*K3
+  double *abfy = &temp[2*n5 + 2*n2 + 2*n4]; // Nj*K3
+  double *abfz = &temp[2*n5 + 2*n2 + 3*n4]; // Nj*K3
+  double *tm = &temp[2*n5 + 2*n2 + 4*n4]; // 4*K3
 
   if ((nl3 > 0) && (Nj>1)) {
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
@@ -1330,8 +1328,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   twobody_forces(fij, cb2, drbf, rij, tj, Nj);
 
   // Initialize forcecoeff to zero
-  double *forcecoeff = &cb[nl2 + nl3 + nl4]; // nelements*K3*nrbf3
-  memset(forcecoeff, 0, nelements * K3 * nrbf3 * sizeof(*forcecoeff));
+  memset(forcecoeff, 0, n5 * sizeof(*forcecoeff));
   if ((nl3 > 0) && (Nj>1)) threebody_forcecoeff(forcecoeff, cb3, sumU);
   if ((nl4 > 0) && (Nj>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU);
   if ((nl3 > 0) && (Nj>1)) allbody_forces(fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz, tj, Nj);
@@ -2050,10 +2047,9 @@ void EAPOD::radialbasis(double *rbf, double *drbf, double *rij, double **rin, do
         double inv_i = 1.0 / (double)i;
         double isinax = inv_i * sin(ix);
 
-        double rbfv   = bf1 * isinax;
         double drbfdr = bg1 * isinax + Kf1dx * cosax;
 
-        rbf [nij] = rbfv;
+        rbf [nij] = bf1 * isinax;
         drbf[nij] = drbfdr * invdij;
         ix += xpi;
         nij += N;
@@ -2068,12 +2064,8 @@ void EAPOD::radialbasis(double *rbf, double *drbf, double *rij, double **rin, do
     for (int i = 1; i <= inversedegree; ++i) {
       dterm -= fcut_invd;
       inva  *= invdij;
-
-      double rbfv   = fcut * inva;
-      double drbfdr = dterm * inva;
-
-      rbf [nij] = rbfv;
-      drbf[nij] = drbfdr * invdij;
+      rbf [nij] = fcut * inva;
+      drbf[nij] = dterm * inva * invdij;
       nij += N;
     }
   }
@@ -2242,10 +2234,9 @@ void EAPOD::init_spline_radialbasis()
 
 void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N)
 {
-  const int ne = nelements;
   const int nb = nspline_bins;
   const int ncs = 4*nrbf2;
-  const int itypene = ti[0]*ne;
+  const int itypene = ti[0]*nelements;
 
   for (int n = 0; n < N; ++n) {
     int pair = itypene + tj[n];
@@ -2254,11 +2245,10 @@ void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, 
     double y = rij[3*n+1];
     double z = rij[3*n+2];
     double dij = sqrt(x*x + y*y + z*z);
-    //double invdij = 1.0/dij;
 
     double r0    = spline_r0[pair];
     double invdr = spline_invdr[pair];
-    double invdrinvdij = invdr/dij;
+    double invdrdij = invdr/dij;
 
     double tg = (dij - r0)*invdr;     // global "bin coordinate"
     int b = (int) tg;
@@ -2272,13 +2262,12 @@ void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, 
       const double *c = cbase + 4*k;
       double c0 = c[0], c1 = c[1], c2 = c[2], c3 = c[3];
 
-      double f    = c0 + t*(c1 + t*(c2 + t*c3));
+      double f    = c0 + t*(c1 + t*(c2 + c3*t));
       double dfdt = c1 + t*(2.0*c2 + 3.0*c3*t);
-      double h    = dfdt*invdrinvdij;   // = f'(r)/r
 
-      int idx = n + N*k;
+      const int idx = n + N*k;
       rbf [idx] = f;
-      drbf[idx] = h;
+      drbf[idx] = dfdt*invdrdij;   // = f'(r)/r
     }
   }
 }
@@ -2327,10 +2316,6 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
     const double dudy = -xy * invdij3;
     const double dudz = -xz * invdij3;
     const double dvdz = -yz * invdij3;
-    
-    const double dvdx = dudy;
-    const double dwdx = dudz;
-    const double dwdy = dvdz;
 
     // n = 0
     int out = j;
@@ -2354,9 +2339,9 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
       if (d == 1) {
         c = u; dcx = dudx; dcy = dudy; dcz = dudz;
       } else if (d == 2) {
-        c = v; dcx = dvdx; dcy = dvdy; dcz = dvdz;
+        c = v; dcx = dudy; dcy = dvdy; dcz = dvdz;
       } else { // d == 3
-        c = w; dcx = dwdx; dcy = dwdy; dcz = dwdz;
+        c = w; dcx = dudz; dcy = dvdz; dcz = dwdz;
       }
 
       const double t  = t0 * c;
@@ -2394,7 +2379,7 @@ void EAPOD::radialangularsum(double *sumU, double *rbf, double *abf, int *tj,
     }
   } else {
     const int NeK = Ne*K;
-    memset(sumU, 0,  NeK*M * sizeof(*sumU));
+    memset(sumU, 0, NeK*M * sizeof(*sumU));
     for (int n = 0; n < Nj; ++n) {
       const int e = tj[n];
       const double *a = &abf[n];
@@ -2912,17 +2897,10 @@ void EAPOD::allocate_temp_memory(int Nj)
   // guarantee all buffers exist even for atoms without neighbors
   if (Nj < 1) Nj = 1;
   estimate_temp_memory(Nj);
-  // in peratomenergyforce2() the bdd buffer stores the coefficients cb and the
-  // force coefficients, which require (nl2 + nl3 + nl4) + nelements*K3*nrbf3 entries.
-  // this size is set by the potential and does not depend on the
-  // number of neighbors, so it can exceed 3*Nj*Mdesc when Nj is small.
-  int nbdd = 3*Nj*Mdesc;
-  int ncb = (nl2 + nl3 + nl4) + nelements*K3*nrbf3;
-  if (nbdd < ncb) nbdd = ncb;
   memory->create(tmpmem, ndblmem, "tmpmem");
   memory->create(tmpint, nintmem, "tmpint");
   memory->create(bd, Mdesc, "bd");
-  memory->create(bdd, nbdd, "bdd");
+  memory->create(bdd, 3*Nj*Mdesc, "bdd");
   memory->create(pd, nClusters, "pd");
   memory->create(pdd, 3*Nj*nClusters, "pdd");
 }
@@ -2935,6 +2913,49 @@ void EAPOD::free_temp_memory()
   memory->destroy(bdd);
   memory->destroy(pd);
   memory->destroy(pdd);
+}
+
+/**
+ * @brief Estimate the temporary memory needed by PairPOD.
+ *
+ * @param Nj Number of neighboring atoms.
+ * @return int The estimated number of doubles needed.
+ */
+int EAPOD::estimate_temp_memory_md(int Nj)
+{
+  int n2 = 2*Nj*nrbf2;            // rbf, drbf
+  int n3 = 2*Nj*ns;               // rbft, drbft
+  int n4 = 4*Nj*K3;               // abf, abfx, abfy, abfz
+  int n5 = 2*nelements*K3*nrbf3;  // sumU, forcecoeff
+
+  // scratch block tm, shared by angular basis and ea-pod
+  int ntm = 4*K3;
+  if (localeapod) ntm = MAX(ntm, 2*nMaxActiveClusters);
+  else if (eapod) ntm = MAX(ntm, 3*nClusters + nComponents);
+
+  int ntemp = n5 + n2 + MAX(n3, n4 + ntm);
+
+  // rij, fij, tmpmem
+  ndblmem = 6*Nj + ntemp;
+
+  // ai, aj, ti, tj
+  nintmem = 4*Nj;
+
+  return ndblmem;
+}
+
+void EAPOD::grow_rij(int Nj)
+{
+  estimate_temp_memory_md(Nj);
+
+  memory->destroy(tmpmem);
+  memory->destroy(tmpint);
+  memory->destroy(bd);
+  memory->destroy(bdd);
+  memory->create(tmpmem, ndblmem, "tmpmem");
+  memory->create(tmpint, nintmem, "tmpint");
+  memory->create(bd, Mdesc, "bd");
+  memory->create(bdd, Mdesc, "bdd");
 }
 
 /**

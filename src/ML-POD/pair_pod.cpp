@@ -50,23 +50,12 @@ PairPOD::PairPOD(LAMMPS *lmp) : Pair(lmp), fastpodptr(nullptr)
   manybody_flag = 1;
   centroidstressflag = CENTROID_NOTAVAIL;
 
-  ni = 0;
-  nimax = 0;
   nij = 0;
   nijmax = 0;
 
   rin = nullptr;
   rcut = nullptr;
-  rij = nullptr;
-  fij = nullptr;
-  ei = nullptr;
-  typeai = nullptr;
-  numij =  nullptr;
-  idxi = nullptr;
-  ai = nullptr;
-  aj = nullptr;
-  ti = nullptr;
-  tj = nullptr;
+  rcutsq = nullptr;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -78,16 +67,6 @@ PairPOD::~PairPOD()
   memory->destroy(rin);
   memory->destroy(rcut);
   memory->destroy(rcutsq);
-  memory->destroy(rij);
-  memory->destroy(fij);
-  memory->destroy(ei);
-  memory->destroy(typeai);
-  memory->destroy(numij);
-  memory->destroy(idxi);
-  memory->destroy(ai);
-  memory->destroy(aj);
-  memory->destroy(ti);
-  memory->destroy(tj);
 
   delete fastpodptr;
 
@@ -123,38 +102,37 @@ void PairPOD::compute(int eflag, int vflag)
 
   if (nijmax < jnummax) {
     nijmax = jnummax;
-    fastpodptr->free_temp_memory();
-    fastpodptr->allocate_temp_memory(nijmax);
+    fastpodptr->grow_rij(nijmax);
   }
 
-  double *rij1 = &fastpodptr->tmpmem[0];
-  double *fij1 = &fastpodptr->tmpmem[3*nijmax];
+  double *rij = &fastpodptr->tmpmem[0];
+  double *fij = &fastpodptr->tmpmem[3*nijmax];
   double *tmp = &fastpodptr->tmpmem[6*nijmax];
-  int *ai1 = &fastpodptr->tmpint[0];
-  int *aj1 = &fastpodptr->tmpint[nijmax];
-  int *ti1 = &fastpodptr->tmpint[2*nijmax];
-  int *tj1 = &fastpodptr->tmpint[3*nijmax];
+  int *ai = &fastpodptr->tmpint[0];
+  int *aj = &fastpodptr->tmpint[nijmax];
+  int *ti = &fastpodptr->tmpint[2*nijmax];
+  int *tj = &fastpodptr->tmpint[3*nijmax];
 
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
     
-    lammpsNeighborList(rij1, ai1, aj1, ti1, tj1, x, firstneigh, type, map, numneigh, i);
+    lammpsNeighborList(rij, ai, aj, ti, tj, x, firstneigh, type, map, numneigh, i);
 
-    evdwl = fastpodptr->peratomenergyforce2(fij1, rij1, tmp, ti1, tj1, nij);
+    evdwl = fastpodptr->peratomenergyforce2(fij, rij, tmp, ti, tj, nij);
 
     // tally atomic energy to global energy
     ev_tally_full(i,2.0*evdwl,0.0,0.0,0.0,0.0,0.0);
 
     // tally atomic force to global force
-    tallyforce(f, fij1, ai1, aj1, nij);
+    tallyforce(f, fij, ai, aj, nij);
 
     // tally atomic stress
     if (vflag) {
       for (int jj = 0; jj < nij; jj++) {
-        int j = aj1[jj];
+        int j = aj[jj];
         ev_tally_xyz(i,j,nlocal,newton_pair,0.0,0.0,
-                    fij1[0 + 3*jj],fij1[1 + 3*jj],fij1[2 + 3*jj],
-                    -rij1[0 + 3*jj], -rij1[1 + 3*jj], -rij1[2 + 3*jj]);
+                    fij[0 + 3*jj],fij[1 + 3*jj],fij[2 + 3*jj],
+                    -rij[0 + 3*jj], -rij[1 + 3*jj], -rij[2 + 3*jj]);
       }
     }
   }
@@ -193,9 +171,7 @@ void PairPOD::coeff(int narg, char **arg)
 
   copy_data_from_pod_class();
 
-  // release the temporary memory allocated by the EAPOD constructor and reset
-  // nijmax, so PairPOD::compute() re-allocates based on actual neighbor counts
-  fastpodptr->free_temp_memory();
+  // reset nijmax to re-allocate based on neighbor counts
   nijmax = 0;
 
   for (int ii = 0; ii < nelements; ii++)
@@ -350,32 +326,6 @@ void PairPOD::copy_data_from_pod_class()
       rcut[i][j] = fastpodptr->rcut[i][j];
       rcutsq[i][j] = fastpodptr->rcutsq[i][j];
     }
-  }
-}
-
-void PairPOD::grow_atoms(int Ni)
-{
-  if (Ni > nimax) {
-    nimax = Ni;
-    memory->grow(ei, nimax, "pair_pod:ei");
-    memory->grow(typeai, nimax, "pair_pod:typeai");
-    memory->grow(numij, nimax+1, "pair_pod:numij");
-
-    for (int i=0; i<=nimax; i++) numij[i] = 0;
-  }
-}
-
-void PairPOD::grow_pairs(int Nij)
-{
-  if (Nij > nijmax) {
-    nijmax = Nij;
-    memory->grow(rij, 3 * nijmax,  "pair_pod:r_ij");
-    memory->grow(fij, 3 * nijmax,  "pair_pod:f_ij");
-    memory->grow(idxi, nijmax, "pair_pod:idxi");
-    memory->grow(ai, nijmax, "pair_pod:ai");
-    memory->grow(aj, nijmax, "pair_pod:aj");
-    memory->grow(ti, nijmax, "pair_pod:ti");
-    memory->grow(tj, nijmax, "pair_pod:tj");
   }
 }
 
