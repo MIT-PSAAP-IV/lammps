@@ -26,6 +26,7 @@
 #include "safe_pointers.h"
 #include "tokenizer.h"
 
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 
