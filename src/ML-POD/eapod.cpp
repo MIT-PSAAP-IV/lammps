@@ -917,7 +917,7 @@ inline void EAPOD::find_active_clusters(double pca, double* ledges, double* redg
                                         int& ks, int& ke)
 {
   ks = static_cast<int>(std::lower_bound(redges, redges + nClusters, pca) - redges);
-  int kend = std::min(nClusters, ks + nMaxActiveClusters);
+  int kend = MIN(nClusters, ks + nMaxActiveClusters);
   ke = static_cast<int>(std::upper_bound(ledges + ks + 1, ledges + kend, pca) - ledges);
 }
 

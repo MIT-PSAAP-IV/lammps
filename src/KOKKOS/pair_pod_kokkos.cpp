@@ -981,10 +981,6 @@ void PairPODKokkos<DeviceType>::angularbasis(
       const KK_FLOAT dudy = -xy * invdij3;
       const KK_FLOAT dudz = -xz * invdij3;
       const KK_FLOAT dvdz = -yz * invdij3;
-
-      const KK_FLOAT dvdx = dudy;
-      const KK_FLOAT dwdx = dudz;
-      const KK_FLOAT dwdy = dvdz;
       
       l_abf(j)  = 1.0;
       l_abfx(j) = 0.0;
@@ -998,9 +994,9 @@ void PairPODKokkos<DeviceType>::angularbasis(
         if (d == 1) {
           c = u; dcx = dudx; dcy = dudy; dcz = dudz;
         } else if (d == 2) {
-          c = v; dcx = dvdx; dcy = dvdy; dcz = dvdz;
+          c = v; dcx = dudy; dcy = dvdy; dcz = dvdz;
         } else { // d == 3
-          c = w; dcx = dwdx; dcy = dwdy; dcz = dwdz;
+          c = w; dcx = dudz; dcy = dvdz; dcz = dwdz;
         }
 
         const int in = j + N * l_pq_m(k);
@@ -1072,26 +1068,30 @@ void PairPODKokkos<DeviceType>::twobodydesc(t_pod_1d d2,  t_pod_1d l_rbf, t_pod_
   Kokkos::parallel_for("twobodydesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
     int n = idx / l_nrbf2;
     int m = idx % l_nrbf2;
-    int i2 = n + Nij * m;
-    Kokkos::atomic_add(&d2(l_idxi(n) + Ni * (m + l_nrbf2 * l_tj(n))), l_rbf(i2));
+    Kokkos::atomic_add(&d2(l_idxi(n) + Ni * (m + l_nrbf2 * l_tj(n))), l_rbf(n + Nij * m));
   });
 }
 
 template<class DeviceType>
-void PairPODKokkos<DeviceType>::twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf, t_pod_1d l_rij,
-                    t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
+void PairPODKokkos<DeviceType>::twobody_forces(
+    t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf, t_pod_1d l_rij,
+    t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
 {
-  int totalIterations = l_nrbf2 * Nij;
-  Kokkos::parallel_for("twobody_forces", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
-    int n = idx / l_nrbf2;
-    int m = idx % l_nrbf2;
-    int i2 = n + Nij * m;
-    int i1 = 3*n;
-    KK_FLOAT cR = cb2(l_idxi(n) + Ni*m + Ni*l_nrbf2*l_tj(n)) * l_drbf(i2);
-    Kokkos::atomic_add(&fij(0 + i1), cR*l_rij(0 + i1));
-    Kokkos::atomic_add(&fij(1 + i1), cR*l_rij(1 + i1));
-    Kokkos::atomic_add(&fij(2 + i1), cR*l_rij(2 + i1));
-  });
+  Kokkos::parallel_for("twobody_forces",
+    Kokkos::RangePolicy<DeviceType>(0, Nij),
+    KOKKOS_LAMBDA(const int n) {
+      const int ii = l_idxi(n) + Ni * l_nrbf2 * l_tj(n);
+
+      KK_FLOAT cR = 0.0;
+      for (int m = 0; m < l_nrbf2; ++m) {
+        cR += cb2(ii + Ni * m) * l_drbf(n + Nij * m);
+      }
+
+      const int i1 = 3 * n;
+      fij(i1 + 0) += cR * l_rij(i1 + 0);
+      fij(i1 + 1) += cR * l_rij(i1 + 1);
+      fij(i1 + 2) += cR * l_rij(i1 + 2);
+    });
 }
 
 template<class DeviceType>
@@ -1284,31 +1284,49 @@ void PairPODKokkos<DeviceType>::fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4,
 }
 
 template<class DeviceType>
-void PairPODKokkos<DeviceType>::allbody_forces(t_pod_1d fij, t_pod_1d l_forcecoeff, t_pod_1d l_rbf, t_pod_1d l_drbf, t_pod_1d l_rij,
+void PairPODKokkos<DeviceType>::allbody_forces(
+    t_pod_1d fij, t_pod_1d l_forcecoeff, t_pod_1d l_rbf, t_pod_1d l_drbf, t_pod_1d l_rij,
     t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
     t_pod_1i l_idxi, t_pod_1i l_tj, int l_nelements, int l_nrbf3, int l_K3, int Nij)
 {
-  int totalIterations = l_K3 * Nij;
-  Kokkos::parallel_for("allbody_forces", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
-    const int j = idx / l_K3;
-    const int k = idx % l_K3;
-    const int NeK3 = l_nelements*l_K3;
-    const int i2 = l_tj(j) + NeK3*l_nrbf3*l_idxi(j) + l_nelements*k;
-    KK_FLOAT fcR = 0;
-    KK_FLOAT fcdR = 0;
-    for (int m = 0; m < l_nrbf3; m++) {
-      const int idxR = j + Nij * m;
-      const KK_FLOAT fc = l_forcecoeff(i2 + NeK3*m);
-      fcR += fc * l_rbf(idxR);
-      fcdR += fc * l_drbf(idxR);
-    }
-    const int idxA = j + Nij * k;
-    fcdR *= l_abf(idxA);
-    int ii = 3*j;
-    Kokkos::atomic_add(&fij(0 + ii), fcR*l_abfx(idxA) + fcdR*l_rij(0 + ii));
-    Kokkos::atomic_add(&fij(1 + ii), fcR*l_abfy(idxA) + fcdR*l_rij(1 + ii));
-    Kokkos::atomic_add(&fij(2 + ii), fcR*l_abfz(idxA) + fcdR*l_rij(2 + ii));
-  });
+  Kokkos::parallel_for("allbody_forces",
+    Kokkos::RangePolicy<DeviceType>(0, Nij),
+    KOKKOS_LAMBDA(const int j) {
+      const int NeK3 = l_nelements * l_K3;
+      const int ii = l_tj(j) + NeK3 * l_nrbf3 * l_idxi(j);
+
+      KK_FLOAT fcAdR = 0.0;
+      KK_FLOAT fx = 0.0, fy = 0.0, fz = 0.0;
+
+      for (int k = 0; k < l_K3; ++k) {
+        const int i2_base = ii + l_nelements * k;
+
+        KK_FLOAT fcR = 0.0;
+        KK_FLOAT fcdR = 0.0;
+
+        for (int m = 0; m < l_nrbf3; ++m) {
+          const int idxR = j + Nij * m;
+          const KK_FLOAT fc = l_forcecoeff(i2_base + NeK3 * m);
+          fcR  += fc * l_rbf(idxR);
+          fcdR += fc * l_drbf(idxR);
+        }
+
+        const int idxA = j + Nij * k;
+        fcAdR += fcdR * l_abf(idxA);
+        fx += fcR * l_abfx(idxA);
+        fy += fcR * l_abfy(idxA);
+        fz += fcR * l_abfz(idxA);
+      }
+
+      const int i1 = 3 * j;
+      fx += fcAdR * l_rij(i1 + 0);
+      fy += fcAdR * l_rij(i1 + 1);
+      fz += fcAdR * l_rij(i1 + 2);
+
+      fij(i1 + 0) += fx;
+      fij(i1 + 1) += fy;
+      fij(i1 + 2) += fz;
+    });
 }
 
 template<class DeviceType>
@@ -1474,41 +1492,34 @@ void PairPODKokkos<DeviceType>::blockatom_base_coefficients(t_pod_1d ei, t_pod_1
 /* ---------------------------------------------------------------------- */
 
 template<class DeviceType>
-// NOLINTNEXTLINE
 KOKKOS_INLINE_FUNCTION
 void PairPODKokkos<DeviceType>::cluster_cutoff_poly_sq(const KK_FLOAT pc, const KK_FLOAT inv_rcut2, KK_FLOAT &fcut, KK_FLOAT &dfcut)
 {
-  const KK_FLOAT pc_inv_rcut2 = pc * inv_rcut2;
-  const KK_FLOAT u            = pc * pc_inv_rcut2;      // u = pc^2 * inv_rcut2
-  const KK_FLOAT u2           = u * u;
-  const KK_FLOAT omu          = 1.0 - u;
+  const KK_FLOAT u   = (pc * pc) * inv_rcut2;
+  const KK_FLOAT u2  = u * u;
+  const KK_FLOAT omu = 1.0 - u;
 
   fcut  = 1.0 - u2 * u * (10.0 - u * (15.0 - 6.0 * u));
 
-  // dfcut/dpc = -60 u^2 (1-u)^2 * (pc * inv_rcut2)
-  dfcut = -60.0 * u2 * omu * omu * pc_inv_rcut2;
+  // dfcut := (1/(2pc)) * d(fcut)/dpc
+  dfcut = -30.0 * u2 * omu * omu * inv_rcut2;
 }
 
 /* ---------------------------------------------------------------------- */
 
 template<class DeviceType>
-// NOLINTNEXTLINE
 KOKKOS_INLINE_FUNCTION
-void PairPODKokkos<DeviceType>::cluster_cutoff_hat(const KK_FLOAT pc, const KK_FLOAT inv_rcut2, KK_FLOAT &fcut, KK_FLOAT &dfcut)
+void PairPODKokkos<DeviceType>::cluster_cutoff_hat(
+    const KK_FLOAT pc, const KK_FLOAT inv_rcut2, KK_FLOAT &fcut, KK_FLOAT &dfcut)
 {
-  constexpr int    p      = 2;
-  constexpr int    q      = 4;
-  constexpr KK_FLOAT TWO_PQ = -2.0 * p * q;
+  const KK_FLOAT y2   = (pc * pc) * inv_rcut2; // (pc/r)^2
+  const KK_FLOAT omy  = 1.0 - y2 * y2;         // 1-(pc/r)^4
+  const KK_FLOAT omy2 = omy * omy;
 
-  KK_FLOAT pc_inv_rcut2 = pc * inv_rcut2;
-  KK_FLOAT y2     = pc * pc_inv_rcut2;
-  KK_FLOAT y2pm1  = Kokkos::pow(y2, p - 1);
-  KK_FLOAT y2p    = y2pm1 * y2;
-  KK_FLOAT omy    = 1.0 - y2p;
-  KK_FLOAT omq1   = Kokkos::pow(omy, q - 1);
+  fcut = omy2 * omy2; // (1-y^4)^4
 
-  fcut  = omq1 * omy;
-  dfcut = TWO_PQ * pc_inv_rcut2 * y2pm1 * omq1;
+  // dfcut := (1/(2pc)) * d(fcut)/dpc
+  dfcut = -8.0 * inv_rcut2 * y2 * omy2 * omy;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1604,16 +1615,16 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
         cluster_cutoff_hat(pc, inv_rcut2, fcut, dfcut);
         //cluster_cutoff_poly_sq(pc, inv_rcut2, fcut, dfcut);
 
-        const KK_FLOAT Dk_raw = 1.0 / (pc * pc + 1e-20);
-        const KK_FLOAT Dval   = fcut * Dk_raw;
-        const KK_FLOAT dDval  = Dk_raw * (dfcut - 2.0 * pc * Dval);
+        const KK_FLOAT invDk = 1.0 / (pc * pc + 1e-20);
+        const KK_FLOAT fDk   = fcut * invDk;
+        const KK_FLOAT dfDkdpc = 2.0 * pc * invDk * (dfcut - fDk);
 
         const int idx = i + Ni * k;
-        D[idx]       = Dval;
-        dD_dpca[idx] = dDval;
+        D[idx]       = fDk;
+        dD_dpca[idx] = dfDkdpc;
 
-        sumfDi += Dval;
-        S      += dDval;
+        sumfDi += fDk;
+        S      += dfDkdpc;
       }
       sumfDi = 1.0 / sumfDi;
 
@@ -1621,11 +1632,12 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       KK_FLOAT T     = 0.0;
       KK_FLOAT A     = 0.0;
       for (int k = 0; k < kni; ++k) {
-        const int idx = i + Ni * k;
+        int idx = knc + k*nDes;
         KK_FLOAT sumE = 0.0;
         for (int m = 0; m < nDes; ++m)
-          sumE += cefs[m + k*nDes + knc] * B[i + Ni*m];
+          sumE += cefs[m + idx] * B[i + Ni*m];
         
+        idx = i + Ni * k;
         const KK_FLOAT Pk  = D[idx] * sumfDi;
         const KK_FLOAT cpk = sumE * sumfDi;
 
@@ -1648,12 +1660,11 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       const int kl    = ks[i];
       const int kni   = kn[i];
       const int typei = tyai[i];
-      const int ncdt  = nDes * typei;
-      const int knc   = 1 + kl * nDes + nCoeff * typei;
+      const int knc   = 1 + m + kl * nDes + nCoeff * typei;
 
-      KK_FLOAT sum = U[i] * proj[m + ncdt];
+      KK_FLOAT sum = U[i] * proj[m + nDes*typei];
       for (int k = 0; k < kni; ++k)
-        sum += cefs[m + k*nDes + knc] * D[i + Ni*k];
+        sum += cefs[knc + k*nDes] * D[i + Ni*k];
 
       cb[i + Ni*m] = sum;
   });
@@ -1870,67 +1881,100 @@ void PairPODKokkos<DeviceType>::tallyenergy(t_pod_1d l_ei, int istart, int Ni)
   }
 }
 
+template<class DeviceType, class View1D>
+struct PODGlobalStressFunctor {
+  View1D l_fij, l_rij;
+
+  PODGlobalStressFunctor(View1D fij, View1D rij) : l_fij(fij), l_rij(rij) {}
+
+  struct value_type {
+    KK_FLOAT v[6];
+  };
+
+  KOKKOS_INLINE_FUNCTION
+  void init(value_type& dst) const {
+    for (int d = 0; d < 6; ++d) dst.v[d] = 0;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  void join(value_type& dst, const value_type& src) const {
+    for (int d = 0; d < 6; ++d) dst.v[d] += src.v[d];
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int k, value_type& upd) const {
+    const int k3 = 3 * k;
+
+    const KK_FLOAT rx = l_rij(k3 + 0);
+    const KK_FLOAT ry = l_rij(k3 + 1);
+    const KK_FLOAT rz = l_rij(k3 + 2);
+
+    const KK_FLOAT fx = l_fij(k3 + 0);
+    const KK_FLOAT fy = l_fij(k3 + 1);
+    const KK_FLOAT fz = l_fij(k3 + 2);
+
+    upd.v[0] += rx * fx;
+    upd.v[1] += ry * fy;
+    upd.v[2] += rz * fz;
+    upd.v[3] += rx * fy;
+    upd.v[4] += rx * fz;
+    upd.v[5] += ry * fz;
+  }
+};
+
+
 template<class DeviceType>
-void PairPODKokkos<DeviceType>::tallystress(t_pod_1d l_fij, t_pod_1d l_rij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij)
+void PairPODKokkos<DeviceType>::tallystress(
+    t_pod_1d l_fij, t_pod_1d l_rij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij)
 {
   auto l_vatom = d_vatom;
 
   if (vflag_global) {
-    for (int j=0; j<3; j++) {
-      KK_FLOAT sum = 0.0;
-      Kokkos::parallel_reduce("GlobalStressTally", Kokkos::RangePolicy<DeviceType>(0,Nij), KOKKOS_LAMBDA(int k, KK_FLOAT& update) {
-        int k3 = 3*k;
-        update += l_rij(j + k3) * l_fij(j + k3);
-      }, sum);
-      virial[j] -= sum;
-    }
+    using Functor = PODGlobalStressFunctor<DeviceType, t_pod_1d>;
+    typename Functor::value_type sumv;
 
-    KK_FLOAT sum = 0.0;
-    Kokkos::parallel_reduce("GlobalStressTally", Kokkos::RangePolicy<DeviceType>(0,Nij), KOKKOS_LAMBDA(int k, KK_FLOAT& update) {
-      int k3 = 3*k;
-      update += l_rij(k3) * l_fij(1 + k3);
-    }, sum);
-    virial[3] -= sum;
+    Kokkos::parallel_reduce("GlobalStressTally",
+      Kokkos::RangePolicy<DeviceType>(0, Nij),
+      Functor(l_fij, l_rij),
+      sumv
+    );
 
-    sum = 0.0;
-    Kokkos::parallel_reduce("GlobalStressTally", Kokkos::RangePolicy<DeviceType>(0,Nij), KOKKOS_LAMBDA(int k, KK_FLOAT& update) {
-      int k3 = 3*k;
-      update += l_rij(k3) * l_fij(2 + k3);
-    }, sum);
-    virial[4] -= sum;
-
-    sum = 0.0;
-    Kokkos::parallel_reduce("GlobalStressTally", Kokkos::RangePolicy<DeviceType>(0,Nij), KOKKOS_LAMBDA(int k, KK_FLOAT& update) {
-      int k3 = 3*k;
-      update += l_rij(1+k3) * l_fij(2+k3);
-    }, sum);
-    virial[5] -= sum;
+    for (int d = 0; d < 6; ++d) virial[d] -= sumv.v[d];
   }
 
   if (vflag_atom) {
-    Kokkos::parallel_for("PerAtomStressTally", Kokkos::RangePolicy<DeviceType>(0,Nij), KOKKOS_LAMBDA(int k) {
-      int i = l_ai(k);
-      int j = l_aj(k);
-      int k3 = 3*k;
-      KK_FLOAT v_local[6];
-      v_local[0] = -l_rij(k3) * l_fij(k3 + 0);
-      v_local[1] = -l_rij(k3 + 1) * l_fij(k3 + 1);
-      v_local[2] = -l_rij(k3 + 2) * l_fij(k3 + 2);
-      v_local[3] = -l_rij(k3 + 0) * l_fij(k3 + 1);
-      v_local[4] = -l_rij(k3 + 0) * l_fij(k3 + 2);
-      v_local[5] = -l_rij(k3 + 1) * l_fij(k3 + 2);
+    Kokkos::parallel_for("PerAtomStressTally",
+      Kokkos::RangePolicy<DeviceType>(0, Nij), KOKKOS_LAMBDA(const int k) {
+        const int i  = l_ai(k);
+        const int j  = l_aj(k);
+        const int k3 = 3 * k;
 
-      for (int d = 0; d < 6; ++d) {
-        Kokkos::atomic_add(&l_vatom(i, d), 0.5 * v_local[d]);
-      }
+        const KK_FLOAT rx = -0.5 * l_rij(k3 + 0);
+        const KK_FLOAT ry = -0.5 * l_rij(k3 + 1);
+        const KK_FLOAT rz = -0.5 * l_rij(k3 + 2);
 
-      for (int d = 0; d < 6; ++d) {
-        Kokkos::atomic_add(&l_vatom(j, d), 0.5 * v_local[d]);
-      }
+        const KK_FLOAT fx = l_fij(k3 + 0);
+        const KK_FLOAT fy = l_fij(k3 + 1);
+        const KK_FLOAT fz = l_fij(k3 + 2);
 
-    });
+        KK_FLOAT v_local[6];
+        v_local[0] = rx * fx;
+        v_local[1] = ry * fy;
+        v_local[2] = rz * fz;
+        v_local[3] = rx * fy;
+        v_local[4] = rx * fz;
+        v_local[5] = ry * fz;
+
+        for (int d = 0; d < 6; ++d) {
+          const KK_FLOAT v_l = v_local[d];
+          Kokkos::atomic_add(&l_vatom(i, d), v_l);
+          Kokkos::atomic_add(&l_vatom(j, d), v_l);
+        }
+      });
   }
 }
+
+
 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::savematrix2binfile(std::string filename, t_pod_1d d_A, int nrows, int ncols)
