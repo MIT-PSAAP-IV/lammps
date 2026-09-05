@@ -169,6 +169,8 @@ void PairPOD::coeff(int narg, char **arg)
   delete fastpodptr;
   fastpodptr = new EAPOD(lmp, pod_file, coeff_file);
 
+  fastpodptr->allocate_desc_memory();
+
   copy_data_from_pod_class();
 
   // reset nijmax to re-allocate based on neighbor counts

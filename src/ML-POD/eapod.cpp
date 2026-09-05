@@ -41,15 +41,19 @@ static constexpr int MAXLINE=1024;
 
 // constructor
 EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff_file) :
-    Pointers(_lmp), elemindex(nullptr), Phi(nullptr), coeff(nullptr), tmpmem(nullptr),
+    Pointers(_lmp), elemindex(nullptr), Phi(nullptr), coeff(nullptr),
     rin(nullptr), rcut(nullptr), Proj(nullptr), Centroids(nullptr),
     invLeftClusterRcut2(nullptr), invRightClusterRcut2(nullptr),
     leftClusterEdges(nullptr), rightClusterEdges(nullptr),
     invPcaSpan(nullptr), clusterOccupancy(nullptr),
     bd(nullptr), bdd(nullptr), pd(nullptr), pdd(nullptr),
-    pn3(nullptr), pq3(nullptr), pc3(nullptr), pa4(nullptr),
-    pb4(nullptr), pc4(nullptr), tmpint(nullptr), ind33l(nullptr), ind33r(nullptr),
-    ind34l(nullptr), ind34r(nullptr), ind44l(nullptr), ind44r(nullptr),
+    pn3(nullptr), pq3(nullptr), pc3(nullptr), ps3(nullptr),
+    pa4(nullptr), pb4(nullptr), pc4(nullptr),
+    sumU(nullptr), forcecoeff(nullptr),
+    tmpmem(nullptr), tmpint(nullptr), tmpenvmem(nullptr),
+    ind33l(nullptr), ind33r(nullptr),
+    ind34l(nullptr), ind34r(nullptr),
+    ind44l(nullptr), ind44r(nullptr),
     p3_active(nullptr), dabf3_active(nullptr),
     p4_active(nullptr), dabf4_active(nullptr), deg4_full(nullptr),
     rbf_spline_coeffs(nullptr), spline_r0(nullptr), spline_invdr(nullptr)
@@ -128,8 +132,11 @@ EAPOD::~EAPOD()
   memory->destroy(pd);
   memory->destroy(pdd);
   memory->destroy(coeff);
+  memory->destroy(sumU);
+  memory->destroy(forcecoeff);
   memory->destroy(tmpmem);
   memory->destroy(tmpint);
+  memory->destroy(tmpenvmem);
   memory->destroy(pn3);
   memory->destroy(pq3);
   memory->destroy(pc3);
@@ -773,8 +780,8 @@ void EAPOD::read_cluster_occupancy_file(const std::string &coeff_file)
 void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, double *temp,
         int *ti, int *tj, int Nj)
 {
-  for (int i=0; i<Mdesc; i++) bd1[i] = 0.0;
-  for (int i=0; i<3*Nj*Mdesc; i++) bdd1[i] = 0.0;
+  memset(bd1, 0, Mdesc * sizeof(*bd1));
+  memset(bdd1, 0, 3*Nj*Mdesc * sizeof(*bdd1));
 
   if (Nj == 0) return;
 
@@ -1253,11 +1260,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   //double *coeff1 = &coeff[nCoeffPerElement*ti[0]];
   if (Nj==0) return coeff[nCoeffPerElement*ti[0]];
 
-  int N = 3*Nj;
-  for (int n=0; n<N; n++) fij[n] = 0.0;
-
-  double e = 0.0;
-  for (int i=0; i<Mdesc; i++) bd[i] = 0.0;
+  memset(fij, 0, 3*Nj * sizeof(*fij));
 
   double *d2  = &bd[0]; // nl2
   double *d3  = &bd[nl2]; // nl3
@@ -1267,31 +1270,28 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   double *d44 = &bd[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
   int n2 = Nj*nrbf2;
-  int n3 = Nj*ns;
   int n4 = Nj*K3;
-  int n5 = K3*nrbf3*nelements;
 
-  double *sumU = &temp[0]; // K3*nrbf3*nelements
-  double *forcecoeff = &temp[n5]; // K3*nrbf3*nelements
-  double *rbf = &temp[2*n5]; // Nj*nrbf2
-  double *drbf = &temp[2*n5 + n2]; // Nj*nrbf2
+  double *rbf = &temp[0]; // Nj*nrbf2
+  double *drbf = &temp[n2]; // Nj*nrbf2
 
   if (use_spline) {
     radialbasis_spline(rbf, drbf, rij, ti, tj, Nj);
   } else {
-    double *rbft = &temp[2*n5 + 2*n2]; // Nj*ns
-    double *drbft = &temp[2*n5 + 2*n2 + n3]; // Nj*ns
+    int n3 = Nj*ns;
+    double *rbft = &temp[2*n2]; // Nj*ns
+    double *drbft = &temp[2*n2 + n3]; // Nj*ns
     radialbasis(rbft, drbft, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
     radialPhi(rbf, drbf, rbft, drbft, ti, tj, Nj);
   }
 
   twobodydesc(d2, rbf, tj, Nj, nelements);
 
-  double *abf = &temp[2*n5 + 2*n2]; // Nj*K3
-  double *abfx = &temp[2*n5 + 2*n2 + n4]; // Nj*K3
-  double *abfy = &temp[2*n5 + 2*n2 + 2*n4]; // Nj*K3
-  double *abfz = &temp[2*n5 + 2*n2 + 3*n4]; // Nj*K3
-  double *tm = &temp[2*n5 + 2*n2 + 4*n4]; // 4*K3
+  double *abf = &temp[2*n2]; // Nj*K3
+  double *abfx = &temp[2*n2 + n4]; // Nj*K3
+  double *abfy = &temp[2*n2 + 2*n4]; // Nj*K3
+  double *abfz = &temp[2*n2 + 3*n4]; // Nj*K3
+  double *tm = &temp[2*n2 + 4*n4]; // 4*K3
 
   if ((nl3 > 0) && (Nj>1)) {
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
@@ -1310,9 +1310,10 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
     }
   }
 
+  double e = 0.0;
   double *cb = &bdd[0];
-  if (localeapod) e += peratom_local_environment_descriptors(cb, bd, tm, ti);
-  else if (eapod) e += peratom_environment_descriptors(cb, bd, tm, ti);
+  if (localeapod) e += peratom_local_environment_descriptors(cb, bd, tmpenvmem, ti);
+  else if (eapod) e += peratom_environment_descriptors(cb, bd, tmpenvmem, ti);
   else            e += peratombase_coefficients(cb, bd, ti);
 
   double *cb2  = &cb[0]; // nl3
@@ -1327,12 +1328,14 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   if ((nl44>0) && (Nj>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44);
 
   twobody_forces(fij, cb2, drbf, rij, tj, Nj);
-
-  // Initialize forcecoeff to zero
-  memset(forcecoeff, 0, n5 * sizeof(*forcecoeff));
-  if ((nl3 > 0) && (Nj>1)) threebody_forcecoeff(forcecoeff, cb3, sumU);
-  if ((nl4 > 0) && (Nj>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU);
-  if ((nl3 > 0) && (Nj>1)) allbody_forces(fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz, tj, Nj);
+  
+  if ((nl3 > 0) && (Nj>1)) {
+    // Initialize forcecoeff to zero
+    memset(forcecoeff, 0, nelements*K3*nrbf3 * sizeof(*forcecoeff));
+    threebody_forcecoeff(forcecoeff, cb3, sumU);
+    if ((nl4 > 0) && (Nj>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU);
+    allbody_forces(fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz, tj, Nj);
+  }
 
   return e;
 }
@@ -1345,7 +1348,7 @@ double EAPOD::peratomenergyforce(double *fij, double *rij, double *temp,
   if (Nj==0) return e;
 
   int N = 3*Nj;
-  for (int n=0; n<N; n++) fij[n] = 0.0;
+  memset(fij, 0, N * sizeof(*fij));
 
   // calculate base descriptors and their derivatives with respect to atom coordinates
   peratombase_descriptors(bd, bdd, rij, temp, ti, tj, Nj);
@@ -1390,7 +1393,7 @@ double EAPOD::energyforce(double *force, double *x, int *atomtype, int *alist,
           int *jlist, int *pairnumsum, int natom)
 {
   double etot = 0.0;
-  for (int i=0; i<3*natom; i++) force[i] = 0.0;
+  memset(force, 0, 3*natom * sizeof(*force));
 
   for (int i=0; i<natom; i++) {
     int Nj = pairnumsum[i+1] - pairnumsum[i]; // # neighbors around atom i
@@ -1428,7 +1431,7 @@ double EAPOD::energyforce(double *force, double *x, int *atomtype, int *alist,
 void EAPOD::base_descriptors(double *basedesc, double *x,
         int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom)
 {
-  for (int i=0; i<natom*Mdesc; i++) basedesc[i] = 0.0;
+  memset(basedesc, 0, natom*Mdesc * sizeof(*basedesc));
 
   for (int i=0; i<natom; i++) {
     int Nj = pairnumsum[i+1] - pairnumsum[i]; // # neighbors around atom i
@@ -1464,17 +1467,15 @@ void EAPOD::base_descriptors(double *basedesc, double *x,
 void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *x,
         int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom)
 {
-  for (int i=0; i<nd; i++) gd[i] = 0.0;
-  for (int i=0; i<3*natom*nd; i++) gdd[i] = 0.0;
-  for (int i=0; i<natom*Mdesc; i++) basedesc[i] = 0.0;
+  memset(gd, 0, nd * sizeof(*gd));
+  memset(gdd, 0, 3*natom*nd * sizeof(*gdd));
+  memset(basedesc, 0, natom*Mdesc * sizeof(*basedesc));
 
   for (int i=0; i<natom; i++) {
     int Nj = pairnumsum[i+1] - pairnumsum[i]; // # neighbors around atom i
 
     // one-body descriptor
-    if (nd1>0) {
-      gd[nCoeffPerElement*(atomtype[i]-1)] += 1.0;
-    }
+    if (nd1>0) gd[nCoeffPerElement*(atomtype[i]-1)] += 1.0;
 
     if (Nj>0) {
       // reallocate temporary memory
@@ -1520,18 +1521,16 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *x,
 void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *probdesc, double *x,
         int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom)
 {
-  for (int i=0; i<nCoeffAll; i++) gd[i] = 0.0;
-  for (int i=0; i<3*natom*nCoeffAll; i++) gdd[i] = 0.0;
-  for (int i=0; i<natom*Mdesc; i++) basedesc[i] = 0.0;
-  for (int i=0; i<natom*nClusters; i++) probdesc[i] = 0.0;
+  memset(gd, 0, nCoeffAll * sizeof(*gd));
+  memset(gdd, 0, 3*natom*nCoeffAll * sizeof(*gdd));
+  memset(basedesc, 0, natom*Mdesc * sizeof(*basedesc));
+  memset(probdesc, 0, natom*nClusters * sizeof(*probdesc));
 
   for (int i=0; i<natom; i++) {
     int Nj = pairnumsum[i+1] - pairnumsum[i]; // # neighbors around atom i
 
     // one-body descriptor
-    if (nd1>0) {
-      gd[nCoeffPerElement*(atomtype[i]-1)] += 1.0;
-    }
+    if (nd1>0) gd[nCoeffPerElement*(atomtype[i]-1)] += 1.0;
 
     if (Nj>0) {
       // reallocate temporary memory
@@ -1768,7 +1767,7 @@ void EAPOD::fourbodydescderiv(double *d4, double *dd4, double *sumU,
                     dd4[2 + 3 * j + ii] += t23 * Uz[jj];
                   }
                 }
-                k += 1;
+                k++;
               }
             }
           }
@@ -1890,7 +1889,7 @@ void EAPOD::twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne)
       d2[m] = sum;
     }
   } else {
-    for (int m=0; m<nl2; m++) d2[m] = 0.0;
+    memset(d2, 0, nl2 * sizeof(*d2));
     for (int n = 0; n < N; ++n) {
       int d2idx = nrbf2 * tj[n];
       int i2 = n;
@@ -1902,8 +1901,8 @@ void EAPOD::twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne)
 
 void EAPOD::twobodydescderiv(double *d2, double *dd2, double *rbf, double *drbf, double *rij, int *tj, int N)
 {
-  for (int m=0; m<nl2; m++) d2[m] = 0.0;
-  for (int m=0; m<3*N*nl2; m++) dd2[m] = 0.0;
+  memset(d2, 0, nl2 * sizeof(*d2));
+  memset(dd2, 0, 3*N*nl2 * sizeof(*dd2));
 
   // Calculate the two-body descriptors and their derivatives
   for (int m=0; m<nrbf2; m++) {
@@ -2686,8 +2685,6 @@ void EAPOD::snapshots(double *rbf, double *xij, double rinij, double rdiffij, in
 ------------------------------------------------------------------------- */
 void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti)
 {
-  for (int i = 0; i < 9; i++) out[i] = 0.0;
-
   int typei = ti[0];
   int nc   = nCoeffPerElement*typei;
   int nct  = nComponents*typei;
@@ -2842,7 +2839,7 @@ void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, do
 }
 
 /**
- * @brief Estimate the amount of memory needed for the computation.
+ * @brief Estimate the amount of memory needed for training and compute/pod commands.
  *
  * @param Nj Number of neighboring atoms.
  * @return int The estimated amount of memory needed.
@@ -2855,13 +2852,13 @@ int EAPOD::estimate_temp_memory(int Nj)
   // d2, d3, d4, nld
   int nmaxnl = nl2 + nl3 + nl4 + nld;
 
-  // dd2, dd3, dd4 (training only)
+  // dd2, dd3, dd4
   int nmaxnd = 3*Nj*nmaxnl;
 
   // rij, fij, d2, d3, d4, dd2, dd3, dd4
   int nmax1 = 6*Nj + nmaxnl + nmaxnd;
 
-  // Ux, Uy, Uz (training only) K3>=K4, nrbf3>=nrbf4
+  // Ux, Uy, Uz (K3>=K4, nrbf3>=nrbf4)
   int nmax2 = 3*Nj*K3*nrbf3;
 
   // sumU and cU
@@ -2924,17 +2921,11 @@ void EAPOD::free_temp_memory()
  */
 int EAPOD::estimate_temp_memory_md(int Nj)
 {
-  int n2 = 2*Nj*nrbf2;            // rbf, drbf
-  int n3 = 2*Nj*ns;               // rbft, drbft
-  int n4 = 4*Nj*K3;               // abf, abfx, abfy, abfz
-  int n5 = 2*nelements*K3*nrbf3;  // sumU, forcecoeff
+  int n2 = 2*Nj*nrbf2;    // rbf, drbf
+  int n3 = 2*Nj*ns;       // rbft, drbft
+  int n4 = 4*Nj*K3+4*K3;  // abf, abfx, abfy, abfz, tm
 
-  // scratch block tm, shared by angular basis and ea-pod
-  int ntm = 4*K3;
-  if (localeapod) ntm = MAX(ntm, 2*nMaxActiveClusters);
-  else if (eapod) ntm = MAX(ntm, 3*nClusters + nComponents);
-
-  int ntemp = n5 + n2 + MAX(n3, n4 + ntm);
+  int ntemp = n2 + MAX(n3, n4);
 
   // rij, fij, tmpmem
   ndblmem = 6*Nj + ntemp;
@@ -2951,12 +2942,29 @@ void EAPOD::grow_rij(int Nj)
 
   memory->destroy(tmpmem);
   memory->destroy(tmpint);
-  memory->destroy(bd);
-  memory->destroy(bdd);
   memory->create(tmpmem, ndblmem, "tmpmem");
   memory->create(tmpint, nintmem, "tmpint");
+}
+
+void EAPOD::allocate_desc_memory()
+{
+  memory->destroy(bd);
+  memory->destroy(bdd);
+  memory->destroy(sumU);
+  memory->destroy(forcecoeff);
+
   memory->create(bd, Mdesc, "bd");
   memory->create(bdd, Mdesc, "bdd");
+  int n5 = nelements*K3*nrbf3;  // sumU, forcecoeff
+  memory->create(sumU, n5, "sumU");
+  memory->create(forcecoeff, n5, "forcecoeff");
+
+  if (eapod) {
+    int neamem = 3*nClusters + nComponents;
+    if (localeapod) neamem = 2*nMaxActiveClusters;
+    memory->destroy(tmpenvmem);
+    memory->create(tmpenvmem, neamem, "tmpenvmem");
+  }
 }
 
 /**
@@ -3432,9 +3440,10 @@ void EAPOD::init3body(int Pa3)
   memory->create(pn3, nabf3+1, "pn3"); // array stores the number of monomials for each degree
   memory->create(pq3, K3*2, "pq3"); // array needed for the recursive computation of the angular basis functions
   memory->create(pc3, K3, "pc3");   // array needed for the computation of the three-body descriptors
+  memory->create(ps3, K3, "ps3");   // array for signs of monomial involution: A_k(-r) -> (-1)^(deg A_k) A_k(r)
 
   // Initialize the arrays
-  init3bodyarray(pn3, pq3, pc3, Pa3);
+  init3bodyarray(pn3, pq3, pc3, ps3, Pa3);
 }
 
 /**
@@ -3460,13 +3469,14 @@ void EAPOD::init4body(int Pa4)
   init4bodyarray(pa4, pb4, pc4, Pa4);
 }
 
-void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int Pa)
+void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int *ps, int Pa)
 {
   const int maxD = Pa + 1;
   for (int d = 0; d <= maxD; ++d) np[d] = npa(d);
   const int K = np[maxD];
 
   // seed: monomial (0,0,0)
+  ps[0] = 1;    // sign(0) = 1
   pc[0] = 1;
   pq[0] = 0;    // parent monomial index (unused for d=0)
   pq[K] = 0;    // recursion direction   (unused for d=0)
@@ -3475,6 +3485,7 @@ void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int Pa)
   for (int d = 1; d < maxD; ++d) {
     for (int r = 0; r <= d; ++r) {
       for (int q = 0; q <= d - r; ++q) {
+        ps[idx] = powint(-1, d);
         const int p = d - q - r;
         pc[idx] = trinom(p, q, r);
 

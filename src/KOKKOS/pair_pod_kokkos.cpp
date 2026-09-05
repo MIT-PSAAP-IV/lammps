@@ -65,7 +65,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   utils::logmesg(lmp, "Atom Block Size: {:d}\n", atomBlockSize);
   nAtomBlocks = 0;
   timing = 0;
-  for (int i=0; i<100; i++) comptime[i] = 0;
+  for (int i=0; i<30; i++) comptime[i] = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -510,11 +510,7 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   MemKK::realloc_kokkos(pq_m, "pq_m", K3);
   MemKK::realloc_kokkos(pq_d, "pq_d", K3);
   MemKK::realloc_kokkos(pc3, "pc3", K3);
-  MemKK::realloc_kokkos(pa4, "pa4", nabf4+1);
-  MemKK::realloc_kokkos(pb4, "pb4", Q4*3);
-  MemKK::realloc_kokkos(pc4, "pc4", Q4);
   
-
   auto h_pn3 = Kokkos::create_mirror_view(pn3);
   for (int i=0; i<nabf3+1; i++) h_pn3[i] = podptr->pn3[i];
   Kokkos::deep_copy(pn3, h_pn3);
@@ -532,20 +528,15 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   for (int i = 0; i < K3; i++) h_pc3[i] = podptr->pc3[i];
   Kokkos::deep_copy(pc3, h_pc3);
 
-  MemKK::realloc_kokkos(p3_active, "pair_pod:p3_active", nabf3_active);
+  MemKK::realloc_kokkos(p3_active, "p3_active", nabf3_active);
   auto h_p3_active = Kokkos::create_mirror_view(p3_active);
   for (int i=0; i<nabf3_active; i++) h_p3_active[i] = podptr->p3_active[i];
   Kokkos::deep_copy(p3_active, h_p3_active);
 
-  MemKK::realloc_kokkos(p4_active, "pair_pod:p4_active", nabf4_active);
-  auto h_p4_active = Kokkos::create_mirror_view(p4_active);
-  for (int i=0; i<nabf4_active; i++) h_p4_active[i] = podptr->p4_active[i];
-  Kokkos::deep_copy(p4_active, h_p4_active);
-
   if (nl4 > 0) {
-    MemKK::realloc_kokkos(pa4, "pair_pod:pa4", nabf4+1);
-    MemKK::realloc_kokkos(pb4, "pair_pod:pb4", Q4*3);
-    MemKK::realloc_kokkos(pc4, "pair_pod:pc4", Q4);
+    MemKK::realloc_kokkos(pa4, "pa4", nabf4+1);
+    MemKK::realloc_kokkos(pb4, "pb4", Q4*3);
+    MemKK::realloc_kokkos(pc4, "pc4", Q4);
 
     auto h_pa4 = Kokkos::create_mirror_view(pa4);
     for (int i = 0; i < nabf4+1; i++) h_pa4[i] = podptr->pa4[i];
@@ -558,6 +549,11 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
     auto h_pc4 = Kokkos::create_mirror_view(pc4);
     for (int i = 0; i < Q4; i++) h_pc4[i] = podptr->pc4[i];
     Kokkos::deep_copy(pc4, h_pc4);
+
+    MemKK::realloc_kokkos(p4_active, "p4_active", nabf4_active);
+    auto h_p4_active = Kokkos::create_mirror_view(p4_active);
+    for (int i=0; i<nabf4_active; i++) h_p4_active[i] = podptr->p4_active[i];
+    Kokkos::deep_copy(p4_active, h_p4_active);
   }
 
   if (nl33 > 0) {
@@ -919,7 +915,6 @@ void PairPODKokkos<DeviceType>::radialbasis_spline(
       const KK_FLOAT z = l_rij(3*n + 2);
 
       const KK_FLOAT r = sqrt(x*x + y*y + z*z);
-      //const KK_FLOAT invr = 1.0 / r;
 
       const KK_FLOAT r0    = s_r0(pair);
       const KK_FLOAT invdr = s_invdr(pair);
@@ -1030,7 +1025,7 @@ void PairPODKokkos<DeviceType>::radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf
       int Nijm = start + Nij * m;
       int Nijk = start + Nij * k;
 
-      KK_FLOAT sum = 0.0;
+      KK_ACC_FLOAT sum = 0.0;
       for (int j=0; j<nj; j++) {
         sum += l_rbf(j + Nijm) * l_abf(j + Nijk);
       }
@@ -1049,7 +1044,7 @@ void PairPODKokkos<DeviceType>::radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf
       int Nijm = start + Nij * m;
       int Nijk = start + Nij * k;
 
-      KK_FLOAT tm[6];
+      KK_ACC_FLOAT tm[6];
       for (int e=0; e<l_nelements; e++) tm[e] = 0;
 
       for (int j=0; j<nj; j++)
@@ -1082,7 +1077,7 @@ void PairPODKokkos<DeviceType>::twobody_forces(
     KOKKOS_LAMBDA(const int n) {
       const int ii = l_idxi(n) + Ni * l_nrbf2 * l_tj(n);
 
-      KK_FLOAT cR = 0.0;
+      KK_ACC_FLOAT cR = 0.0;
       for (int m = 0; m < l_nrbf2; ++m) {
         cR += cb2(ii + Ni * m) * l_drbf(n + Nij * m);
       }
@@ -1098,27 +1093,25 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::threebodydesc(t_pod_1d d3, t_pod_1d l_sumU, t_pod_1i l_pc3, t_pod_1i l_pn3, t_pod_1i l_p3_active,
         int l_nelements, int l_nrbf3, int l_nabf3_active, int l_K3, const int Ni)
 {
-  int totalIterations = Ni * l_nrbf3;
+  const int totalIterations = Ni * l_nrbf3 * l_nabf3_active;
   Kokkos::parallel_for("ThreeBodyDesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
-    int m = idx % l_nrbf3;
-    int i = idx / l_nrbf3;
+    const int a =  idx % l_nabf3_active;
+    const int m = (idx / l_nabf3_active) % l_nrbf3;
+    const int i =  idx / (l_nabf3_active * l_nrbf3);
     int nmi = l_nelements * l_K3 * (m + l_nrbf3 * i);
     int nRA = Ni * l_nrbf3 * l_nabf3_active;
-    int iAm = i + Ni * l_nabf3_active * m;
-    for (int a = 0; a < l_nabf3_active; ++a) {
-      int p = l_p3_active(a);
-      int n1 = l_pn3(p);
-      int n2 = l_pn3(p + 1);
-      int k = iAm + Ni * a;
-      for (int i1 = 0; i1 < l_nelements; i1++) {
-        for (int i2 = i1; i2 < l_nelements; i2++) {
-          KK_FLOAT tmp=0;
-          for (int q = n1; q < n2; q++) {
-            tmp += l_pc3(q) * l_sumU(i1 + l_nelements * q + nmi) * l_sumU(i2 + l_nelements * q + nmi);
-          }
-          d3(k) = tmp;
-          k += nRA;
+    int k = i + Ni * (a + l_nabf3_active * m);
+    int p = l_p3_active(a);
+    int n1 = l_pn3(p);
+    int n2 = l_pn3(p + 1);
+    for (int i1 = 0; i1 < l_nelements; i1++) {
+      for (int i2 = i1; i2 < l_nelements; i2++) {
+        KK_ACC_FLOAT tmp = 0.0;
+        for (int q = n1; q < n2; q++) {
+          tmp += l_pc3(q) * l_sumU(i1 + l_nelements * q + nmi) * l_sumU(i2 + l_nelements * q + nmi);
         }
+        d3(k) = tmp;
+        k += nRA;
       }
     }
   });
@@ -1129,51 +1122,46 @@ void PairPODKokkos<DeviceType>::threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3,
     t_pod_1d l_sumU, t_pod_1i l_pc3, t_pod_1i l_pn3, t_pod_1i l_p3_active,
     int l_nelements, int l_nrbf3, int l_nabf3_active, int l_K3, int Ni)
 {
-  int totalIterations = Ni * l_nrbf3;
+  const int totalIterations = Ni * l_nrbf3 * l_nabf3_active;
   if (l_nelements==1) {
     Kokkos::parallel_for("threebody_forcecoeff1", Kokkos::RangePolicy<DeviceType>(0, totalIterations), KOKKOS_LAMBDA(int idx) {
-      const int i = idx / l_nrbf3;
-      const int m = idx % l_nrbf3;
-      const int nib3 = i + Ni*l_nabf3_active*m;
+      const int a =  idx % l_nabf3_active;
+      const int m = (idx / l_nabf3_active) % l_nrbf3;
+      const int i =  idx / (l_nabf3_active * l_nrbf3);
       const int idxU = l_K3 * (m + l_nrbf3*i);
-      for (int a = 0; a < l_nabf3_active; ++a) {
-        const KK_FLOAT c3 = 2.0 * cb3(nib3 + Ni*a);
-        const int p = l_p3_active(a);
-        const int n1 = l_pn3(p);
-        const int n2 = l_pn3(p + 1);
-        for (int q = n1; q < n2; q++) {
-          fb3(q + idxU) += c3 * l_pc3(q) * l_sumU(q + idxU);
-        }
+      const KK_FLOAT c3 = 2.0 * cb3(i + Ni*(a + l_nabf3_active*m));
+      const int p = l_p3_active(a);
+      const int n1 = l_pn3(p);
+      const int n2 = l_pn3(p + 1);
+      for (int q = n1; q < n2; q++) {
+        fb3(q + idxU) += c3 * l_pc3(q) * l_sumU(q + idxU);
       }
     });
   }
   else {
     Kokkos::parallel_for("threebody_forcecoeff2", Kokkos::RangePolicy<DeviceType>(0, totalIterations), KOKKOS_LAMBDA(const int idx) {
-      const int i = idx / l_nrbf3;
-      const int m = idx % l_nrbf3;
+      const int a =  idx % l_nabf3_active;
+      const int m = (idx / l_nabf3_active) % l_nrbf3;
+      const int i =  idx / (l_nabf3_active * l_nrbf3);
       const int N3 = Ni * l_nabf3_active * l_nrbf3;
-      const int nim = i + Ni * l_nabf3_active * m;
+      const int nim = i + Ni * (a + l_nabf3_active * m);
       const int baseKMI = l_nelements * l_K3 * (m + l_nrbf3 * i);
     
-      for (int a = 0; a < l_nabf3_active; ++a) {
-        const int p = l_p3_active(a);
-        const int n1  = l_pn3(p);
-        const int n2  = l_pn3(p + 1);
-        const int jmp = nim + Ni * a;
-        for (int q = n1; q < n2; ++q) {
-          const KK_FLOAT pk = l_pc3[q];
-          const int idxU = baseKMI + l_nelements * q;
-          // em = l_elemindex(i1, i2)
-          int em = jmp;
-          for (int i1 = 0; i1 < l_nelements; ++i1) {
-            const KK_FLOAT u1 = l_sumU[idxU + i1];
-            for (int i2 = i1; i2 < l_nelements; ++i2, em+=N3) {
-              const KK_FLOAT w = pk * cb3[em];
-              const KK_FLOAT u2 = l_sumU[idxU + i2];
-            
-              fb3[idxU + i2] += w * u1;
-              fb3[idxU + i1] += w * u2;
-            }
+      const int p = l_p3_active(a);
+      const int n1  = l_pn3(p);
+      const int n2  = l_pn3(p + 1);
+      for (int q = n1; q < n2; ++q) {
+        const int pk = l_pc3[q];
+        const int idxU = baseKMI + l_nelements * q;
+        int em = nim;
+        for (int i1 = 0; i1 < l_nelements; ++i1) {
+          const KK_FLOAT u1 = l_sumU[idxU + i1];
+          for (int i2 = i1; i2 < l_nelements; ++i2, em+=N3) {
+            const KK_FLOAT w = pk * cb3[em];
+            const KK_FLOAT u2 = l_sumU[idxU + i2];
+          
+            fb3[idxU + i2] += w * u1;
+            fb3[idxU + i1] += w * u2;
           }
         }
       }
@@ -1185,19 +1173,21 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::fourbodydesc(t_pod_1d d4,  t_pod_1d l_sumU, t_pod_1i l_pa4, t_pod_1i l_pb4,
     t_pod_1i l_pc4, int l_nelements, int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni)
 {
-  int totalIterations = l_nrbf4 * Ni;
+  const int totalIterations = l_nrbf4 * Ni;
   Kokkos::parallel_for("fourbodydesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
-    int m = idx % l_nrbf4;
-    int i = idx / l_nrbf4;
-    int idxU = l_nelements * l_K3 * (m + l_nrbf3 * i);
+    const int m = idx % l_nrbf4;
+    const int i = idx / l_nrbf4;
+    const int NiAR4 = Ni * l_nabf4 * l_nrbf4;
+    const int idxU = l_nelements * l_K3 * (m + l_nrbf3 * i);
+    const int iNiA4m = i + Ni * l_nabf4 * m;
     for (int p = 0; p < l_nabf4; p++) {
       int n1 = l_pa4(p);
       int n2 = l_pa4(p + 1);
-      int k = 0;
+      int k = iNiA4m + Ni * p;
       for (int i1 = 0; i1 < l_nelements; i1++) {
         for (int i2 = i1; i2 < l_nelements; i2++) {
           for (int i3 = i2; i3 < l_nelements; i3++) {
-            KK_FLOAT tmp = 0.0;
+            KK_ACC_FLOAT tmp = 0.0;
             for (int q = n1; q < n2; q++) {
               int c = l_pc4(q);
               int j1 = l_pb4(q);
@@ -1205,9 +1195,8 @@ void PairPODKokkos<DeviceType>::fourbodydesc(t_pod_1d d4,  t_pod_1d l_sumU, t_po
               int j3 = l_pb4(q + 2 * l_Q4);
               tmp += c * l_sumU(idxU + i1 + l_nelements * j1) * l_sumU(idxU + i2 + l_nelements * j2) * l_sumU(idxU + i3 + l_nelements * j3);
             }
-            int kk = p + l_nabf4 * m + l_nabf4 * l_nrbf4 * k;
-            d4(i + Ni * kk) = tmp;
-            k += 1;
+            d4(k) = tmp;
+            k += NiAR4;
           }
         }
       }
@@ -1220,7 +1209,7 @@ void PairPODKokkos<DeviceType>::fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4,
     t_pod_1d l_sumU, t_pod_1i l_pa4, t_pod_1i l_pb4, t_pod_1i l_pc4, int l_nelements,
         int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni)
 {
-  int totalIterations = l_nrbf4 * Ni;
+  const int totalIterations = l_nrbf4 * Ni;
   if (l_nelements==1) {
     Kokkos::parallel_for("fourbody_forcecoeff1", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
       int i = idx / l_nrbf4;
@@ -1247,7 +1236,7 @@ void PairPODKokkos<DeviceType>::fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4,
     });
   }
   else {
-    int N3 = Ni * l_nabf4 * l_nrbf4;
+    const int N3 = Ni * l_nabf4 * l_nrbf4;
     Kokkos::parallel_for("fourbody_forcecoeff2", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
       int i = idx / l_nrbf4;
       int m = idx % l_nrbf4;
@@ -1261,7 +1250,7 @@ void PairPODKokkos<DeviceType>::fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4,
           int idx1 = idxU + l_nelements * l_pb4(q);
           int idx2 = idxU + l_nelements * l_pb4(q + l_Q4);
           int idx3 = idxU + l_nelements * l_pb4(q + 2 * l_Q4);
-          KK_FLOAT c = l_pc4(q);
+          int c = l_pc4(q);
           int k = jpm;
           for (int i1 = 0; i1 < l_nelements; i1++) {
             KK_FLOAT c1 = l_sumU[idx1 + i1];
@@ -1295,14 +1284,14 @@ void PairPODKokkos<DeviceType>::allbody_forces(
       const int NeK3 = l_nelements * l_K3;
       const int ii = l_tj(j) + NeK3 * l_nrbf3 * l_idxi(j);
 
-      KK_FLOAT fcAdR = 0.0;
-      KK_FLOAT fx = 0.0, fy = 0.0, fz = 0.0;
+      KK_ACC_FLOAT fcAdR = 0.0;
+      KK_ACC_FLOAT fx = 0.0, fy = 0.0, fz = 0.0;
 
       for (int k = 0; k < l_K3; ++k) {
         const int i2_base = ii + l_nelements * k;
 
-        KK_FLOAT fcR = 0.0;
-        KK_FLOAT fcdR = 0.0;
+        KK_ACC_FLOAT fcR = 0.0;
+        KK_ACC_FLOAT fcdR = 0.0;
 
         for (int m = 0; m < l_nrbf3; ++m) {
           const int idxR = j + Nij * m;
@@ -1380,30 +1369,22 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   auto d34 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33), Ni * (nl2 + nl3 + nl4 + nl33 + nl34)));
   auto d44 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
 
+  begin = std::chrono::high_resolution_clock::now();
   if (use_spline) {
     // Directly fills final basis rbf/drbf (Phi-orthogonalized)
-    begin = std::chrono::high_resolution_clock::now();
     radialbasis_spline(rbf, drbf, rij, ti, tj, Nij);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[10] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   } else {
     // Original analytic path
-    begin = std::chrono::high_resolution_clock::now();
     radialbasis(abf, abfx, rij, rin, invrdiff,
                 bessel_neg_alpha, bessel_pi_inv_t1, bessel_dx_factor, ti, tj,
                 nelements, besseldegree, inversedegree, nbesselpars, Nij);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[10] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
-    
-    begin = std::chrono::high_resolution_clock::now();
+
     matrixMultiply(abf,  Phi, rbf,  Nij, ns, nrbf2);
     matrixMultiply(abfx, Phi, drbf, Nij, ns, nrbf2);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[11] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
+  Kokkos::fence();
+  end = std::chrono::high_resolution_clock::now();
+  comptime[11] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
   begin = std::chrono::high_resolution_clock::now();
   set_array_to_zero(d2, Ni*nl2);
@@ -1560,7 +1541,7 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       const int ncdt  = typei * nDes;
       const int ncct  = typei * nCls;
 
-      KK_FLOAT pcai = 0.0;
+      KK_ACC_FLOAT pcai = 0.0;
       for (int m = 0; m < nDes; ++m) {
         pcai += proj[ncdt + m] * B[i + Ni * m];
       }
@@ -1601,8 +1582,8 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       const int kncct = kl + nCls * typei;
       const int knc   = 1 + nc + kl * nDes;
       
-      KK_FLOAT sumfDi = 0.0;
-      KK_FLOAT S      = 0.0;
+      KK_ACC_FLOAT sumfDi = 0.0;
+      KK_ACC_FLOAT S      = 0.0;
 
       const KK_FLOAT pcai = pca[i];
       KK_FLOAT fcut, dfcut;
@@ -1628,12 +1609,12 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       }
       sumfDi = 1.0 / sumfDi;
 
-      KK_FLOAT eival = cefs[nc];
-      KK_FLOAT T     = 0.0;
-      KK_FLOAT A     = 0.0;
+      KK_ACC_FLOAT eival = cefs[nc];
+      KK_ACC_FLOAT T     = 0.0;
+      KK_ACC_FLOAT A     = 0.0;
       for (int k = 0; k < kni; ++k) {
         int idx = knc + k*nDes;
-        KK_FLOAT sumE = 0.0;
+        KK_ACC_FLOAT sumE = 0.0;
         for (int m = 0; m < nDes; ++m)
           sumE += cefs[m + idx] * B[i + Ni*m];
         
@@ -1662,7 +1643,7 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       const int typei = tyai[i];
       const int knc   = 1 + m + kl * nDes + nCoeff * typei;
 
-      KK_FLOAT sum = U[i] * proj[m + nDes*typei];
+      KK_ACC_FLOAT sum = U[i] * proj[m + nDes*typei];
       for (int k = 0; k < kni; ++k)
         sum += cefs[knc + k*nDes] * D[i + Ni*k];
 
@@ -1808,33 +1789,41 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   auto cb34 = Kokkos::subview(cb, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33), Ni * (nl2 + nl3 + nl4 + nl33 + nl34)));
   auto cb44 = Kokkos::subview(cb, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
 
-  if ((nl33>0) && (Nij>3)) {
-    crossdesc_reduction(cb3, cb3, cb33, d3, d3, ind33l, ind33r, nl33, Ni);
-  }
-  if ((nl34>0) && (Nij>4)) {
-    crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34, Ni);
-  }
-  if ((nl44>0) && (Nij>5)) {
-    crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44, Ni);
-  }
+  if ((nl33>0) && (Nij>3)) crossdesc_reduction(cb3, cb3, cb33, d3, d3, ind33l, ind33r, nl33, Ni);
+  if ((nl34>0) && (Nij>4)) crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34, Ni);
+  if ((nl44>0) && (Nij>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44, Ni);
   Kokkos::fence();
   end = std::chrono::high_resolution_clock::now();
   comptime[6] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
   begin = std::chrono::high_resolution_clock::now();
   set_array_to_zero(l_fij, 3*Nij);
-  if (Nij>0) twobody_forces(l_fij, cb2, drbf, rij, idxi, tj, nrbf2, Ni, Nij);
+  if (Nij>0) twobody_forces(l_fij, cb2, drbf, rij, idxi, tj, nrbf2, Ni, Nij);  
   Kokkos::fence();
   end = std::chrono::high_resolution_clock::now();
   comptime[7] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
+  begin = std::chrono::high_resolution_clock::now();
   set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
   if ((nl3 > 0) && (Nij>1)) threebody_forcecoeff(forcecoeff, cb3, sumU,
           pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
+  Kokkos::fence();
+  end = std::chrono::high_resolution_clock::now();
+  comptime[8] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
+
+  begin = std::chrono::high_resolution_clock::now();
   if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU,
       pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
+  Kokkos::fence();
+  end = std::chrono::high_resolution_clock::now();
+  comptime[9] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
+
+  begin = std::chrono::high_resolution_clock::now();
   if ((nl3 > 0) && (Nij>1)) allbody_forces(l_fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz,
           idxi, tj, nelements, nrbf3, K3, Nij);
+  Kokkos::fence();
+  end = std::chrono::high_resolution_clock::now();
+  comptime[10] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 }
 
 template<class DeviceType>
@@ -1888,7 +1877,7 @@ struct PODGlobalStressFunctor {
   PODGlobalStressFunctor(View1D fij, View1D rij) : l_fij(fij), l_rij(rij) {}
 
   struct value_type {
-    KK_FLOAT v[6];
+    KK_ACC_FLOAT v[6];
   };
 
   KOKKOS_INLINE_FUNCTION

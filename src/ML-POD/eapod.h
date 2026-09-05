@@ -45,7 +45,7 @@ class EAPOD : protected Pointers {
   int crossindices(int *ind1, int *ind2, int *dabf1, int nabf1, int nrbf1, int nebf1, int *dabf2,
                    int nabf2, int nrbf2, int nebf2, int dabf12, int nrbf12);
 
-  void init3bodyarray(int *np, int *pq, int *pc, int Pa3);
+  void init3bodyarray(int *np, int *pq, int *pc, int *ps, int Pa3);
 
   void init4bodyarray(int *pa4, int *pb4, int *pc4, int Pa4);
 
@@ -148,8 +148,11 @@ class EAPOD : protected Pointers {
 
   double *bd;           // base descriptors
   double *bdd;          // derivatives of the base descriptors with respect to the atomic positions
-  double *pd;           //  multi-environment descriptors
+  double *pd;           // multi-environment descriptors
   double *pdd;          // derivative of the multi-environment descriptors with respect to the atomic positions
+  double *sumU;         // [Ne*K3*nrbf3]
+  double *forcecoeff;   // [Ne*K3*nrbf3]
+  double *tmpenvmem;    // [2*nMaxActiveClusters || 3*nClusters + nComponents]
 
   int nproj;         // number of elements in projection matrix (nComponents * Mdesc * nelements)
   int ncentroids;    // number of centroids (nComponents * nClusters * nelements)
@@ -174,6 +177,7 @@ class EAPOD : protected Pointers {
   int K3, K4, Q4;                // number of monomials
   int *pn3, *pq3, *pc3;          // arrays to compute 3-body angular basis functions
   int *pa4, *pb4, *pc4;          // arrays to compute 4-body angular basis functions
+  int *ps3;                      // [K3] sign_k of monomial A_k for graded involution
   int *tmpint;
   int nintmem;    // number of integers in tmpint array
   int ndblmem;    // number of doubles in tmpmem array
@@ -213,6 +217,7 @@ class EAPOD : protected Pointers {
 
   int estimate_temp_memory_md(int Nj);
   void grow_rij(int Nj);
+  void allocate_desc_memory();
 
   //void mknewcoeff();
 
