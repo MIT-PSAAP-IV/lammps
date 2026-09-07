@@ -56,7 +56,8 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
     ind44l(nullptr), ind44r(nullptr),
     p3_active(nullptr), dabf3_active(nullptr),
     p4_active(nullptr), dabf4_active(nullptr), deg4_full(nullptr),
-    rbf_spline_coeffs(nullptr), spline_r0(nullptr), spline_invdr(nullptr)
+    rbf_hermite_coeffs(nullptr), hermite_r0(nullptr), hermite_invdr(nullptr),
+    bs_r0(nullptr), bs_invh(nullptr), bs_base(nullptr)
 {
   nelements = 1;
   nClusters = 1;
@@ -96,9 +97,13 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   pbc[1] = 1;
   pbc[2] = 1;
 
-  use_spline   = false;
-  nspline_grid = 1000;
-  nspline_bins = nspline_grid-1;
+  use_bspline = false;
+  bs_left_open = true;
+  bs_ileft = 0;
+
+  use_hermite   = false;
+  nhermite_grid = 1000;
+  nhermite_bins = nhermite_grid-1;
   
   uncertaintyflag = false;
 
@@ -140,6 +145,7 @@ EAPOD::~EAPOD()
   memory->destroy(pn3);
   memory->destroy(pq3);
   memory->destroy(pc3);
+  memory->destroy(ps3);
   memory->destroy(pa4);
   memory->destroy(pb4);
   memory->destroy(pc4);
@@ -155,9 +161,12 @@ EAPOD::~EAPOD()
   memory->destroy(dabf3_active);
   memory->destroy(dabf4_active);
   memory->destroy(deg4_full);
-  memory->destroy(rbf_spline_coeffs);
-  memory->destroy(spline_r0);
-  memory->destroy(spline_invdr);
+  memory->destroy(rbf_hermite_coeffs);
+  memory->destroy(hermite_r0);
+  memory->destroy(hermite_invdr);
+  memory->destroy(bs_r0);
+  memory->destroy(bs_invh);
+  memory->destroy(bs_base);
 }
 
 void EAPOD::read_pod_file(const std::string &pod_file)
@@ -210,56 +219,15 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     }
 
     if (keywd == "pbc") {
-      if (words.size() != 4)
-        error->one(FLERR,"Improper POD file.", utils::getsyserror());
+      if (words.size() != 4) error->one(FLERR,"Improper POD file.", utils::getsyserror());
       pbc[0] = utils::inumeric(FLERR,words[1],false,lmp);
       pbc[1] = utils::inumeric(FLERR,words[2],false,lmp);
       pbc[2] = utils::inumeric(FLERR,words[3],false,lmp);
     }
 
     int Ne = nelements;
-
-    if (keywd == "rin") {
-      int wsize = words.size()-1;
-      if ( (wsize != Ne*Ne) && (wsize != 1) )
-        error->one(FLERR,"Improper POD file. Provide outer cut-off radius for each element pair", utils::getsyserror());
-      
-      memory->create(rin, Ne, Ne, "rin");
-      if (wsize != Ne*Ne) {
-        double r = utils::numeric(FLERR,words[1],false,lmp);
-        for (int i = 0; i < Ne; i++)
-          for (int j = 0; j < Ne; j++)
-            rin[i][j] = r;
-      }
-      else {
-        for (int i = 0; i < Ne; i++)
-          for (int j = 0; j < Ne; j++) {
-            int ij = j + i*Ne;
-            rin[i][j] = utils::numeric(FLERR,words[ij+1],false,lmp);
-          }
-      }
-    }
-
-    if (keywd == "rcut") {
-      int wsize = words.size()-1;
-      if ( (wsize != Ne*Ne) && (wsize != 1) )
-        error->one(FLERR,"Improper POD file. Provide outer cut-off radius for each element pair", utils::getsyserror());
-      
-      memory->create(rcut, Ne, Ne, "rcut");
-      if (wsize != Ne*Ne) {
-        double r = utils::numeric(FLERR,words[1],false,lmp);
-        for (int i = 0; i < Ne; i++)
-          for (int j = 0; j < Ne; j++)
-            rcut[i][j] = r;
-      }
-      else {
-        for (int i = 0; i < Ne; i++)
-          for (int j = 0; j < Ne; j++) {
-            int ij = j + i*Ne;
-            rcut[i][j] = utils::numeric(FLERR,words[ij+1],false,lmp);
-          }
-      }
-    }
+    if (keywd == "rin")  read_pair_radii(rin,  words, Ne, "rin");
+    if (keywd == "rcut") read_pair_radii(rcut, words, Ne, "rcut");
 
     // settings for the base POD potential and descriptors
     if (keywd == "bessel_parameters") {
@@ -304,10 +272,14 @@ void EAPOD::read_pod_file(const std::string &pod_file)
         L4min = utils::inumeric(FLERR,words[1],false,lmp);
       if (keywd == "fourbody_angular_degree_max")
         L4max = utils::inumeric(FLERR,words[1],false,lmp);
-      if (keywd == "enable_radial_spline")
-        use_spline = utils::inumeric(FLERR,words[1],false,lmp);
-      if (keywd == "radial_spline_grid")
-        nspline_grid = utils::inumeric(FLERR,words[1],false,lmp);
+      if (keywd == "enable_bspline")
+        use_bspline = utils::inumeric(FLERR,words[1],false,lmp);
+      if (keywd == "bspline_left_open")
+        bs_left_open = utils::inumeric(FLERR,words[1],false,lmp);
+      if (keywd == "enable_hermite_spline")
+        use_hermite = utils::inumeric(FLERR,words[1],false,lmp);
+      if (keywd == "radial_hermite_grid")
+        nhermite_grid = utils::inumeric(FLERR,words[1],false,lmp);
       if (keywd == "onebody")
         onebody = utils::inumeric(FLERR,words[1],false,lmp);
       if (keywd == "twobody_number_radial_basis_functions")
@@ -334,29 +306,49 @@ void EAPOD::read_pod_file(const std::string &pod_file)
         P44 = utils::inumeric(FLERR,words[1],false,lmp);
     }
   }
+  if (P3 < P4) error->all(FLERR,"four-body angular degree must be equal or less than three-body angular degree");
+  if (P4 < P33) error->all(FLERR,"five-body angular degree must be equal or less than four-body angular degree");
+  if (P4 < P34) error->all(FLERR,"six-body angular degree must be equal or less than four-body angular degree");
+  if (P4 < P44) error->all(FLERR,"seven-body angular degree must be equal or less than four-body angular degree");
+  if (P3 > 12) error->all(FLERR,"three-body angular degree must be equal or less than 12");
+  if (P4 > 6) error->all(FLERR,"four-body angular degree must be equal or less than 6");
+
   if (nrbf2 < nrbf3) error->all(FLERR,"number of three-body radial basis functions must be equal or less than number of two-body radial basis functions");
   if (nrbf3 < nrbf4) error->all(FLERR,"number of four-body radial basis functions must be equal or less than number of three-body radial basis functions");
   if (nrbf4 < nrbf33) error->all(FLERR,"number of five-body radial basis functions must be equal or less than number of four-body radial basis functions");
   if (nrbf4 < nrbf34) error->all(FLERR,"number of six-body radial basis functions must be equal or less than number of four-body radial basis functions");
   if (nrbf4 < nrbf44) error->all(FLERR,"number of seven-body radial basis functions must be equal or less than number of four-body radial basis functions");
+  nrbfmax = nrbf2;
+
+  if (use_bspline) {
+    // B-splines for two-body radial basis (nrbf2) and descriptors (nl2)
+    // Bessel for many-body radial basis (nrbf3) orthogonalized
+    if (nrbf2 < 4) error->all(FLERR,"B-spline two-body radial basis requires at least 4 two-body radial basis functions");
+    nrbfmax = nrbf3;
+  }
+  int Ne = nelements;
+  memory->create(rcutsq,   Ne, Ne, "rcutsq");
+  memory->create(invrdiff, Ne, Ne, "invrdiff");
+
+  rcutmax = rcut[0][0];
+  for (int i = 0; i < Ne; i++)
+    for (int j = 0; j < Ne; j++) {
+      double rinij = rin[i][j];
+      double rcutij = rcut[i][j];
+      rcutsq[i][j]   = rcutij*rcutij;
+      invrdiff[i][j] = 1.0 / (rcutij - rinij);
+      rcutmax = MAX(rcutmax, rcutij);
+    }
 
   nbesselrbf = besseldegree*nbesselpars;
   ns = nbesselrbf + inversedegree;
-  if (ns < nrbf2) {
-    inversedegree = nrbf2 - nbesselrbf;
-    ns = nrbf2;
+  if (ns < nrbfmax) {
+    inversedegree = nrbfmax - nbesselrbf;
+    ns = nrbfmax;
   }
 
   for (int i = 0; i < nbesselpars; i++)
-    if (fabs(besselparams[i]) <= 1.0e-6) besselparams[i] = 1e-3;
-
-  if (P3 < P4) error->all(FLERR,"four-body angular degree must be equal or less than three-body angular degree");
-  if (P4 < P33) error->all(FLERR,"five-body angular degree must be equal or less than four-body angular degree");
-  if (P4 < P34) error->all(FLERR,"six-body angular degree must be equal or less than four-body angular degree");
-  if (P4 < P44) error->all(FLERR,"seven-body angular degree must be equal or less than four-body angular degree");
-
-  if (P3 > 12) error->all(FLERR,"three-body angular degree must be equal or less than 12");
-  if (P4 > 6) error->all(FLERR,"four-body angular degree must be equal or less than 6");
+    if (fabs(besselparams[i]) <= 1e-6) besselparams[i] = 1e-3;
 
   if (nActiveClusters == 1.0) nActiveClusters += 1e-3;
   if (nClusters < 1) nClusters = 1;
@@ -376,29 +368,14 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   hat_p1 = hat_p - 1;
   hat_q1 = hat_q - 1;
 
-  int Ne = nelements;
   memory->create(elemindex, Ne, Ne, "elemindex");
   int k = 0;
   for (int i1 = 0; i1<Ne; i1++)
     for (int i2 = i1; i2<Ne; i2++) {
       elemindex[i1][i2] = k;
       elemindex[i2][i1] = k;
-      k += 1;
+      k++;
     }
-  
-  // Compute the maximum and minimum distances between two atoms for each element pair type
-  memory->create(rcutsq, Ne, Ne, "rcutsq");
-  memory->create(invrdiff, Ne, Ne, "invrdiff");
-  rcutmax = rcut[0][0];
-  for (int i = 0; i < nelements; i++) {
-    for (int j = 0; j < nelements; j++) {
-      double rcut_ij = rcut[i][j];
-      double rin_ij = rin[i][j];
-      invrdiff[i][j] = 1.0 / (rcut_ij - rin_ij);
-      rcutsq[i][j] = rcut_ij * rcut_ij;
-      if (rcut_ij > rcutmax) rcutmax = rcut_ij;
-    }
-  }
 
   init_bessel_const();
 
@@ -406,7 +383,8 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   init3body(P3);
   init4body(P4);
 
-  if (use_spline) init_spline_radialbasis();
+  if (use_bspline) init_bspline_radialbasis();
+  if (use_hermite) init_hermite_radialbasis();
 
   if (L3max < 0) L3max = P3;
   if (L4max < 0) L4max = P4;
@@ -503,17 +481,17 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     utils::logmesg(lmp, "inverse polynomial degree: {}\n", inversedegree);
 
     utils::logmesg(lmp, "bessel parameters:");
-    for (int i = 0; i < nbesselpars; i++)
-      utils::logmesg(lmp, " {}", besselparams[i]);
+    for (int i = 0; i < nbesselpars; i++) utils::logmesg(lmp, " {}", besselparams[i]);
     utils::logmesg(lmp, "\n");
 
-    utils::logmesg(lmp,"3-body angular range: [{}:{}], active channels: {}\n",
-                   L3min,L3max,nabf3_active);
-    utils::logmesg(lmp,"4-body angular range: [{}:{}], active channels: {}\n",
-                   L4min,L4max,nabf4_active);
+    utils::logmesg(lmp,"3-body angular range: [{}:{}], active channels: {}\n", L3min,L3max,nabf3_active);
+    utils::logmesg(lmp,"4-body angular range: [{}:{}], active channels: {}\n", L4min,L4max,nabf4_active);
     
-    utils::logmesg(lmp, "enable radial spline: {}\n", (int)use_spline);
-    if (use_spline == 1) utils::logmesg(lmp, "radial spline grid resolution: {}\n", nspline_grid);
+    utils::logmesg(lmp, "enable radial hermite spline: {}\n", (int)use_hermite);
+    if (use_hermite) utils::logmesg(lmp, "radial hermite grid resolution: {}\n", nhermite_grid);
+    utils::logmesg(lmp, "enable B-spline two-body radial basis: {}\n", (int)use_bspline);
+    if (use_bspline) utils::logmesg(lmp, "B-spline with sides open: {}\n", (int)bs_left_open);
+
     utils::logmesg(lmp, "one-body potential: {}\n", onebody);
     utils::logmesg(lmp, "two-body radial basis functions: {}\n", nrbf2);
     utils::logmesg(lmp, "three-body radial basis functions: {}\n", nrbf3);
@@ -537,6 +515,19 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     utils::logmesg(lmp, "number of global descriptors: {}\n", nCoeffAll);
     utils::logmesg(lmp, "**************** End of POD Potentials ****************\n\n");
   }
+}
+
+void EAPOD::read_pair_radii(double **&arr, const std::vector<std::string> &words,
+                            int Ne, const char *name)
+{
+  int wsize = (int)words.size() - 1;
+  if ((wsize != Ne*Ne) && (wsize != 1)) error->one(FLERR, "Improper POD file: {} needs 1 or nelements^2 values", name);
+  memory->create(arr, Ne, Ne, name);
+  for (int i = 0; i < Ne; i++)
+    for (int j = 0; j < Ne; j++) {
+      int k = (wsize == 1) ? 1 : (j + i*Ne + 1);
+      arr[i][j] = utils::numeric(FLERR, words[k], false, lmp);
+    }
 }
 
 void EAPOD::read_model_coeff_file(const std::string &coeff_file)
@@ -799,37 +790,50 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
   double *dd34 = &bdd1[3*Nj*(nl2+nl3+nl4+nl33)]; // 3*Nj*nl34
   double *dd44 = &bdd1[3*Nj*(nl2+nl3+nl4+nl33+nl34)]; // 3*Nj*nl44
 
-  int n1 = Nj*K3*nrbf3;
-  int n2 = Nj*nrbf2;
-  int n3 = Nj*ns;
-  int n4 = Nj*K3;
-  int n5 = K3*nrbf3*nelements;
+  // radial basis for the many-body (>= 3-body) descriptors
+  int n1 = Nj*nrbfmax;
+  int nt = 2*n1;
+  double *rbf = &temp[0];    // Nj*nrbfmax
+  double *drbf = &temp[n1];  // Nj*nrbfmax
+  
+  // B-splines two-body radial basis: 4 nonzero splines per neighbor (compact)
+  double *rbf2 = rbf;
+  double *drbf2 = drbf;
+  if (use_bspline) {
+    rbf2 = &temp[nt];          // 4*Nj
+    drbf2 = &temp[nt + 4*Nj];  // 4*Nj
+    nt += 8*Nj;
+    radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nj);
+  }
 
-  double *Ux = &temp[0]; // Nj*K3*nrbf3
-  double *Uy = &temp[n1]; // Nj*K3*nrbf3
-  double *Uz = &temp[2*n1]; // Nj*K3*nrbf3
-  double *sumU = &temp[3*n1]; // K3*nrbf3*nelements
-
-  double *rbf = &temp[3*n1 + n5]; // Nj*nrbf2
-  double *drbf = &temp[3*n1 + n5 + n2]; // Nj*nrbf2
-
-  if (use_spline) {
-    radialbasis_spline(rbf, drbf, rij, ti, tj, Nj);
+  if (use_hermite) {
+    radialbasis_hermite(rbf, drbf, rij, ti, tj, Nj);
   } else {
-    double *rbft = &temp[3*n1 + n5 + 2*n2]; // Nj*ns
-    double *drbft = &temp[3*n1 + n5 + 2*n2 + n3]; // Nj*ns
+    int n2 = Nj*ns;
+    double *rbft = &temp[nt];        // Nj*ns
+    double *drbft = &temp[nt + n2];  // Nj*ns
     radialbasis(rbft, drbft, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
     radialPhi(rbf, drbf, rbft, drbft, ti, tj, Nj);
   }
 
-  twobodydescderiv(d2, dd2, rbf, drbf, rij, tj, Nj);
+  if (use_bspline) twobodydescderiv_bspline(d2, dd2, rbf2, drbf2, rij, bs_base, tj, Nj);
+  else             twobodydescderiv(d2, dd2, rbf2, drbf2, rij, tj, Nj);
 
   if ((nl3 > 0) && (Nj>1)) {
-    double *abf = &temp[3*n1 + n5 + 2*n2]; // Nj*K3
-    double *abfx = &temp[3*n1 + n5 + 2*n2 + n4]; // Nj*K3
-    double *abfy = &temp[3*n1 + n5 + 2*n2 + 2*n4]; // Nj*K3
-    double *abfz = &temp[3*n1 + n5 + 2*n2 + 3*n4]; // Nj*K3
-    double *tm = &temp[3*n1 + n5 + 2*n2 + 4*n4]; // 4*K3
+    int n3 = Nj*K3*nrbf3;
+    int n4 = K3*nrbf3*nelements;
+    int n5 = Nj*K3;
+
+    double *Ux = &temp[nt]; // Nj*K3*nrbf3
+    double *Uy = &temp[nt + n3]; // Nj*K3*nrbf3
+    double *Uz = &temp[nt + 2*n3]; // Nj*K3*nrbf3
+    double *sumU = &temp[nt + 3*n3]; // K3*nrbf3*nelements
+
+    double *abf = &temp[nt + 3*n3 + n4]; // Nj*K3
+    double *abfx = &temp[nt + 3*n3 + n4 + n5]; // Nj*K3
+    double *abfy = &temp[nt + 3*n3 + n4 + 2*n5]; // Nj*K3
+    double *abfz = &temp[nt + 3*n3 + n4 + 3*n5]; // Nj*K3
+    double *tm = &temp[nt + 3*n3 + n4 + 4*n5]; // 4*K3
 
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
 
@@ -1087,13 +1091,28 @@ double EAPOD::peratom_environment_descriptors(double *cb, double *bd, double *tm
   return ei;
 }
 
-void EAPOD::twobody_forces(double *fij, double *cb2, double *drbf, double *rij, int *tj, int Nj)
+void EAPOD::twobody_forces_bspline(double *fij, double *cb2, double *drbf2, double *rij, int *base,
+                                   int *tj, int Nj)
+{
+  for (int n = 0; n < Nj; ++n) {
+    const double *c = &cb2[base[n] + nrbf2*tj[n]];
+    double fr = 0.0;
+    for (int s = 0; s < 4; ++s)
+      fr += c[s]*drbf2[n + Nj*s];
+    const int i1 = 3*n;
+    fij[i1] += fr * rij[0 + i1];
+    fij[i1+1] += fr * rij[1 + i1];
+    fij[i1+2] += fr * rij[2 + i1];
+  }
+}
+
+void EAPOD::twobody_forces(double *fij, double *cb2, double *drbf2, double *rij, int *tj, int Nj)
 {
   for (int n = 0; n < Nj; ++n) {
     const double *c = &cb2[nrbf2*tj[n]];
     double fr = 0.0;
     for (int m = 0; m < nrbf2; ++m)
-      fr += c[m]*drbf[n + Nj*m];
+      fr += c[m]*drbf2[n + Nj*m];
     const int i1 = 3*n;
     fij[i1] += fr * rij[0 + i1];
     fij[i1+1] += fr * rij[1 + i1];
@@ -1105,14 +1124,14 @@ void EAPOD::threebody_forcecoeff(double *fb3, double *cb3, double *sumU)
 {
   if (nelements == 1) {
     for (int m = 0; m < nrbf3; ++m) {
+      const int idxU = K3 * m;
       for (int a = 0; a < nabf3_active; a++) {
-        int p  = p3_active[a];
+        int p = p3_active[a];
         double c3 = 2.0 * cb3[a + nabf3_active * m];
 
         int n1 = pn3[p];
         int n2 = pn3[p + 1];
-        int nn = n2 - n1;
-        int idxU = K3 * m;
+        int nn = n2 - n1;        
 
         for (int q = 0; q < nn; q++) {
           int k = n1 + q;
@@ -1121,7 +1140,7 @@ void EAPOD::threebody_forcecoeff(double *fb3, double *cb3, double *sumU)
       }
     }
   } else {
-    int N3 = nabf3_active * nrbf3;
+    int NAR3 = nabf3_active * nrbf3;
     for (int m = 0; m < nrbf3; ++m) {
       for (int a = 0; a < nabf3_active; ++a) {
         const int p   = p3_active[a];
@@ -1130,18 +1149,19 @@ void EAPOD::threebody_forcecoeff(double *fb3, double *cb3, double *sumU)
         const int jmp = a + nabf3_active * m;
       
         for (int k = n1; k < n2; ++k) {
-          const double pk = pc3[k];
+          const int pk = pc3[k];
           const int idxU  = nelements * (k + K3 * m);
         
-          int em = 0;
+          int em = jmp;
           for (int i1 = 0; i1 < nelements; ++i1) {
             const double u1 = sumU[idxU + i1];
-            for (int i2 = i1; i2 < nelements; ++i2, ++em) {
-              const double w  = pk * cb3[jmp + N3 * em];
+            for (int i2 = i1; i2 < nelements; ++i2) {
+              const double w  = pk * cb3[em];
               const double u2 = sumU[idxU + i2];
             
               fb3[idxU + i2] += w * u1;
               fb3[idxU + i1] += w * u2;
+              em += NAR3;
             }
           }
         }
@@ -1164,7 +1184,7 @@ void EAPOD::fourbody_forcecoeff(double *fb4, double *cb4, double *sumU)
 
         for (int q = 0; q < nn; q++) {
           int iq = n1 + q;
-          int c  = pc4[iq];
+          double cc4 = c4 * pc4[iq];
           int j1 = idxU + pb4[iq];
           int j2 = idxU + pb4[iq + Q4];
           int j3 = idxU + pb4[iq + 2 * Q4];
@@ -1173,14 +1193,14 @@ void EAPOD::fourbody_forcecoeff(double *fb4, double *cb4, double *sumU)
           double c2 = sumU[j2];
           double c3 = sumU[j3];
 
-          fb4[j3] += c4 * c * c1 * c2;
-          fb4[j2] += c4 * c * c1 * c3;
-          fb4[j1] += c4 * c * c2 * c3;
+          fb4[j3] += cc4 * c1 * c2;
+          fb4[j2] += cc4 * c1 * c3;
+          fb4[j1] += cc4 * c2 * c3;
         }
       }
     }
   } else {
-    int N3 = nabf4_active * nrbf4;
+    const int NAR4 = nabf4_active * nrbf4;
     for (int m = 0; m < nrbf4; ++m) {
       for (int a = 0; a < nabf4_active; a++) {
         int p  = p4_active[a];
@@ -1200,18 +1220,18 @@ void EAPOD::fourbody_forcecoeff(double *fb4, double *cb4, double *sumU)
           int idx2 = nelements * j2 + nelements * K3 * m;
           int idx3 = nelements * j3 + nelements * K3 * m;
 
-          int k = 0;
+          int k = jpm;
           for (int i1 = 0; i1 < nelements; i1++) {
             double c1 = sumU[idx1 + i1];
             for (int i2 = i1; i2 < nelements; i2++) {
               double c2 = sumU[idx2 + i2];
               for (int i3 = i2; i3 < nelements; i3++) {
                 double c3 = sumU[idx3 + i3];
-                double c4 = c * cb4[jpm + N3 * k];
+                double c4 = c * cb4[k];
                 fb4[idx3 + i3] += c4 * (c1 * c2);
                 fb4[idx2 + i2] += c4 * (c1 * c3);
                 fb4[idx1 + i1] += c4 * (c2 * c3);
-                k += 1;
+                k += NAR4;
               }
             }
           }
@@ -1261,6 +1281,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   if (Nj==0) return coeff[nCoeffPerElement*ti[0]];
 
   memset(fij, 0, 3*Nj * sizeof(*fij));
+  memset(bd, 0, Mdesc * sizeof(*bd));
 
   double *d2  = &bd[0]; // nl2
   double *d3  = &bd[nl2]; // nl3
@@ -1269,29 +1290,41 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   double *d34 = &bd[nl2 + nl3 + nl4 + nl33]; // nl34
   double *d44 = &bd[nl2 + nl3 + nl4 + nl33 + nl34]; // nl44
 
-  int n2 = Nj*nrbf2;
-  int n4 = Nj*K3;
+  // radial basis for the many-body (>= 3-body) descriptors
+  int n1 = Nj*nrbfmax;
+  int nt = 2*n1;
+  double *rbf = &temp[0];    // Nj*nrbfmax
+  double *drbf = &temp[n1];  // Nj*nrbfmax
 
-  double *rbf = &temp[0]; // Nj*nrbf2
-  double *drbf = &temp[n2]; // Nj*nrbf2
+  // B-splines two-body radial basis: 4 nonzero splines per neighbor (compact)
+  double *rbf2 = rbf;
+  double *drbf2 = drbf;
+  if (use_bspline) {
+    rbf2 = &temp[nt];          // 4*Nj
+    drbf2 = &temp[nt + 4*Nj];  // 4*Nj
+    nt += 8*Nj;
+    radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nj);
+  }
 
-  if (use_spline) {
-    radialbasis_spline(rbf, drbf, rij, ti, tj, Nj);
+  if (use_hermite) {
+    radialbasis_hermite(rbf, drbf, rij, ti, tj, Nj);
   } else {
-    int n3 = Nj*ns;
-    double *rbft = &temp[2*n2]; // Nj*ns
-    double *drbft = &temp[2*n2 + n3]; // Nj*ns
+    int n2 = Nj*ns;
+    double *rbft = &temp[nt];        // Nj*ns
+    double *drbft = &temp[nt + n2];  // Nj*ns
     radialbasis(rbft, drbft, rij, rin, invrdiff, ti, tj, besseldegree, inversedegree, nbesselpars, Nj);
     radialPhi(rbf, drbf, rbft, drbft, ti, tj, Nj);
   }
 
-  twobodydesc(d2, rbf, tj, Nj, nelements);
+  if (use_bspline) twobodydesc_bspline(d2, rbf2, bs_base, tj, Nj);
+  else             twobodydesc(d2, rbf2, tj, Nj, nelements);
 
-  double *abf = &temp[2*n2]; // Nj*K3
-  double *abfx = &temp[2*n2 + n4]; // Nj*K3
-  double *abfy = &temp[2*n2 + 2*n4]; // Nj*K3
-  double *abfz = &temp[2*n2 + 3*n4]; // Nj*K3
-  double *tm = &temp[2*n2 + 4*n4]; // 4*K3
+  int n3 = Nj*K3;
+  double *abf = &temp[nt]; // Nj*K3
+  double *abfx = &temp[nt + n3]; // Nj*K3
+  double *abfy = &temp[nt + 2*n3]; // Nj*K3
+  double *abfz = &temp[nt + 3*n3]; // Nj*K3
+  double *tm = &temp[nt + 4*n3]; // 4*K3
 
   if ((nl3 > 0) && (Nj>1)) {
     angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
@@ -1327,7 +1360,8 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   if ((nl34>0) && (Nj>4)) crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34);
   if ((nl44>0) && (Nj>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44);
 
-  twobody_forces(fij, cb2, drbf, rij, tj, Nj);
+  if (use_bspline) twobody_forces_bspline(fij, cb2, drbf2, rij, bs_base, tj, Nj);
+  else             twobody_forces(fij, cb2, drbf2, rij, tj, Nj);
   
   if ((nl3 > 0) && (Nj>1)) {
     // Initialize forcecoeff to zero
@@ -1879,13 +1913,13 @@ void EAPOD::threebodydescderiv(double *dd3, double *sumU, double *Ux, double *Uy
   }
 }
 
-void EAPOD::twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne)
+void EAPOD::twobodydesc(double *d2, double *rbf2, int *tj, int N, int Ne)
 {
   if (Ne == 1) {
     for (int m = 0, mN = 0; m < nrbf2; ++m, mN += N) {
       double sum = 0.0;
       for (int n = 0, i2 = mN; n < N; ++n, ++i2)
-        sum += rbf[i2];
+        sum += rbf2[i2];
       d2[m] = sum;
     }
   } else {
@@ -1894,12 +1928,12 @@ void EAPOD::twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne)
       int d2idx = nrbf2 * tj[n];
       int i2 = n;
       for (int m = 0; m < nrbf2; ++m, ++d2idx, i2 += N)
-        d2[d2idx] += rbf[i2];
+        d2[d2idx] += rbf2[i2];
     }
   }
 }
 
-void EAPOD::twobodydescderiv(double *d2, double *dd2, double *rbf, double *drbf, double *rij, int *tj, int N)
+void EAPOD::twobodydescderiv(double *d2, double *dd2, double *rbf2, double *drbf2, double *rij, int *tj, int N)
 {
   memset(d2, 0, nl2 * sizeof(*d2));
   memset(dd2, 0, 3*N*nl2 * sizeof(*dd2));
@@ -1909,11 +1943,46 @@ void EAPOD::twobodydescderiv(double *d2, double *dd2, double *rbf, double *drbf,
     for (int n=0; n<N; n++) {
       int i2 = n + N*m;
       int i1 = n + N*m + N*nrbf2*tj[n];
-      double drbfi2 = drbf[i2];
-      d2[m + nrbf2*tj[n]] += rbf[i2];
+      double drbfi2 = drbf2[i2];
+      d2[m + nrbf2*tj[n]] += rbf2[i2];
       dd2[0 + 3*i1] += drbfi2 * rij[0 + 3*n];
       dd2[1 + 3*i1] += drbfi2 * rij[1 + 3*n];
       dd2[2 + 3*i1] += drbfi2 * rij[2 + 3*n];
+    }
+  }
+}
+
+void EAPOD::twobodydesc_bspline(double *d2, double *rbf2, int *base, int *tj, int N)
+{
+  memset(d2, 0, nl2 * sizeof(*d2));
+
+  for (int n = 0; n < N; ++n) {
+    const int d2idx = base[n] + nrbf2*tj[n];
+    for (int s = 0; s < 4; ++s)
+      d2[d2idx + s] += rbf2[n + N*s];
+  }
+}
+
+void EAPOD::twobodydescderiv_bspline(double *d2, double *dd2, double *rbf2, double *drbf2, double *rij,
+                                     int *base, int *tj, int N)
+{
+  memset(d2, 0, nl2 * sizeof(*d2));
+  memset(dd2, 0, 3*N*nl2 * sizeof(*dd2));
+
+  for (int n = 0; n < N; ++n) {
+    const int m0 = base[n];
+    const double xij = rij[0 + 3*n];
+    const double yij = rij[1 + 3*n];
+    const double zij = rij[2 + 3*n];
+    for (int s = 0; s < 4; ++s) {
+      const int m = m0 + s;
+      const int i2 = n + N*s;
+      const int i1 = n + N*m + N*nrbf2*tj[n];
+      const double drbfi2 = drbf2[i2];
+      d2[m + nrbf2*tj[n]] += rbf2[i2];
+      dd2[0 + 3*i1] += drbfi2 * xij;
+      dd2[1 + 3*i1] += drbfi2 * yij;
+      dd2[2 + 3*i1] += drbfi2 * zij;
     }
   }
 }
@@ -2050,7 +2119,7 @@ void EAPOD::radialbasis(double *rbf, double *drbf, double *rij, double **rin, do
         double drbfdr = bg1 * isinax + Kf1dx * cosax;
 
         rbf [nij] = bf1 * isinax;
-        drbf[nij] = drbfdr * invdij;
+        drbf[nij] = drbfdr * invdij; // R'/r
         ix += xpi;
         nij += N;
       }
@@ -2065,7 +2134,7 @@ void EAPOD::radialbasis(double *rbf, double *drbf, double *rij, double **rin, do
       dterm -= fcut_invd;
       inva  *= invdij;
       rbf [nij] = fcut * inva;
-      drbf[nij] = dterm * inva * invdij;
+      drbf[nij] = dterm * inva * invdij;  // R'/r
       nij += N;
     }
   }
@@ -2081,9 +2150,8 @@ void EAPOD::radialPhi(double *rbf, double *drbf,
   const int ns2 = ns*ns;
   const int itypene = ti[0]*nelements;
   for (int n=0; n<N; n++) {
-    int jtype = tj[n];
-    int nsij = (jtype + itypene)*ns2;
-    for (int k=0; k<nrbf2; k++) {
+    int nsij = (tj[n] + itypene)*ns2;
+    for (int k=0; k<nrbfmax; k++) {
       double sum_rbf = 0.0;
       double sum_drbf = 0.0;
 
@@ -2100,6 +2168,89 @@ void EAPOD::radialPhi(double *rbf, double *drbf,
   }
 }
 
+void EAPOD::init_bspline_radialbasis()
+{
+  const int ne = nelements;
+  bs_ileft = bs_left_open ? 0 : 3;
+  bs_nb = nrbf2 + bs_ileft;
+
+  memory->create(bs_r0,   ne*ne, "bs_r0");
+  memory->create(bs_invh, ne*ne, "bs_invh");
+  for (int it = 0; it < ne; ++it)
+    for (int jt = 0; jt < ne; ++jt) {
+      const int p = it*ne + jt;
+      bs_r0[p]   = rin[it][jt];
+      bs_invh[p] = ((double) bs_nb) * invrdiff[it][jt];
+    }
+}
+
+inline void EAPOD::bspline4(double t, double dscale, double *B, double *dB)
+{
+  constexpr double S = 1.0/6.0;
+  const double t2 = t*t;
+  const double a = 1.0 - t;
+  const double a2 = a*a;
+  const double t3 = 3.0*t;
+  const double hd = 0.5*dscale;
+
+  B[0] = S*a2*a;
+  B[1] = 4.0*S + 0.5*t2*(t - 2.0);
+  B[2] = S + 0.5*t*(1.0 + t*a);
+  B[3] = S*t2*t;
+
+  dB[0] = -a2*hd;
+  dB[1] = t*(t3 - 4.0)*hd;
+  dB[2] = (1.0 + t*(2.0 - t3))*hd;
+  dB[3] = t2*hd;
+}
+
+void EAPOD::radialbasis_bspline(double *rbf2, double *drbf2, double *rij,
+                                int *base, int *ti, int *tj, int N)
+{
+  const int nbm1 = bs_nb - 1;  // largest admissible bin index
+  const int gmax = nrbf2 - 4;  // largest admissible base index
+
+  // rows of the per-pair grid parameters for the (fixed) type of atom i
+  const double *r0row = &bs_r0[ti[0]*nelements];
+  const double *invhrow = &bs_invh[ti[0]*nelements];
+
+  // zero padding on both sides absorbs the out-of-range slots at the grid ends
+  double Bpad[10] = {0.0}, dBpad[10] = {0.0};
+  double *const B = &Bpad[3];
+  double *const dB = &dBpad[3];
+
+  for (int n = 0; n < N; ++n) {
+    const int jt = tj[n];
+    const double x = rij[3*n], y = rij[3*n+1], z = rij[3*n+2];
+    const double dij = sqrt(x*x + y*y + z*z);
+    const double invh = invhrow[jt];
+
+    double tg = (dij - r0row[jt])*invh;
+
+    // for r <= r_in the basis is extended as a constant, so forces vanish
+    // fold that into the derivative scale instead of zeroing dB afterwards
+    const bool   inside = (tg >= 0.0);
+    const double dscale = inside ? invh/dij : 0.0;
+    if (!inside) tg = 0.0;
+
+    int b = (int) tg;
+    if (b > nbm1) b = nbm1;
+    bspline4(tg - (double) b, dscale, B, dB);
+
+    const int g0 = b - bs_ileft;
+    int gb = g0;
+    if (gb < 0) gb = 0;
+    else if (gb > gmax) gb = gmax;
+    base[n] = gb;
+
+    const int sh = gb - g0;         // 0 in the interior
+    for (int s = 0; s < 4; ++s) {
+      rbf2 [n + N*s] = B[sh + s];
+      drbf2[n + N*s] = dB[sh + s];  // R'(r)/r
+    }
+  }
+}
+
 /* ----------------------------------------------------------------------
    Precompute C2 cubic-spline tables of the (Phi-orthogonalized)
    radial basis f_k(r) for every element pair.
@@ -2109,18 +2260,18 @@ void EAPOD::radialPhi(double *rbf, double *drbf,
      - enforces endpoint slopes from analytic df/dr (drbf)
      - is C2 across all interior knots
 ------------------------------------------------------------------------- */
-void EAPOD::init_spline_radialbasis()
+void EAPOD::init_hermite_radialbasis()
 {
-  if (nspline_grid < 4) nspline_grid = 4;
+  if (nhermite_grid < 4) nhermite_grid = 4;
 
   const int ne = nelements;
-  const int Ng = nspline_grid;   // nodes
+  const int Ng = nhermite_grid;   // nodes
   const int nb = Ng - 1;         // bins
-  nspline_bins = nb;
+  nhermite_bins = nb;
 
-  memory->create(spline_r0,    ne*ne,                  "spline_r0");
-  memory->create(spline_invdr, ne*ne,                  "spline_invdr");
-  memory->create(rbf_spline_coeffs, ne*ne*nb*nrbf2*4, "rbf_spline_coeffs");
+  memory->create(hermite_r0,    ne*ne,                   "hermite_r0");
+  memory->create(hermite_invdr, ne*ne,                   "hermite_invdr");
+  memory->create(rbf_hermite_coeffs, ne*ne*nb*nrbfmax*4, "rbf_hermite_coeffs");
 
   // scratch buffers for basis sampling
   double *rij, *rbft, *drbft;
@@ -2129,8 +2280,8 @@ void EAPOD::init_spline_radialbasis()
   memory->create(rij,   3*Ng,       "spl:rij");
   memory->create(rbft,  Ng*ns,      "spl:rbft");
   memory->create(drbft, Ng*ns,      "spl:drbft");
-  memory->create(rbf,   Ng*nrbf2, "spl:rbf");
-  memory->create(drbf,  Ng*nrbf2, "spl:drbf");
+  memory->create(rbf,   Ng*nrbfmax, "spl:rbf");
+  memory->create(drbf,  Ng*nrbfmax, "spl:drbf");
   memory->create(tit,   1,          "spl:tit");
   memory->create(tjt,   Ng,         "spl:tjt");
 
@@ -2154,8 +2305,8 @@ void EAPOD::init_spline_radialbasis()
       const double invdr = 1.0 / dr;
       const double dr2   = dr * dr;
 
-      spline_r0[pair]    = r0;
-      spline_invdr[pair] = invdr;
+      hermite_r0[pair]    = r0;
+      hermite_invdr[pair] = invdr;
 
       tit[0] = it;
       for (int i = 0; i < Ng; ++i) {
@@ -2172,7 +2323,7 @@ void EAPOD::init_spline_radialbasis()
       radialPhi(rbf, drbf, rbft, drbft, tit, tjt, Ng);
 
       // Build one clamped C2 cubic spline per basis channel k
-      for (int k = 0; k < nrbf2; ++k) {
+      for (int k = 0; k < nrbfmax; ++k) {
         // y[i] = f(r_i)
         for (int i = 0; i < Ng; ++i) y[i] = rbf[i + Ng*k];
 
@@ -2212,7 +2363,7 @@ void EAPOD::init_spline_radialbasis()
           const double Mi = M[bin];
           const double Mj = M[bin + 1];
 
-          double *c = &rbf_spline_coeffs[((pair*nb + bin)*nrbf2 + k)*4];
+          double *c = &rbf_hermite_coeffs[((pair*nb + bin)*nrbfmax + k)*4];
           c[0] = f0;
           c[1] = (f1 - f0) - (dr2/6.0) * (2.0*Mi + Mj);
           c[2] = 0.5 * dr2 * Mi;
@@ -2232,10 +2383,10 @@ void EAPOD::init_spline_radialbasis()
   memory->destroy(du);  memory->destroy(rhs);
 }
 
-void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N)
+void EAPOD::radialbasis_hermite(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N)
 {
-  const int nb = nspline_bins;
-  const int ncs = 4*nrbf2;
+  const int nb = nhermite_bins;
+  const int ncs = 4*nrbfmax;
   const int itypene = ti[0]*nelements;
 
   for (int n = 0; n < N; ++n) {
@@ -2246,8 +2397,8 @@ void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, 
     double z = rij[3*n+2];
     double dij = sqrt(x*x + y*y + z*z);
 
-    double r0    = spline_r0[pair];
-    double invdr = spline_invdr[pair];
+    double r0    = hermite_r0[pair];
+    double invdr = hermite_invdr[pair];
     double invdrdij = invdr/dij;
 
     double tg = (dij - r0)*invdr;     // global "bin coordinate"
@@ -2256,9 +2407,9 @@ void EAPOD::radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, 
     else if (b > nb-1) b = nb-1;
     double t = tg - (double) b;       // local coordinate in [0,1] (clamped ends extrapolate)
 
-    const double *cbase = &rbf_spline_coeffs[(pair*nb + b)*ncs];
+    const double *cbase = &rbf_hermite_coeffs[(pair*nb + b)*ncs];
 
-    for (int k = 0; k < nrbf2; ++k) {
+    for (int k = 0; k < nrbfmax; ++k) {
       const double *c = cbase + 4*k;
       double c0 = c[0], c1 = c[1], c2 = c[2], c3 = c[3];
 
@@ -2864,14 +3015,16 @@ int EAPOD::estimate_temp_memory(int Nj)
   // sumU and cU
   int nmax3 = 2*nelements*K3*nrbf3;
 
-  // rbf, drbf
-  int nmax4 = 2*Nj*nrbf2;
+  // rbf, drbf for the many-body descriptors
+  // plus 4 B-spline slots for each
+  int nmax4 = 2*Nj*nrbfmax;
+  if (use_bspline) nmax4 += 8*Nj;
 
   // rbft, drbft
   int nmax5 = 2*Nj*ns;
 
-  // abf, abfx, abfy, abfz
-  int nmax6 = 4*(Nj+1)*K3;
+  // abf, abfx, abfy, abfz, tm
+  int nmax6 = 4*Nj*K3 + 4*K3;
 
   // Determine the total amount of memory needed for all double memory
   ndblmem = nmax1 + nmax2 + nmax3 + nmax4 + MAX(nmax5, nmax6);
@@ -2901,6 +3054,7 @@ void EAPOD::allocate_temp_memory(int Nj)
   memory->create(bdd, 3*Nj*Mdesc, "bdd");
   memory->create(pd, nClusters, "pd");
   memory->create(pdd, 3*Nj*nClusters, "pdd");
+  if (use_bspline) memory->create(bs_base, Nj, "bs_base");
 }
 
 void EAPOD::free_temp_memory()
@@ -2911,6 +3065,7 @@ void EAPOD::free_temp_memory()
   memory->destroy(bdd);
   memory->destroy(pd);
   memory->destroy(pdd);
+  memory->destroy(bs_base);
 }
 
 /**
@@ -2921,9 +3076,10 @@ void EAPOD::free_temp_memory()
  */
 int EAPOD::estimate_temp_memory_md(int Nj)
 {
-  int n2 = 2*Nj*nrbf2;    // rbf, drbf
-  int n3 = 2*Nj*ns;       // rbft, drbft
-  int n4 = 4*Nj*K3+4*K3;  // abf, abfx, abfy, abfz, tm
+  int n2 = 2*Nj*nrbfmax;        // rbf, drbf for the many-body descriptors
+  if (use_bspline) n2 += 8*Nj;  // plus 4 B-spline slots for each
+  int n3 = 2*Nj*ns;             // rbft, drbft
+  int n4 = 4*Nj*K3+4*K3;        // abf, abfx, abfy, abfz, tm  
 
   int ntemp = n2 + MAX(n3, n4);
 
@@ -2944,6 +3100,11 @@ void EAPOD::grow_rij(int Nj)
   memory->destroy(tmpint);
   memory->create(tmpmem, ndblmem, "tmpmem");
   memory->create(tmpint, nintmem, "tmpint");
+
+  if (use_bspline) {
+    memory->destroy(bs_base);
+    memory->create(bs_base, Nj, "bs_base");
+  }
 }
 
 void EAPOD::allocate_desc_memory()

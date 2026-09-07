@@ -104,8 +104,9 @@ class PairPODKokkos : public PairPOD {
   int besseldegree; // degree of Bessel functions
   int inversedegree; // degree of inverse functions
   int nbesselpars;  // number of Bessel parameters
-  int nCoeffPerElement; // number of coefficients per element = (nl1 + Mdesc*nClusters)
-  int ns;      // number of snapshots for radial basis functions
+  int nCoeffPerElement; // number of coefficients per element (nl1 + Mdesc*nClusters)
+  int ns;               // number of snapshots for Bessel radial basis functions
+  int nrbfmax;          // number of orthogonal radial basis functions to keep (<=ns)
   int nl1, nl2, nl3, nl4, nl33, nl34, nl44, nl;   // number of local descriptors
   int nrbf2, nrbf3, nrbf4;            // number of radial basis functions
   int nabf3, nabf4;                            // number of angular basis functions
@@ -128,9 +129,15 @@ class PairPODKokkos : public PairPOD {
   int hat_q1;   // order of hat function
   int h_pq;    // hat_p * hat_q
 
-  bool use_spline;
-  int nspline_bins;
-  t_pod_1d spline_r0, spline_invdr, rbf_spline_coeffs;
+  bool use_hermite;
+  int nhermite_bins;
+  t_pod_1d hermite_r0, hermite_invdr, rbf_hermite_coeffs;
+
+  bool use_bspline;         // flag for two-body cubic B-splines RBF
+  int bs_ileft;             // 0 if left open (knots=nrbf2), +3 if clamped both ends (knots=nrbf2+3)
+  int bs_nb;                // knots + bs_ileft intervals
+  t_pod_1d bs_r0, bs_invh;  // grid origin (rin), and knot spacing per pair
+  t_pod_1i bs_base;         // index of the first active B-splines per neighbor
 
   t_pod_2d rin;  // inner cut-off radius
   t_pod_2d rcut; // outer cut-off radius
@@ -153,8 +160,10 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d bessel_pi_inv_t1;
   t_pod_1d bessel_dx_factor;
   t_pod_1d Phi;  // eigenvectors matrix ns x ns
-  t_pod_1d rbf;  // radial basis functions nij x nrbfmax
-  t_pod_1d drbf; // x-derivatives of radial basis functions nij x nrbfmax
+  t_pod_1d rbf;   // many-body radial basis functions   nij x nrbfmax
+  t_pod_1d drbf;  // dR/dr / r of the above             nij x nrbfmax
+  t_pod_1d rbf2;  // two-body radial basis: alias of rbf, or 4 B-spline
+  t_pod_1d drbf2; // dR/dr / r of the above
   t_pod_1d abf;  // angular basis functions nij x K3
   t_pod_1d abfx; // x-derivatives of angular basis functions nij x K3
   t_pod_1d abfy; // y-derivatives of angular basis functions nij x K3
@@ -192,6 +201,15 @@ class PairPODKokkos : public PairPOD {
   KOKKOS_INLINE_FUNCTION
   static void cluster_cutoff_hat(const KK_FLOAT, const KK_FLOAT, KK_FLOAT &, KK_FLOAT &);
 
+  KOKKOS_INLINE_FUNCTION
+  static void bspline4(const KK_FLOAT t, const KK_FLOAT dscale,
+                       KK_FLOAT &B0,  KK_FLOAT &B1,  KK_FLOAT &B2,  KK_FLOAT &B3,
+                       KK_FLOAT &dB0, KK_FLOAT &dB1, KK_FLOAT &dB2, KK_FLOAT &dB3);
+
+  KOKKOS_INLINE_FUNCTION
+  static KK_FLOAT sel4(const int i, const KK_FLOAT v0, const KK_FLOAT v1,
+                                    const KK_FLOAT v2, const KK_FLOAT v3);
+
   void set_array_to_zero(t_pod_1d a, int N);
 
   int NeighborCount(t_pod_1i, int, int);
@@ -206,9 +224,21 @@ class PairPODKokkos : public PairPOD {
     t_pod_1i l_ti, t_pod_1i l_tj,
     int l_nelements, int l_besseldegree, int l_inversedegree, int l_nbesselpars, int Nij);
 
-  void matrixMultiply(t_pod_1d a, t_pod_1d b, t_pod_1d c, int r1, int c1, int c2);
+  void radialPhi(t_pod_1d rbft, t_pod_1d drbft, t_pod_1d Phi,
+                 t_pod_1d rbf, t_pod_1d drbf, int Nij, int ns, int nrbfmax);
 
-  void radialbasis_spline(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rij, t_pod_1i ti, t_pod_1i tj, int N);
+  void radialbasis_hermite(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rij, t_pod_1i ti, t_pod_1i tj, int N);
+
+  void radialbasis_bspline(t_pod_1d l_rbf2, t_pod_1d l_drbf2, t_pod_1d l_rij,
+                           t_pod_1i l_base, t_pod_1i ti, t_pod_1i tj, int N);
+
+  void twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_1i l_base,
+                           t_pod_1i l_idxi, t_pod_1i l_tj,
+                           int l_nrbf2, const int Ni, const int Nij);
+
+  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rij,
+                              t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj,
+                              int l_nrbf2, const int Ni, const int Nij);
 
   void angularbasis(t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
         t_pod_1d l_rij, t_pod_1i l_pq_m, t_pod_1i l_pq_d, int K3, int N);
@@ -216,7 +246,7 @@ class PairPODKokkos : public PairPOD {
   void radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf, t_pod_1d l_abf, t_pod_1i l_tj,
     t_pod_1i l_numij, const int l_nelements, const int l_nrbf3, const int l_K3, const int Ni, const int Nij);
 
-  void twobodydesc(t_pod_1d d2, t_pod_1d l_rbf, t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
+  void twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebodydesc(t_pod_1d d3, t_pod_1d l_sumU, t_pod_1i l_pc3, t_pod_1i l_pn3, t_pod_1i p3_active,
         int l_nelements, int l_nrbf3, int l_nabf3_active, int l_K3, const int Ni);
@@ -233,7 +263,7 @@ class PairPODKokkos : public PairPOD {
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
-  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf, t_pod_1d l_rij,
+  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rij,
           t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3, t_pod_1d l_sumU, t_pod_1i l_pc3,

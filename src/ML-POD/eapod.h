@@ -61,15 +61,19 @@ class EAPOD : protected Pointers {
                    int *pairnumsum, int *atomtype, int *alist, int i);
   
   void init_bessel_const();
+  void init_bspline_radialbasis();
+  void init_hermite_radialbasis();
 
-  void init_spline_radialbasis();
-  void radialbasis_spline(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N);
+  static inline void bspline4(double t, double dscale, double *B, double *dB);
+  void radialbasis_bspline(double *rbf2, double *drbf2, double *rij, int *base, int *ti, int *tj, int N);
+
+  void radialbasis_hermite(double *rbf, double *drbf, double *rij, int *ti, int *tj, int N);
 
   void radialbasis(double *rbf, double *drbf, double *rij, double **rin, double **invrdiff,
                    int *ti, int *tj, int besseldegree, int inversedegree, int nbesselpars, int N);
-  
+
   void radialPhi(double *rbf, double *drbf, double *rbft, double *drbft, int *ti, int *tj, int N);
-  
+
   void angularbasis(double *abf, double *abfx, double *abfy, double *abfz, double *rij, double *tm,
                     int *pq, int N, int K);
 
@@ -115,13 +119,21 @@ class EAPOD : protected Pointers {
   double *Phi;       // eigenvectors
   double *Lambda;    // eigenvalues
   double *coeff;     // coefficients
-  // --- precomputed radial-basis spline (fast inference path) ---
-  bool use_spline;          // enable cubic-Hermite spline evaluation of rbf
-  int  nspline_grid;        // number of spline nodes per element pair
-  int  nspline_bins;        // = nspline_grid - 1
-  double *rbf_spline_coeffs;// [pair][bin][k][4] cubic Hermite coeffs (in local t)
-  double *spline_r0;        // [nelements*nelements] grid start (r) per pair
-  double *spline_invdr;     // [nelements*nelements] 1/bin-width per pair
+  // ---- two-body cubic B-spline radial basis ----
+  bool use_bspline;      // flag for two-body cubic B-splines RBF
+  bool bs_left_open;     // 1: keep the 3 left-truncated functions (nonzero at rin)
+  int  bs_ileft;         // 0 if left open (knots=nrbf2), +3 if clamped both ends (knots=nrbf2+3)
+  int  bs_nb;            // knots + bs_ileft intervals
+  double *bs_r0;         // [ne*ne] grid origin (rin)
+  double *bs_invh;       // [ne*ne] knot spacing
+  int *bs_base;          // [Njmax] index of the first active B-splines per neighbor
+  // --- precomputed Bessel radial basis with cubic Hermite polynomials ---
+  bool use_hermite;           // enable cubic-Hermite spline interpolation of Bessel rbf
+  int  nhermite_grid;         // number of hermite spline nodes per element pair
+  int  nhermite_bins;         // = nhermite_grid - 1
+  double *rbf_hermite_coeffs; // [pair][bin][k][4] cubic Hermite coeffs (in local t)
+  double *hermite_r0;         // [nelements*nelements] grid origin (rin)
+  double *hermite_invdr;      // [nelements*nelements] bin spacing
   //double *newcoeff ;  // coefficients
   double *tmpmem;
 
@@ -167,7 +179,8 @@ class EAPOD : protected Pointers {
   int nCoeffPerElement;    // number of coefficients per element = (nl1 + Mdesc*nClusters)
   int nCoeffAll;    // number of coefficients for all elements = (nl1 + Mdesc*nClusters)*nelements
   int ncoeff;       // number of coefficients in the input file
-  int ns;           // number of snapshots for radial basis functions
+  int ns;           // number of snapshots for Bessel radial basis functions
+  int nrbfmax;      // number of orthogonal radial basis functions to keep (<=ns)
 
   int nd1, nd2, nd3, nd4, nd;    // number of global descriptors
   int nl1, nl2, nl3, nl4, nl;    // number of local descriptors
@@ -211,6 +224,9 @@ class EAPOD : protected Pointers {
   void read_model_coeff_file(const std::string &coeff_file);
   void read_cluster_occupancy_file(const std::string &coeff_file);
 
+  void read_pair_radii(double **&arr, const std::vector<std::string> &words,
+                       int Ne, const char *name);
+
   int estimate_temp_memory(int Nj);
   void free_temp_memory();
   void allocate_temp_memory(int Nj);
@@ -245,9 +261,15 @@ class EAPOD : protected Pointers {
                                           const int nClusters, const int nMaxActiveClusters,
                                           int& ks, int& ke);
 
-  void twobodydesc(double *d2, double *rbf, int *tj, int N, int Ne);
-  void twobodydescderiv(double *d2, double *dd2, double *rbf, double *drbf, double *rij, int *tj, int N);
-  void twobody_forces(double *fij, double *cb2, double *drbf, double *rij, int *tj, int Nj);
+  void twobodydesc(double *d2, double *rbf2, int *tj, int N, int Ne);
+  void twobodydescderiv(double *d2, double *dd2, double *rbf2, double *drbf2, double *rij, int *tj, int N);
+  void twobody_forces(double *fij, double *cb2, double *drbf2, double *rij, int *tj, int Nj);
+
+  void twobodydesc_bspline(double *d2, double *rbf2, int *base, int *tj, int N);
+  void twobodydescderiv_bspline(double *d2, double *dd2, double *rbf2, double *drbf2, double *rij,
+                                int *base, int *tj, int N);
+  void twobody_forces_bspline(double *fij, double *cb2, double *drbf2, double *rij,
+                              int *base, int *tj, int Nj);
 
   void threebodydesc(double *d3, double *sumU, int Ne);
   void threebodydescderiv(double *dd3, double *sumU, double *Ux, double *Uy, double *Uz,
