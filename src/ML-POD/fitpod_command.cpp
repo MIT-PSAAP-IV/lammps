@@ -75,7 +75,7 @@ void FitPOD::datastruct::copydatainfo(datastruct &data) const
   data.precision = precision;
   data.training = training;
   data.normalizeenergy = normalizeenergy;
-  for (int i = 0; i < 17; i++) data.fitting_weights[i] = fitting_weights[i];
+  for (int i = 0; i < 18; i++) data.fitting_weights[i] = fitting_weights[i];
   data.we_map = we_map;
   data.wf_map = wf_map;
 }

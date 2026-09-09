@@ -3354,7 +3354,7 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
     //cluster_cutoff_poly_sq_train(u, fcut, dfcut_du);
 
     // guards for training
-    if (abs(u - 1.0) <= 1e-4) {
+    if (std::abs(u - 1.0) <= 1e-4) {
       fcut = 0.0;
       dfcut_du = 0.0;
     }
