@@ -31,6 +31,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "eapod.h"
 #include "pair_pod_kokkos_hip.h"
@@ -41,6 +42,14 @@ using namespace MathConst;
 static constexpr int GPU_CONCURRENCY_DIV = 1;
 
 enum{FS,FS_SHIFTEDSCALED};
+
+// variants of the native HIP kernels
+enum { HIP_RADIAL = 1,     // fused radial basis and projection
+       HIP_ANGULAR = 2,    // angular basis computed on the fly
+       HIP_MFMA = 4,       // matrix cores for the radial-angular sums
+       HIP_MFMA_FORCE = 8,      // matrix cores for the force coefficient products
+       HIP_DESC = 16,           // fused 3- and 4-body descriptors
+       HIP_TALLY = 32 };        // per-atom reductions in the force tally and 2-body descriptors
 
 /* ---------------------------------------------------------------------- */
 
@@ -71,6 +80,14 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   native_hip = 1;
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
+  hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY;
+  angular_otf = false;
+  env = getenv("LAMMPS_POD_HIP_FLAGS");
+  if (env) hip_flags = atoi(env);
+  hip_jtile = 16;
+  env = getenv("LAMMPS_POD_HIP_JTILE");
+  if (env) hip_jtile = atoi(env);
+  abf_degree = -1;
 }
 
 /* ----------------------------------------------------------------------
@@ -535,6 +552,27 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   auto h_pc3 = Kokkos::create_mirror_view(pc3);
   for (int i = 0; i < K3; i++) h_pc3[i] = podptr->pc3[i];
   Kokkos::deep_copy(pc3, h_pc3);
+
+  // check that the pq3 recursion generates each monomial u^a v^b w^c with
+  // a+b+c <= L exactly once, as assumed by kernels that compute them directly
+
+  abf_degree = 0;
+  while ((abf_degree + 1) * (abf_degree + 2) * (abf_degree + 3) / 6 < K3) abf_degree++;
+  if ((abf_degree + 1) * (abf_degree + 2) * (abf_degree + 3) / 6 != K3) abf_degree = -1;
+  if (abf_degree >= 0) {
+    const int L1 = abf_degree + 1;
+    std::vector<int> ex(3 * K3, 0), seen(L1 * L1 * L1, 0);
+    for (int k = 0; k < K3; k++) {
+      if (k > 0) {
+        const int m = h_pq_m[k], d = h_pq_d[k];
+        if ((m < 0) || (m >= k) || (d < 1) || (d > 3)) { abf_degree = -1; break; }
+        for (int c = 0; c < 3; c++) ex[3 * k + c] = ex[3 * m + c];
+        ex[3 * k + d - 1]++;
+      }
+      const int a = ex[3 * k], b = ex[3 * k + 1], c = ex[3 * k + 2];
+      if ((a + b + c > abf_degree) || seen[(a * L1 + b) * L1 + c]++) { abf_degree = -1; break; }
+    }
+  }
 
   MemKK::realloc_kokkos(p3_active, "p3_active", nabf3_active);
   auto h_p3_active = Kokkos::create_mirror_view(p3_active);
@@ -1204,6 +1242,17 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_1i l_idxi, t_pod_1i l_tj,
         int l_nrbf2, const int Ni, const int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  // d2 is written, not accumulated, by the native kernel; it was zeroed before
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_TALLY) &&
+        PODHIP::twobodydesc<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), d2.data(),
+                                                     l_rbf2.data(), l_tj.data(), numij.data(),
+                                                     nelements, l_nrbf2, Ni, Nij))
+      return;
+  }
+#endif
+
   int totalIterations = l_nrbf2 * Nij;
   Kokkos::parallel_for("twobodydesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
     int n = idx / l_nrbf2;
@@ -1580,11 +1629,25 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     radialbasis_hermite(rbf, drbf, rij, ti, tj, Nij);
   } else {
     // Original analytic path
-    radialbasis(abf, abfx, rij, rin, invrdiff,
-                bessel_neg_alpha, bessel_pi_inv_t1, bessel_dx_factor, ti, tj,
-                nelements, besseldegree, inversedegree, nbesselpars, Nij);
+    bool done = false;
+#ifdef KOKKOS_ENABLE_HIP
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+      if (native_hip && (hip_flags & HIP_RADIAL))
+        done = PODHIP::radialbasis_phi<KK_FLOAT, KK_ACC_FLOAT>(
+            Kokkos::HIP().hip_stream(), rbf.data(), drbf.data(), rij.data(), rin.data(),
+            invrdiff.data(), rin.stride(0), rin.stride(1), invrdiff.stride(0), invrdiff.stride(1),
+            bessel_neg_alpha.data(), bessel_pi_inv_t1.data(), bessel_dx_factor.data(), Phi.data(),
+            ti.data(), tj.data(), nelements, besseldegree, inversedegree, nbesselpars, ns,
+            nrbfmax, Nij);
+    }
+#endif
+    if (!done) {
+      radialbasis(abf, abfx, rij, rin, invrdiff,
+                  bessel_neg_alpha, bessel_pi_inv_t1, bessel_dx_factor, ti, tj,
+                  nelements, besseldegree, inversedegree, nbesselpars, Nij);
 
-    radialPhi(abf, abfx, Phi, rbf, drbf, Nij, ns, nrbfmax);
+      radialPhi(abf, abfx, Phi, rbf, drbf, Nij, ns, nrbfmax);
+    }
   }
 
   if (use_bspline) radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nij);
@@ -1594,15 +1657,42 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   else             twobodydesc(d2, rbf2, idxi, tj, nrbf2, Ni, Nij);
 
   if ((nl3 > 0) && (Nij>1)) {
-    angularbasis(abf, abfx, abfy, abfz, rij, pq_m, pq_d, K3, Nij);
+    // with the native HIP kernels the angular basis can be computed on the fly
+    // by its two users, radialangularsum() and allbody_forces()
+    angular_otf = false;
+#ifdef KOKKOS_ENABLE_HIP
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+      if (native_hip && (hip_flags & HIP_ANGULAR) && (abf_degree >= 0))
+        angular_otf = PODHIP::radialangularsum_otf<KK_FLOAT, KK_ACC_FLOAT>(
+            Kokkos::HIP().hip_stream(), sumU.data(), rbf.data(), rij.data(), tj.data(),
+            numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
+            (hip_flags & HIP_MFMA) != 0, hip_jtile);
+    }
+#endif
+    if (!angular_otf) {
+      angularbasis(abf, abfx, abfy, abfz, rij, pq_m, pq_d, K3, Nij);
 
-    radialangularsum(sumU, rbf, abf, tj, numij, nelements, nrbf3, K3, Ni, Nij);
-
-    threebodydesc(d3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
+      radialangularsum(sumU, rbf, abf, tj, numij, nelements, nrbf3, K3, Ni, Nij);
+    }
   }
 
-  if ((nl4 > 0) && (Nij>2)) {
-    fourbodydesc(d4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
+  bool desc_done = false;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_DESC) && (nl3 > 0) && (Nij > 1))
+      desc_done = PODHIP::desc34<KK_FLOAT, KK_ACC_FLOAT>(
+          Kokkos::HIP().hip_stream(), d3.data(), d4.data(), sumU.data(), pc3.data(), pn3.data(),
+          p3_active.data(), pa4.data(), pb4.data(), pc4.data(), nelements, nrbf3, nabf3_active,
+          nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2));
+  }
+#endif
+
+  if (!desc_done) {
+    if ((nl3 > 0) && (Nij>1))
+      threebodydesc(d3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
+
+    if ((nl4 > 0) && (Nij>2))
+      fourbodydesc(d4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
   }
 
   if ((nl33>0) && (Nij>3)) {
@@ -1980,13 +2070,37 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
         pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
   }
 
-  if ((nl3 > 0) && (Nij>1)) allbody_forces(l_fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz,
+  if ((nl3 > 0) && (Nij>1)) {
+    bool done = false;
+#ifdef KOKKOS_ENABLE_HIP
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+      if (angular_otf)
+        done = PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
+            Kokkos::HIP().hip_stream(), l_fij.data(), forcecoeff.data(), rbf.data(), drbf.data(),
+            rij.data(), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3,
+            K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0);
+      // the angular basis was not stored; compute it now for the portable kernel
+      if (angular_otf && !done) angularbasis(abf, abfx, abfy, abfz, rij, pq_m, pq_d, K3, Nij);
+    }
+#endif
+    if (!done) allbody_forces(l_fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz,
           idxi, tj, nelements, nrbf3, K3, Nij);
+  }
 }
 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::tallyforce(t_pod_1d l_fij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_TALLY) &&
+        PODHIP::tallyforce<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), f.data(),
+                                                    f.stride(0), f.stride(1), l_fij.data(),
+                                                    l_ai.data(), l_aj.data(), numij.data(), ni))
+      return;
+  }
+#endif
+
   auto l_f = f;
   Kokkos::parallel_for("TallyForce", Kokkos::RangePolicy<DeviceType>(0,Nij), KOKKOS_LAMBDA(int n) {
     int im = l_ai(n);

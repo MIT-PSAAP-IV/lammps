@@ -93,6 +93,10 @@ class PairPODKokkos : public PairPOD {
   int atomBlocks[101];      // atom blocks
   int timing;
   int native_hip;          // 1 to use native HIP kernels where available
+  int hip_flags;           // which native HIP kernel variants are used (HIP_* bits)
+  int hip_jtile;           // neighbor tile size of the native HIP radial-angular sum
+  int abf_degree;          // angular degree L of the 3-body monomials, or -1
+  bool angular_otf;        // true if the angular basis of the current block was not stored
 
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block
