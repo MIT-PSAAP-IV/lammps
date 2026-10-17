@@ -41,8 +41,8 @@ static constexpr int MAXLINE=1024;
 
 // constructor
 EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff_file) :
-    Pointers(_lmp), elemindex(nullptr), Phi(nullptr), coeff(nullptr),
-    rin(nullptr), rcut(nullptr), Proj(nullptr), Centroids(nullptr),
+    Pointers(_lmp), elemindex(nullptr), rin(nullptr), rcut(nullptr),
+    besselparams(nullptr), Phi(nullptr), coeff(nullptr), Proj(nullptr), Centroids(nullptr),
     invLeftClusterRcut2(nullptr), invRightClusterRcut2(nullptr),
     leftClusterEdges(nullptr), rightClusterEdges(nullptr),
     invPcaSpan(nullptr), clusterOccupancy(nullptr),
@@ -186,6 +186,10 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   char line[MAXLINE],*ptr;
   int eof = 0;
 
+  // keywords whose size depends on other keywords are applied after the whole file is read
+
+  std::vector<std::string> rin_words, rcut_words, bessel_words;
+
   while (true) {
     if (comm->me == 0) {
       ptr = fgets(line,MAXLINE,fppod);
@@ -225,20 +229,9 @@ void EAPOD::read_pod_file(const std::string &pod_file)
       pbc[2] = utils::inumeric(FLERR,words[3],false,lmp);
     }
 
-    int Ne = nelements;
-    if (keywd == "rin")  read_pair_radii(rin,  words, Ne, "rin");
-    if (keywd == "rcut") read_pair_radii(rcut, words, Ne, "rcut");
-
-    // settings for the base POD potential and descriptors
-    if (keywd == "bessel_parameters") {
-      int wsize = words.size()-1;
-      if ( wsize < nbesselpars )
-        error->one(FLERR,"Improper POD file. Less number of bessel parameters available than requested", utils::getsyserror());
-
-      memory->create(besselparams, nbesselpars, "besselparams");
-      for (int i = 0; i < nbesselpars; i++)
-        besselparams[i] = utils::numeric(FLERR,words[i+1],false,lmp);
-    }
+    if (keywd == "rin") rin_words = words;
+    if (keywd == "rcut") rcut_words = words;
+    if (keywd == "bessel_parameters") bessel_words = words;
 
     if ((keywd != "#") && (keywd != "species") && (keywd != "pbc") &&
         (keywd != "rin") && (keywd != "rcut") && (keywd != "bessel_parameters")) {
@@ -327,6 +320,26 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     nrbfmax = nrbf3;
   }
   int Ne = nelements;
+
+  // default cutoffs and Bessel parameters, as in the previous POD file format
+
+  if (rin_words.empty()) rin_words = {"rin", "0.5"};
+  if (rcut_words.empty()) rcut_words = {"rcut", "5.0"};
+  read_pair_radii(rin,  rin_words, Ne, "rin");
+  read_pair_radii(rcut, rcut_words, Ne, "rcut");
+
+  if (bessel_words.empty()) {
+    if (nbesselpars > 3)
+      error->all(FLERR, "POD file must list bessel_parameters when number_of_bessel_parameters > 3");
+    bessel_words = {"bessel_parameters", "1e-3", "2.0", "4.0"};
+  }
+  if ((int) bessel_words.size() - 1 < nbesselpars)
+    error->all(FLERR, "POD file lists fewer bessel_parameters than number_of_bessel_parameters");
+  memory->destroy(besselparams);
+  memory->create(besselparams, nbesselpars, "besselparams");
+  for (int i = 0; i < nbesselpars; i++)
+    besselparams[i] = utils::numeric(FLERR, bessel_words[i+1], false, lmp);
+
   memory->create(rcutsq,   Ne, Ne, "rcutsq");
   memory->create(invrdiff, Ne, Ne, "invrdiff");
 
