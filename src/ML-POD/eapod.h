@@ -114,7 +114,6 @@ class EAPOD : protected Pointers {
   int inversedegree;
   int nbesselpars;
   int timing;
-  double comptime[20];
   double *besselparams;
   double *Phi;       // eigenvectors
   double *Lambda;    // eigenvalues

@@ -91,7 +91,6 @@ class PairPODKokkos : public PairPOD {
   int atomBlockSize;        // size of each atom block
   int nAtomBlocks;          // number of atoms blocks
   int atomBlocks[101];      // atom blocks
-  double comptime[30];
   int timing;
 
   int ni;            // number of atoms i in the current atom block

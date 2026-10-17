@@ -30,7 +30,6 @@
 #include "neigh_request.h"
 
 #include <cstring>
-#include <chrono>
 
 #include "eapod.h"
 
@@ -63,7 +62,6 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   utils::logmesg(lmp, "Atom Block Size: {:d}\n", atomBlockSize);
   nAtomBlocks = 0;
   timing = 0;
-  for (int i=0; i<30; i++) comptime[i] = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -291,9 +289,6 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     maxneigh = maxneighs;
   }
 
-  auto begin = std::chrono::high_resolution_clock::now();
-  auto end = std::chrono::high_resolution_clock::now();
-
   // determine the number of atom blocks and divide atoms into blocks
   nAtomBlocks = calculateNumberOfIntervals(inum, atomBlockSize);
   if (nAtomBlocks > 100) nAtomBlocks = 100;
@@ -312,28 +307,15 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     int gi2 = atomBlocks[block+1]-1;
     ni = gi2 - gi1; // total number of atoms in the current atom block
 
-    begin = std::chrono::high_resolution_clock::now();
     // calculate the total number of pairs (i,j) in the current atom block
     nij = NeighborCount(numij, gi1, ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[0] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-    begin = std::chrono::high_resolution_clock::now();
     // obtain the neighbors within rcut
     NeighborList(rij, numij, typeai, idxi, ai, aj, ti, tj, gi1, ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[1] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
     // compute atomic energy and force for the current atom block
-    begin = std::chrono::high_resolution_clock::now();
     blockatom_energyforce(ei, fij, ni, nij);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[2] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-    begin = std::chrono::high_resolution_clock::now();
     // tally atomic energy to global energy
     tallyenergy(ei, gi1, ni);
 
@@ -344,9 +326,6 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     if (vflag) {
       tallystress(fij, rij, ai, aj, nij);
     }
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[3] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
   }
 
@@ -1557,8 +1536,6 @@ void PairPODKokkos<DeviceType>::set_array_to_zero(t_pod_1d a, int N)
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, int Nij)
 {
-  auto begin = std::chrono::high_resolution_clock::now();
-  auto end = std::chrono::high_resolution_clock::now();
 
   auto d2 = Kokkos::subview(bd, std::make_pair(0, Ni * nl2));
   auto d3 = Kokkos::subview(bd, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
@@ -1568,89 +1545,45 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   auto d44 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
 
   if (use_hermite) {
-    begin = std::chrono::high_resolution_clock::now();
     // Directly fills final basis rbf/drbf (Phi-orthogonalized)
     radialbasis_hermite(rbf, drbf, rij, ti, tj, Nij);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[11] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   } else {
-    begin = std::chrono::high_resolution_clock::now();
     // Original analytic path
     radialbasis(abf, abfx, rij, rin, invrdiff,
                 bessel_neg_alpha, bessel_pi_inv_t1, bessel_dx_factor, ti, tj,
                 nelements, besseldegree, inversedegree, nbesselpars, Nij);
 
     radialPhi(abf, abfx, Phi, rbf, drbf, Nij, ns, nrbfmax);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[11] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
 
-  begin = std::chrono::high_resolution_clock::now();
   if (use_bspline) radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nij);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[12] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   set_array_to_zero(d2, Ni*nl2);
   if (use_bspline) twobodydesc_bspline(d2, rbf2, bs_base, idxi, tj, nrbf2, Ni, Nij);
   else             twobodydesc(d2, rbf2, idxi, tj, nrbf2, Ni, Nij);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[13] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
   if ((nl3 > 0) && (Nij>1)) {
-    begin = std::chrono::high_resolution_clock::now();
     angularbasis(abf, abfx, abfy, abfz, rij, pq_m, pq_d, K3, Nij);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[14] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-    begin = std::chrono::high_resolution_clock::now();
     radialangularsum(sumU, rbf, abf, tj, numij, nelements, nrbf3, K3, Ni, Nij);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[15] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-    begin = std::chrono::high_resolution_clock::now();
     threebodydesc(d3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[16] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
 
   if ((nl4 > 0) && (Nij>2)) {
-    begin = std::chrono::high_resolution_clock::now();
     fourbodydesc(d4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[17] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
 
   if ((nl33>0) && (Nij>3)) {
-    begin = std::chrono::high_resolution_clock::now();
     crossdesc(d33, d3, d3, ind33l, ind33r, nl33, Ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[18] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
 
   if ((nl34>0) && (Nij>4)) {
-    begin = std::chrono::high_resolution_clock::now();
     crossdesc(d34, d3, d4, ind34l, ind34r, nl34, Ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[19] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
 
   if ((nl44>0) && (Nij>5)) {
-    begin = std::chrono::high_resolution_clock::now();
     crossdesc(d44, d4, d4, ind44l, ind44r, nl44, Ni);
-    Kokkos::fence();
-    end = std::chrono::high_resolution_clock::now();
-    comptime[20] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
   }
 }
 
@@ -1969,25 +1902,14 @@ void PairPODKokkos<DeviceType>::blockatom_environment_descriptors(t_pod_1d ei, t
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij)
 {
-  auto begin = std::chrono::high_resolution_clock::now();
-  auto end = std::chrono::high_resolution_clock::now();
 
   // calculate base descriptors and their derivatives with respect to atom coordinates
-  begin = std::chrono::high_resolution_clock::now();
   blockatom_base_descriptors(bd, Ni, Nij);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[4] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   if (localeapod) blockatom_local_environment_descriptors(l_ei, cb, bd, Ni);
   else if (eapod) blockatom_environment_descriptors(l_ei, cb, bd, Ni);
   else            blockatom_base_coefficients(l_ei, cb, bd, Ni);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[5] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   auto d3 = Kokkos::subview(bd, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
   auto d4 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3), Ni * (nl2 + nl3 + nl4)));
   auto cb2 = Kokkos::subview(cb, std::make_pair(0, Ni * nl2));
@@ -2000,41 +1922,22 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   if ((nl33>0) && (Nij>3)) crossdesc_reduction(cb3, cb3, cb33, d3, d3, ind33l, ind33r, nl33, Ni);
   if ((nl34>0) && (Nij>4)) crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34, Ni);
   if ((nl44>0) && (Nij>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44, Ni);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[6] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   set_array_to_zero(l_fij, 3*Nij);
   if (Nij>0) {
     if (use_bspline) twobody_forces_bspline(l_fij, cb2, drbf2, rij, bs_base, idxi, tj, nrbf2, Ni, Nij);
     else             twobody_forces(l_fij, cb2, drbf2, rij, idxi, tj, nrbf2, Ni, Nij);
   }
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[7] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
   if ((nl3 > 0) && (Nij>1)) threebody_forcecoeff(forcecoeff, cb3, sumU,
           pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[8] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU,
       pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[9] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 
-  begin = std::chrono::high_resolution_clock::now();
   if ((nl3 > 0) && (Nij>1)) allbody_forces(l_fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz,
           idxi, tj, nelements, nrbf3, K3, Nij);
-  Kokkos::fence();
-  end = std::chrono::high_resolution_clock::now();
-  comptime[10] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;
 }
 
 template<class DeviceType>
@@ -2122,7 +2025,6 @@ struct PODGlobalStressFunctor {
   }
 };
 
-
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::tallystress(
     t_pod_1d l_fij, t_pod_1d l_rij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij)
@@ -2173,8 +2075,6 @@ void PairPODKokkos<DeviceType>::tallystress(
       });
   }
 }
-
-
 
 template<class DeviceType>
 int PairPODKokkos<DeviceType>::getStreamingProcessorCount()
