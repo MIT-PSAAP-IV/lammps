@@ -41,8 +41,8 @@ static constexpr int MAXLINE=1024;
 
 // constructor
 EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff_file) :
-    Pointers(_lmp), elemindex(nullptr), Phi(nullptr), coeff(nullptr),
-    rin(nullptr), rcut(nullptr), Proj(nullptr), Centroids(nullptr),
+    Pointers(_lmp), elemindex(nullptr), rin(nullptr), rcut(nullptr),
+    besselparams(nullptr), Phi(nullptr), coeff(nullptr), Proj(nullptr), Centroids(nullptr),
     invLeftClusterRcut2(nullptr), invRightClusterRcut2(nullptr),
     leftClusterEdges(nullptr), rightClusterEdges(nullptr),
     invPcaSpan(nullptr), clusterOccupancy(nullptr),
@@ -104,7 +104,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   use_hermite   = false;
   nhermite_grid = 1000;
   nhermite_bins = nhermite_grid-1;
-  
+
   uncertaintyflag = false;
 
   // read pod input file to podstruct
@@ -186,6 +186,10 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   char line[MAXLINE],*ptr;
   int eof = 0;
 
+  // keywords whose size depends on other keywords are applied after the whole file is read
+
+  std::vector<std::string> rin_words, rcut_words, bessel_words;
+
   while (true) {
     if (comm->me == 0) {
       ptr = fgets(line,MAXLINE,fppod);
@@ -225,27 +229,16 @@ void EAPOD::read_pod_file(const std::string &pod_file)
       pbc[2] = utils::inumeric(FLERR,words[3],false,lmp);
     }
 
-    int Ne = nelements;
-    if (keywd == "rin")  read_pair_radii(rin,  words, Ne, "rin");
-    if (keywd == "rcut") read_pair_radii(rcut, words, Ne, "rcut");
-
-    // settings for the base POD potential and descriptors
-    if (keywd == "bessel_parameters") {
-      int wsize = words.size()-1;
-      if ( wsize < nbesselpars )
-        error->one(FLERR,"Improper POD file. Less number of bessel parameters available than requested", utils::getsyserror());
-      
-      memory->create(besselparams, nbesselpars, "besselparams");
-      for (int i = 0; i < nbesselpars; i++)
-        besselparams[i] = utils::numeric(FLERR,words[i+1],false,lmp);
-    }
+    if (keywd == "rin") rin_words = words;
+    if (keywd == "rcut") rcut_words = words;
+    if (keywd == "bessel_parameters") bessel_words = words;
 
     if ((keywd != "#") && (keywd != "species") && (keywd != "pbc") &&
         (keywd != "rin") && (keywd != "rcut") && (keywd != "bessel_parameters")) {
 
       if (words.size() != 2)
         error->one(FLERR,"Improper POD file.", utils::getsyserror());
-      
+
       if (keywd == "number_of_environment_clusters")
         nClusters = utils::inumeric(FLERR,words[1],false,lmp);
       if (keywd == "number_of_active_clusters")
@@ -327,6 +320,26 @@ void EAPOD::read_pod_file(const std::string &pod_file)
     nrbfmax = nrbf3;
   }
   int Ne = nelements;
+
+  // default cutoffs and Bessel parameters, as in the previous POD file format
+
+  if (rin_words.empty()) rin_words = {"rin", "0.5"};
+  if (rcut_words.empty()) rcut_words = {"rcut", "5.0"};
+  read_pair_radii(rin,  rin_words, Ne, "rin");
+  read_pair_radii(rcut, rcut_words, Ne, "rcut");
+
+  if (bessel_words.empty()) {
+    if (nbesselpars > 3)
+      error->all(FLERR, "POD file must list bessel_parameters when number_of_bessel_parameters > 3");
+    bessel_words = {"bessel_parameters", "1e-3", "2.0", "4.0"};
+  }
+  if ((int) bessel_words.size() - 1 < nbesselpars)
+    error->all(FLERR, "POD file lists fewer bessel_parameters than number_of_bessel_parameters");
+  memory->destroy(besselparams);
+  memory->create(besselparams, nbesselpars, "besselparams");
+  for (int i = 0; i < nbesselpars; i++)
+    besselparams[i] = utils::numeric(FLERR, bessel_words[i+1], false, lmp);
+
   memory->create(rcutsq,   Ne, Ne, "rcutsq");
   memory->create(invrdiff, Ne, Ne, "invrdiff");
 
@@ -486,7 +499,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
 
     utils::logmesg(lmp,"3-body angular range: [{}:{}], active channels: {}\n", L3min,L3max,nabf3_active);
     utils::logmesg(lmp,"4-body angular range: [{}:{}], active channels: {}\n", L4min,L4max,nabf4_active);
-    
+
     utils::logmesg(lmp, "enable radial hermite spline: {}\n", (int)use_hermite);
     if (use_hermite) utils::logmesg(lmp, "radial hermite grid resolution: {}\n", nhermite_grid);
     utils::logmesg(lmp, "enable B-spline two-body radial basis: {}\n", (int)use_bspline);
@@ -795,7 +808,7 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
   int nt = 2*n1;
   double *rbf = &temp[0];    // Nj*nrbfmax
   double *drbf = &temp[n1];  // Nj*nrbfmax
-  
+
   // B-splines two-body radial basis: 4 nonzero splines per neighbor (compact)
   double *rbf2 = rbf;
   double *drbf2 = drbf;
@@ -940,7 +953,7 @@ double EAPOD::peratom_local_environment_descriptors(double *cb, double *bd, doub
   int ncct  = nClusters*itype;
 
   double *proj = &Proj[Mdesc*itype];
-  
+
   double pca = 0.0;
   for (int m = 0; m < Mdesc; m++)
     pca += proj[m] * bd[m];
@@ -980,7 +993,7 @@ double EAPOD::peratom_local_environment_descriptors(double *cb, double *bd, doub
     S         += dfDkdpc;
   }
   sumfDi = 1.0 / sumfDi;
-  
+
   double ei = coeff[nc];
   double *ceffs = &coeff[1 + ks*Mdesc + nc];
   double T  = 0.0;
@@ -1131,7 +1144,7 @@ void EAPOD::threebody_forcecoeff(double *fb3, double *cb3, double *sumU)
 
         int n1 = pn3[p];
         int n2 = pn3[p + 1];
-        int nn = n2 - n1;        
+        int nn = n2 - n1;
 
         for (int q = 0; q < nn; q++) {
           int k = n1 + q;
@@ -1147,18 +1160,18 @@ void EAPOD::threebody_forcecoeff(double *fb3, double *cb3, double *sumU)
         const int n1  = pn3[p];
         const int n2  = pn3[p + 1];
         const int jmp = a + nabf3_active * m;
-      
+
         for (int k = n1; k < n2; ++k) {
           const int pk = pc3[k];
           const int idxU  = nelements * (k + K3 * m);
-        
+
           int em = jmp;
           for (int i1 = 0; i1 < nelements; ++i1) {
             const double u1 = sumU[idxU + i1];
             for (int i2 = i1; i2 < nelements; ++i2) {
               const double w  = pk * cb3[em];
               const double u2 = sumU[idxU + i2];
-            
+
               fb3[idxU + i2] += w * u1;
               fb3[idxU + i1] += w * u2;
               em += NAR3;
@@ -1362,7 +1375,7 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
 
   if (use_bspline) twobody_forces_bspline(fij, cb2, drbf2, rij, bs_base, tj, Nj);
   else             twobody_forces(fij, cb2, drbf2, rij, tj, Nj);
-  
+
   if ((nl3 > 0) && (Nj>1)) {
     // Initialize forcecoeff to zero
     memset(forcecoeff, 0, nelements*K3*nrbf3 * sizeof(*forcecoeff));
@@ -2705,7 +2718,7 @@ void EAPOD::eigenvaluedecomposition(double *Phi, double *Lambda, double rinij, d
   // Generate the xij array
   for (int i=0; i<N; i++)
     xij[i] = (rinij+1e-6) + (rdiffij-1e-6)*(i*1.0/(N-1));
-  
+
   // Compute the snapshots matrix S
   snapshots(S, xij, rinij, rdiffij, N);
 
@@ -3079,7 +3092,7 @@ int EAPOD::estimate_temp_memory_md(int Nj)
   int n2 = 2*Nj*nrbfmax;        // rbf, drbf for the many-body descriptors
   if (use_bspline) n2 += 8*Nj;  // plus 4 B-spline slots for each
   int n3 = 2*Nj*ns;             // rbft, drbft
-  int n4 = 4*Nj*K3+4*K3;        // abf, abfx, abfy, abfz, tm  
+  int n4 = 4*Nj*K3+4*K3;        // abf, abfx, abfy, abfz, tm
 
   int ntemp = n2 + MAX(n3, n4);
 
@@ -3198,8 +3211,8 @@ int EAPOD::crossindices(int *ind1, int *ind2, int *dabf1, int nabf1, int nrbf1, 
   return n;
 }
 
-void EAPOD::calculateClusterEdges(int nClusters, double nActiveClusters, int nComponents, int nelements) 
-{  
+void EAPOD::calculateClusterEdges(int nClusters, double nActiveClusters, int nComponents, int nelements)
+{
   double lrange = 0.5 * nActiveClusters;
   int l = lrange; // number of clusters to consider on each side
   double fac = lrange - l;
@@ -3305,7 +3318,7 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
   double *invrcut2 = &invRightClusterRcut2[ncce];
   double *ledges = &leftClusterEdges[ncce];
   double *redges = &rightClusterEdges[ncce];
-  
+
   // tmp memory treated for the nComponent dimensional PCA (general case)
   // Local EA-POD currently only supports nComponents==1 (enforced at init)
   const int nActClsCp = nMaxActiveClusters*nComponents;
@@ -3363,7 +3376,7 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
       fcut = 1.0;
       dfcut_du = 0.0;
     }
-    
+
     // dfcut/dpca[n] = (df/du) * (du/dpca[n])
     clusterFcut[j] = fcut;
     for (int n = 0; n < nComponents; n++) {
@@ -3421,7 +3434,7 @@ void EAPOD::peratomlocalenvironment_descriptors(double *P, double *dP_dR, double
   // calculate dP_dR = dB_dR * dP_dB , which are derivatives of probabilities with respect to atomic coordinates
   int N = 3*nNeighbors;
   DGEMM(&chn, &cht, &N, &kn, &Mdesc, &alpha, dB_dR, &N, dP_dB, &kn, &beta, &dP_dR[N * ks], &N);
-  
+
 }
 
 void EAPOD::peratomenvironment_descriptors(double *P, double *dP_dR, double *B, double *dB_dR, double *tmp, int elem, int nNeighbors)

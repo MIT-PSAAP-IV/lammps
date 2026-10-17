@@ -115,7 +115,7 @@ void PairPOD::compute(int eflag, int vflag)
 
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
-    
+
     lammpsNeighborList(rij, ai, aj, ti, tj, x, firstneigh, type, map, numneigh, i);
 
     evdwl = fastpodptr->peratomenergyforce2(fij, rij, tmp, ti, tj, nij);
@@ -175,10 +175,6 @@ void PairPOD::coeff(int narg, char **arg)
 
   // reset nijmax to re-allocate based on neighbor counts
   nijmax = 0;
-
-  for (int ii = 0; ii < nelements; ii++)
-    for (int jj = 0; jj < nelements; jj++)
-      cutsq[ii][jj] = rcutsq[ii][jj];
 }
 
 /* ----------------------------------------------------------------------
@@ -204,9 +200,11 @@ double PairPOD::init_one(int i, int j)
     error->all(FLERR, Error::NOLASTLINE,
                "All pair coeffs are not set. Status:\n" + Info::get_pair_coeff_status(lmp));
 
-  int itype = i-1;
-  int jtype = j-1;
-  return rcut[itype][jtype];
+  // cutoffs are stored per element pair; atom types are mapped to elements
+
+  const int ielem = map[i];
+  const int jelem = map[j];
+  return MAX(rcut[ielem][jelem], rcut[jelem][ielem]);
 }
 
 void PairPOD::allocate()
@@ -237,7 +235,7 @@ void PairPOD::lammpsNeighborList(double *rij, int *ai, int *aj, int *ti, int *tj
     double rsq = delx * delx + dely * dely + delz * delz;
 
     int jtype = map[type[gj]];
-    if (rsq < cutsq[itype][jtype]) {
+    if (rsq < rcutsq[itype][jtype]) {
       rij[nij * 3 + 0] = delx;
       rij[nij * 3 + 1] = dely;
       rij[nij * 3 + 2] = delz;
