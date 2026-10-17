@@ -33,7 +33,7 @@ class ComputePODGlobal : public Compute {
   void compute_array() override;
   double memory_usage() override;
   void lammpsNeighborList(double **x, int **firstneigh, tagint *atomid, int *atomtype,
-                          int *numneigh, double rcutsq, int i);
+                          int *numneigh, double **rcutsq, int nelements, int i);
   void map_element2type(int narg, char **arg, int nelements);
 
  private:
