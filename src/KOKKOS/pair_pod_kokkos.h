@@ -92,6 +92,7 @@ class PairPODKokkos : public PairPOD {
   int nAtomBlocks;          // number of atoms blocks
   int atomBlocks[101];      // atom blocks
   int timing;
+  int native_hip;          // 1 to use native HIP kernels where available
 
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block

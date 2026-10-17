@@ -29,9 +29,11 @@
 #include "neighbor_kokkos.h"
 #include "neigh_request.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "eapod.h"
+#include "pair_pod_kokkos_hip.h"
 
 using namespace LAMMPS_NS;
 using namespace MathConst;
@@ -62,6 +64,13 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   utils::logmesg(lmp, "Atom Block Size: {:d}\n", atomBlockSize);
   nAtomBlocks = 0;
   timing = 0;
+
+  // native HIP kernels replace some Kokkos kernels on AMD GPUs.  setting the
+  // environment variable LAMMPS_POD_NATIVE_HIP=0 selects the Kokkos versions.
+
+  native_hip = 1;
+  const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
+  if (env && (strcmp(env, "0") == 0)) native_hip = 0;
 }
 
 /* ----------------------------------------------------------------------
@@ -1139,6 +1148,16 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf, t_pod_1d l_abf, t_pod_1i l_tj,
     t_pod_1i l_numij, const int l_nelements, const int l_nrbf3, const int l_K3, const int Ni, const int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip &&
+        PODHIP::radialangularsum<KK_FLOAT, KK_ACC_FLOAT>(
+            Kokkos::HIP().hip_stream(), l_sumU.data(), l_rbf.data(), l_abf.data(), l_tj.data(),
+            l_numij.data(), l_nelements, l_nrbf3, l_K3, Ni, Nij))
+      return;
+  }
+#endif
+
   int totalIterations = l_nrbf3 * l_K3 * Ni;
   if (l_nelements==1) {
     Kokkos::parallel_for("RadialAngularSum", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
@@ -1455,6 +1474,18 @@ void PairPODKokkos<DeviceType>::allbody_forces(
     t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
     t_pod_1i l_idxi, t_pod_1i l_tj, int l_nelements, int l_nrbf3, int l_K3, int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  // pairs are stored contiguously per atom i of the current block, with offsets in numij
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip &&
+        PODHIP::allbody_forces<KK_FLOAT, KK_ACC_FLOAT>(
+            Kokkos::HIP().hip_stream(), fij.data(), l_forcecoeff.data(), l_rbf.data(),
+            l_drbf.data(), l_rij.data(), l_abf.data(), l_abfx.data(), l_abfy.data(),
+            l_abfz.data(), l_tj.data(), numij.data(), l_nelements, l_nrbf3, l_K3, ni, Nij))
+      return;
+  }
+#endif
+
   Kokkos::parallel_for("allbody_forces",
     Kokkos::RangePolicy<DeviceType>(0, Nij),
     KOKKOS_LAMBDA(const int j) {
@@ -1929,12 +1960,25 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
     else             twobody_forces(l_fij, cb2, drbf2, rij, idxi, tj, nrbf2, Ni, Nij);
   }
 
-  set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
-  if ((nl3 > 0) && (Nij>1)) threebody_forcecoeff(forcecoeff, cb3, sumU,
-          pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
+  bool fc_done = false;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (nl3 > 0) && (Nij > 1))
+      fc_done = PODHIP::forcecoeff34<KK_FLOAT>(
+          Kokkos::HIP().hip_stream(), forcecoeff.data(), cb3.data(), cb4.data(), sumU.data(),
+          pc3.data(), pn3.data(), p3_active.data(), pa4.data(), pb4.data(), pc4.data(), nelements,
+          nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2));
+  }
+#endif
 
-  if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU,
-      pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
+  if (!fc_done) {
+    set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
+    if ((nl3 > 0) && (Nij>1)) threebody_forcecoeff(forcecoeff, cb3, sumU,
+            pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
+
+    if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU,
+        pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
+  }
 
   if ((nl3 > 0) && (Nij>1)) allbody_forces(l_fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz,
           idxi, tj, nelements, nrbf3, K3, Nij);
