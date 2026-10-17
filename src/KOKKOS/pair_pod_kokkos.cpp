@@ -161,7 +161,7 @@ void PairPODKokkos<DeviceType>::coeff(int narg, char **arg)
   auto h_rin = Kokkos::create_mirror_view(rin);
   for (int i = 0; i < nelements; i++)
     for (int j = 0; j < nelements; j++) {
-      h_rin(i, j) = fastpodptr->rin[i][j];
+      h_rin(i, j) = static_cast<KK_FLOAT>(fastpodptr->rin[i][j]);
     }
 
   Kokkos::deep_copy(rin, h_rin);
@@ -170,7 +170,7 @@ void PairPODKokkos<DeviceType>::coeff(int narg, char **arg)
   auto h_rcut = Kokkos::create_mirror_view(rcut);
   for (int i = 0; i < nelements; i++)
     for (int j = 0; j < nelements; j++) {
-      h_rcut(i, j) = fastpodptr->rcut[i][j];
+      h_rcut(i, j) = static_cast<KK_FLOAT>(fastpodptr->rcut[i][j]);
     }
 
   Kokkos::deep_copy(rcut, h_rcut);
@@ -179,7 +179,7 @@ void PairPODKokkos<DeviceType>::coeff(int narg, char **arg)
   auto h_invrdiff = Kokkos::create_mirror_view(invrdiff);
   for (int i = 0; i < nelements; i++)
     for (int j = 0; j < nelements; j++) {
-      h_invrdiff(i, j) = fastpodptr->invrdiff[i][j];
+      h_invrdiff(i, j) = static_cast<KK_FLOAT>(fastpodptr->invrdiff[i][j]);
     }
 
   Kokkos::deep_copy(invrdiff, h_invrdiff);
@@ -380,7 +380,7 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   Mdesc = podptr->Mdesc; // number of base descriptors
   eapod = podptr->eapod; // boolean for ea-pod method
   localeapod = podptr->localeapod; // boolean for local ea-pod method
-  nActiveClusters = podptr->nActiveClusters; // average number of active clusters
+  nActiveClusters = static_cast<KK_FLOAT>(podptr->nActiveClusters); // average number of active clusters
   nMaxActiveClusters = podptr->nMaxActiveClusters; // max number of active clusters
   use_hermite   = podptr->use_hermite;
   nhermite_bins = podptr->nhermite_bins;
@@ -394,7 +394,7 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
 
   MemKK::realloc_kokkos(coefficients, "pair_pod:coefficients", nCoeffPerElement * nelements);
   auto h_coefficients = Kokkos::create_mirror_view(coefficients);
-  for (int i=0; i<nCoeffPerElement * nelements; i++) h_coefficients[i] = podptr->coeff[i];
+  for (int i=0; i<nCoeffPerElement * nelements; i++) h_coefficients[i] = static_cast<KK_FLOAT>(podptr->coeff[i]);
   Kokkos::deep_copy(coefficients, h_coefficients);
 
   if (use_bspline) {
@@ -407,8 +407,8 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
     auto h_bsinvh = Kokkos::create_mirror_view(bs_invh);
 
     for (int i = 0; i < npair; ++i) {
-      h_bsr0(i)   = podptr->bs_r0[i];
-      h_bsinvh(i) = podptr->bs_invh[i];
+      h_bsr0(i)   = static_cast<KK_FLOAT>(podptr->bs_r0[i]);
+      h_bsinvh(i) = static_cast<KK_FLOAT>(podptr->bs_invh[i]);
     }
 
     Kokkos::deep_copy(bs_r0, h_bsr0);
@@ -428,11 +428,11 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
     auto h_coef  = Kokkos::create_mirror_view(rbf_hermite_coeffs);
 
     for (int i = 0; i < npair; ++i) {
-      h_r0(i)    = podptr->hermite_r0[i];
-      h_invdr(i) = podptr->hermite_invdr[i];
+      h_r0(i)    = static_cast<KK_FLOAT>(podptr->hermite_r0[i]);
+      h_invdr(i) = static_cast<KK_FLOAT>(podptr->hermite_invdr[i]);
     }
     for (size_t i = 0; i < ncoef; ++i) {
-      h_coef(i) = podptr->rbf_hermite_coeffs[i];
+      h_coef(i) = static_cast<KK_FLOAT>(podptr->rbf_hermite_coeffs[i]);
     }
 
     Kokkos::deep_copy(hermite_r0, h_r0);
@@ -453,9 +453,9 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
         const EAPOD::BesselConst *bc = podptr->bessel_const(it, jt);
         for (int j = 0; j < nbesselpars; ++j) {
           const int idx = (it * nelements + jt) * nbesselpars + j;
-          h_neg_alpha[idx] = bc[j].neg_alpha;
-          h_pi_inv_t1[idx] = bc[j].pi_inv_t1;
-          h_dx_factor[idx] = bc[j].dx_factor;
+          h_neg_alpha[idx] = static_cast<KK_FLOAT>(bc[j].neg_alpha);
+          h_pi_inv_t1[idx] = static_cast<KK_FLOAT>(bc[j].pi_inv_t1);
+          h_dx_factor[idx] = static_cast<KK_FLOAT>(bc[j].dx_factor);
         }
       }
     }
@@ -465,20 +465,20 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
 
     MemKK::realloc_kokkos(Phi, "pair_pod:Phi", ns*ns);
     auto h_Phi = Kokkos::create_mirror_view(Phi);
-    for (int i=0; i<ns*ns; i++) h_Phi[i] = podptr->Phi[i];
+    for (int i=0; i<ns*ns; i++) h_Phi[i] = static_cast<KK_FLOAT>(podptr->Phi[i]);
     Kokkos::deep_copy(Phi, h_Phi);
   }
 
   if (eapod) {
     MemKK::realloc_kokkos(Proj, "pair_pod:Proj",  Mdesc * nComponents * nelements);
     auto h_Proj = Kokkos::create_mirror_view(Proj);
-    for (int i=0; i<Mdesc * nComponents * nelements; i++) h_Proj[i] = podptr->Proj[i];
+    for (int i=0; i<Mdesc * nComponents * nelements; i++) h_Proj[i] = static_cast<KK_FLOAT>(podptr->Proj[i]);
     Kokkos::deep_copy(Proj, h_Proj);
 
     int ncce = nClusters * nComponents * nelements;
     MemKK::realloc_kokkos(Centroids, "pair_pod:Centroids", ncce);
     auto h_Centroids = Kokkos::create_mirror_view(Centroids);
-    for (int i=0; i<ncce; i++) h_Centroids[i] = podptr->Centroids[i];
+    for (int i=0; i<ncce; i++) h_Centroids[i] = static_cast<KK_FLOAT>(podptr->Centroids[i]);
     Kokkos::deep_copy(Centroids, h_Centroids);
 
     if (localeapod) {
@@ -488,19 +488,19 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
       MemKK::realloc_kokkos(rightClusterEdges, "pair_pod:rightClusterEdges", ncce);
 
       auto h_invLeftClusterRcut2 = Kokkos::create_mirror_view(invLeftClusterRcut2);
-      for (int i=0; i<ncce; i++) h_invLeftClusterRcut2[i] = podptr->invLeftClusterRcut2[i];
+      for (int i=0; i<ncce; i++) h_invLeftClusterRcut2[i] = static_cast<KK_FLOAT>(podptr->invLeftClusterRcut2[i]);
       Kokkos::deep_copy(invLeftClusterRcut2, h_invLeftClusterRcut2);
 
       auto h_invRightClusterRcut2 = Kokkos::create_mirror_view(invRightClusterRcut2);
-      for (int i=0; i<ncce; i++) h_invRightClusterRcut2[i] = podptr->invRightClusterRcut2[i];
+      for (int i=0; i<ncce; i++) h_invRightClusterRcut2[i] = static_cast<KK_FLOAT>(podptr->invRightClusterRcut2[i]);
       Kokkos::deep_copy(invRightClusterRcut2, h_invRightClusterRcut2);
 
       auto h_leftClusterEdges = Kokkos::create_mirror_view(leftClusterEdges);
-      for (int i=0; i<ncce; i++) h_leftClusterEdges[i] = podptr->leftClusterEdges[i];
+      for (int i=0; i<ncce; i++) h_leftClusterEdges[i] = static_cast<KK_FLOAT>(podptr->leftClusterEdges[i]);
       Kokkos::deep_copy(leftClusterEdges, h_leftClusterEdges);
 
       auto h_rightClusterEdges = Kokkos::create_mirror_view(rightClusterEdges);
-      for (int i=0; i<ncce; i++) h_rightClusterEdges[i] = podptr->rightClusterEdges[i];
+      for (int i=0; i<ncce; i++) h_rightClusterEdges[i] = static_cast<KK_FLOAT>(podptr->rightClusterEdges[i]);
       Kokkos::deep_copy(rightClusterEdges, h_rightClusterEdges);
     }
   }
@@ -798,12 +798,12 @@ void PairPODKokkos<DeviceType>::cutoff_exp(const KK_FLOAT y, const KK_FLOAT invr
   // df = f * 3*invrmax*y^2*(y^3-1) / (y4*y5)
   //const KK_FLOAT y  = r * invrmax;
   const KK_FLOAT y2 = y * y;
-  const KK_FLOAT y3 = y * y2 - 1.0;
-  const KK_FLOAT y4 = y3 * y3 + 1.0e-6;
-  const KK_FLOAT y5 = sqrt(y4);
+  const KK_FLOAT y3 = y * y2 - static_cast<KK_FLOAT>(1.0);
+  const KK_FLOAT y4 = y3 * y3 + static_cast<KK_FLOAT>(1.0e-6);
+  const KK_FLOAT y5 = Kokkos::sqrt(y4);
 
-  fcut  = e_v * exp(-1.0 / y5);
-  dfcut = fcut * (3.0 * invrmax * y2 * y3) / (y4 * y5);
+  fcut  = e_v * Kokkos::exp(static_cast<KK_FLOAT>(-1.0) / y5);  // argument is always negative
+  dfcut = fcut * (static_cast<KK_FLOAT>(3.0) * invrmax * y2 * y3) / (y4 * y5);
 }
 
 template<class DeviceType>
@@ -827,12 +827,12 @@ void PairPODKokkos<DeviceType>::radialbasis(
     const KK_FLOAT yij = l_rij(3*n + 1);
     const KK_FLOAT zij = l_rij(3*n + 2);
 
-    const KK_FLOAT dij    = sqrt(xij*xij + yij*yij + zij*zij);
-    const KK_FLOAT invdij = 1.0 / dij;
+    const KK_FLOAT dij    = Kokkos::sqrt(xij*xij + yij*yij + zij*zij);
+    const KK_FLOAT invdij = static_cast<KK_FLOAT>(1.0) / dij;
 
     const KK_FLOAT invrmax = l_invrdiff(itype, jtype);
     const KK_FLOAT r       = dij - l_rin(itype, jtype);
-    const KK_FLOAT invr    = 1.0 / r;
+    const KK_FLOAT invr    = static_cast<KK_FLOAT>(1.0) / r;
     const KK_FLOAT y       = r * invrmax;
 
     // cutoff function for radial basis
@@ -842,7 +842,7 @@ void PairPODKokkos<DeviceType>::radialbasis(
     // Shared Bessel constants
     const KK_FLOAT f1   = fcut * invr;
     const KK_FLOAT g1   = (dfcut - f1) * invr;
-    const KK_FLOAT bfac = sqrt(2.0 * invrmax);
+    const KK_FLOAT bfac = Kokkos::sqrt(static_cast<KK_FLOAT>(2.0) * invrmax);
     const KK_FLOAT bf1  = bfac * f1;
     const KK_FLOAT bg1  = bfac * g1;
 
@@ -852,16 +852,16 @@ void PairPODKokkos<DeviceType>::radialbasis(
     for (int j = 0; j < l_nbesselpars; ++j) {
       const int bcj = bc_base + j;
 
-      const KK_FLOAT mt2   = expm1(l_neg_alpha(bcj) * y);
+      const KK_FLOAT mt2   = Kokkos::expm1(l_neg_alpha(bcj) * y);
       const KK_FLOAT xpi   = mt2 * l_pi_inv_t1(bcj);
-      const KK_FLOAT pi_dx = l_dx_factor(bcj) * (1.0 + mt2);
+      const KK_FLOAT pi_dx = l_dx_factor(bcj) * (static_cast<KK_FLOAT>(1.0) + mt2);
       const KK_FLOAT Kf1dx = bf1 * pi_dx;
 
-      KK_ACC_FLOAT ix = xpi;
+      KK_ACC_FLOAT ix = static_cast<KK_ACC_FLOAT>(xpi);
       for (int i = 1; i <= l_besseldegree; ++i) {
-        const KK_FLOAT cosax  = cos(ix);
-        const KK_FLOAT inv_i  = 1.0 / KK_FLOAT(i);
-        const KK_FLOAT isinax = inv_i * sin(ix);
+        const KK_FLOAT cosax  = static_cast<KK_FLOAT>(Kokkos::cos(ix));
+        const KK_FLOAT inv_i  = static_cast<KK_FLOAT>(1.0) / static_cast<KK_FLOAT>(i);
+        const KK_FLOAT isinax = inv_i * static_cast<KK_FLOAT>(Kokkos::sin(ix));
 
         const KK_FLOAT rbfv    = bf1 * isinax;
         const KK_FLOAT drbftdr = bg1 * isinax + Kf1dx * cosax;
@@ -869,7 +869,7 @@ void PairPODKokkos<DeviceType>::radialbasis(
         rbft (nij) = rbfv;
         drbft(nij) = drbftdr * invdij;  // R'/r
 
-        ix  += xpi;
+        ix  += static_cast<KK_ACC_FLOAT>(xpi);
         nij += Nij;
       }
     }
@@ -907,12 +907,12 @@ void PairPODKokkos<DeviceType>::radialPhi(t_pod_1d rbft, t_pod_1d drbft, t_pod_1
 
         for (int k = 0; k < ns; ++k) {
             const KK_FLOAT phi_kj = Phi(k + ns * j);
-            sum1 += rbft(i + Nij * k) * phi_kj;
-            sum2 += drbft(i + Nij * k) * phi_kj;
+            sum1 += static_cast<KK_ACC_FLOAT>(rbft(i + Nij * k) * phi_kj);
+            sum2 += static_cast<KK_ACC_FLOAT>(drbft(i + Nij * k) * phi_kj);
         }
 
-        rbf(i + Nij * j) = sum1;
-        drbf(i + Nij * j) = sum2;
+        rbf(i + Nij * j) = static_cast<KK_FLOAT>(sum1);
+        drbf(i + Nij * j) = static_cast<KK_FLOAT>(sum2);
     });
 }
 
@@ -940,7 +940,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
       const KK_FLOAT y = l_rij(3*n + 1);
       const KK_FLOAT z = l_rij(3*n + 2);
 
-      const KK_FLOAT r = sqrt(x*x + y*y + z*z);
+      const KK_FLOAT r = Kokkos::sqrt(x*x + y*y + z*z);
 
       const KK_FLOAT r0    = s_r0(pair);
       const KK_FLOAT invdr = s_invdr(pair);
@@ -963,7 +963,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
         const KK_FLOAT c3 = s_coef(off + 3);
 
         const KK_FLOAT f    = c0 + t * (c1 + t * (c2 + t * c3));
-        const KK_FLOAT dfdt = c1 + t * (2.0*c2 + 3.0*c3*t);
+        const KK_FLOAT dfdt = c1 + t * (static_cast<KK_FLOAT>(2.0)*c2 + static_cast<KK_FLOAT>(3.0)*c3*t);
 
         const int idx = n + N*k;
         l_rbf (idx) = f;
@@ -1034,7 +1034,7 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
       const KK_FLOAT y = l_rij(3*n + 1);
       const KK_FLOAT z = l_rij(3*n + 2);
 
-      const KK_FLOAT r    = sqrt(x*x + y*y + z*z);
+      const KK_FLOAT r    = Kokkos::sqrt(x*x + y*y + z*z);
       const KK_FLOAT invh = s_invh(pair);
 
       KK_FLOAT tg = (r - s_r0(pair)) * invh;
@@ -1088,7 +1088,7 @@ void PairPODKokkos<DeviceType>::angularbasis(
       const KK_FLOAT xx = x*x, yy = y*y, zz = z*z;
       const KK_FLOAT xy = x*y, xz = x*z, yz = y*z;
 
-      const KK_FLOAT invdij  = 1.0 / sqrt(xx + yy + zz);
+      const KK_FLOAT invdij  = static_cast<KK_FLOAT>(1.0) / Kokkos::sqrt(xx + yy + zz);
       const KK_FLOAT u = x * invdij;
       const KK_FLOAT v = y * invdij;
       const KK_FLOAT w = z * invdij;
@@ -1153,9 +1153,9 @@ void PairPODKokkos<DeviceType>::radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf
 
       KK_ACC_FLOAT sum = 0.0;
       for (int j=0; j<nj; j++) {
-        sum += l_rbf(j + Nijm) * l_abf(j + Nijk);
+        sum += static_cast<KK_ACC_FLOAT>(l_rbf(j + Nijm) * l_abf(j + Nijk));
       }
-      l_sumU(idx) = sum;
+      l_sumU(idx) = static_cast<KK_FLOAT>(sum);
     });
   }
   else {
@@ -1174,9 +1174,9 @@ void PairPODKokkos<DeviceType>::radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf
       for (int e=0; e<l_nelements; e++) tm[e] = 0;
 
       for (int j=0; j<nj; j++)
-        tm[l_tj(j + start)] += l_rbf(j + Nijm) * l_abf(j + Nijk);
+        tm[l_tj(j + start)] += static_cast<KK_ACC_FLOAT>(l_rbf(j + Nijm) * l_abf(j + Nijk));
 
-      for (int e=0; e<l_nelements; e++) l_sumU(e + base) = tm[e];
+      for (int e=0; e<l_nelements; e++) l_sumU(e + base) = static_cast<KK_FLOAT>(tm[e]);
     });
   }
 }
@@ -1205,13 +1205,13 @@ void PairPODKokkos<DeviceType>::twobody_forces(
 
       KK_ACC_FLOAT cR = 0.0;
       for (int m = 0; m < l_nrbf2; ++m) {
-        cR += cb2(ii + Ni * m) * l_drbf2(n + Nij * m);
+        cR += static_cast<KK_ACC_FLOAT>(cb2(ii + Ni * m) * l_drbf2(n + Nij * m));
       }
 
       const int i1 = 3 * n;
-      fij(i1 + 0) += cR * l_rij(i1 + 0);
-      fij(i1 + 1) += cR * l_rij(i1 + 1);
-      fij(i1 + 2) += cR * l_rij(i1 + 2);
+      fij(i1 + 0) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 0)));
+      fij(i1 + 1) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 1)));
+      fij(i1 + 2) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 2)));
     });
 }
 
@@ -1238,12 +1238,12 @@ void PairPODKokkos<DeviceType>::twobody_forces_bspline(
 
       KK_ACC_FLOAT cR = 0.0;
       for (int s = 0; s < 4; ++s)
-        cR += cb2(ii + Ni * s) * l_drbf2(n + Nij * s);
+        cR += static_cast<KK_ACC_FLOAT>(cb2(ii + Ni * s) * l_drbf2(n + Nij * s));
 
       const int i1 = 3 * n;
-      fij(i1 + 0) += cR * l_rij(i1 + 0);
-      fij(i1 + 1) += cR * l_rij(i1 + 1);
-      fij(i1 + 2) += cR * l_rij(i1 + 2);
+      fij(i1 + 0) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 0)));
+      fij(i1 + 1) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 1)));
+      fij(i1 + 2) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 2)));
     });
 }
 
@@ -1264,9 +1264,9 @@ void PairPODKokkos<DeviceType>::threebodydesc(t_pod_1d d3, t_pod_1d l_sumU, t_po
       KK_ACC_FLOAT tmp = 0.0;
       for (int q = n1; q < n2; q++) {
         const KK_FLOAT su = l_sumU(q + nmi);
-        tmp += l_pc3(q) * su * su;
+        tmp += static_cast<KK_ACC_FLOAT>(static_cast<KK_FLOAT>(l_pc3(q)) * su * su);
       }
-      d3(i + Ni * (a + l_nabf3_active * m)) = tmp;
+      d3(i + Ni * (a + l_nabf3_active * m)) = static_cast<KK_FLOAT>(tmp);
     });
   }
   else {
@@ -1284,9 +1284,9 @@ void PairPODKokkos<DeviceType>::threebodydesc(t_pod_1d d3, t_pod_1d l_sumU, t_po
         for (int i2 = i1; i2 < l_nelements; i2++) {
           KK_ACC_FLOAT tmp = 0.0;
           for (int q = n1; q < n2; q++) {
-            tmp += l_pc3(q) * l_sumU(i1 + l_nelements * q + nmi) * l_sumU(i2 + l_nelements * q + nmi);
+            tmp += static_cast<KK_ACC_FLOAT>(static_cast<KK_FLOAT>(l_pc3(q)) * l_sumU(i1 + l_nelements * q + nmi) * l_sumU(i2 + l_nelements * q + nmi));
           }
-          d3(k) = tmp;
+          d3(k) = static_cast<KK_FLOAT>(tmp);
           k += nRA;
         }
       }
@@ -1311,7 +1311,7 @@ void PairPODKokkos<DeviceType>::threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3,
       const int n1 = l_pn3(p);
       const int n2 = l_pn3(p + 1);
       for (int q = n1; q < n2; q++) {
-        fb3(q + idxU) += c3 * l_pc3(q) * l_sumU(q + idxU);
+        fb3(q + idxU) += c3 * static_cast<KK_FLOAT>(l_pc3(q)) * l_sumU(q + idxU);
       }
     });
   }
@@ -1334,7 +1334,7 @@ void PairPODKokkos<DeviceType>::threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3,
         for (int i1 = 0; i1 < l_nelements; ++i1) {
           const KK_FLOAT u1 = l_sumU[idxU + i1];
           for (int i2 = i1; i2 < l_nelements; ++i2, em+=N3) {
-            const KK_FLOAT w = pk * cb3[em];
+            const KK_FLOAT w = static_cast<KK_FLOAT>(pk) * cb3[em];
             const KK_FLOAT u2 = l_sumU[idxU + i2];
 
             fb3[idxU + i2] += w * u1;
@@ -1370,9 +1370,9 @@ void PairPODKokkos<DeviceType>::fourbodydesc(t_pod_1d d4,  t_pod_1d l_sumU, t_po
               int j1 = l_pb4(q);
               int j2 = l_pb4(q + l_Q4);
               int j3 = l_pb4(q + 2 * l_Q4);
-              tmp += c * l_sumU(idxU + i1 + l_nelements * j1) * l_sumU(idxU + i2 + l_nelements * j2) * l_sumU(idxU + i3 + l_nelements * j3);
+              tmp += static_cast<KK_ACC_FLOAT>(static_cast<KK_FLOAT>(c) * l_sumU(idxU + i1 + l_nelements * j1) * l_sumU(idxU + i2 + l_nelements * j2) * l_sumU(idxU + i3 + l_nelements * j3));
             }
-            d4(k) = tmp;
+            d4(k) = static_cast<KK_FLOAT>(tmp);
             k += NiAR4;
           }
         }
@@ -1398,7 +1398,7 @@ void PairPODKokkos<DeviceType>::fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4,
         int n2 = l_pa4(p + 1);
         KK_FLOAT c4 = cb4(iAm + Ni*p);
         for (int q = n1; q < n2; q++) {
-          KK_FLOAT c = c4 * l_pc4(q);
+          KK_FLOAT c = c4 * static_cast<KK_FLOAT>(l_pc4(q));
           int j1 = idxU + l_pb4(q);
           int j2 = idxU + l_pb4(q + l_Q4);
           int j3 = idxU + l_pb4(q + 2 * l_Q4);
@@ -1435,7 +1435,7 @@ void PairPODKokkos<DeviceType>::fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4,
               KK_FLOAT c2 = l_sumU[idx2 + i2];
               for (int i3 = i2; i3 < l_nelements; i3++) {
                 KK_FLOAT c3 = l_sumU[idx3 + i3];
-                KK_FLOAT c4 = c * cb4[k];
+                KK_FLOAT c4 = static_cast<KK_FLOAT>(c) * cb4[k];
                 fb4[idx3 + i3] += c4*(c1 * c2);
                 fb4[idx2 + i2] += c4*(c1 * c3);
                 fb4[idx1 + i1] += c4*(c2 * c3);
@@ -1473,25 +1473,25 @@ void PairPODKokkos<DeviceType>::allbody_forces(
         for (int m = 0; m < l_nrbf3; ++m) {
           const int idxR = j + Nij * m;
           const KK_FLOAT fc = l_forcecoeff(i2_base + NeK3 * m);
-          fcR  += fc * l_rbf(idxR);
-          fcdR += fc * l_drbf(idxR);
+          fcR  += static_cast<KK_ACC_FLOAT>(fc * l_rbf(idxR));
+          fcdR += static_cast<KK_ACC_FLOAT>(fc * l_drbf(idxR));
         }
 
         const int idxA = j + Nij * k;
-        fcAdR += fcdR * l_abf(idxA);
-        fx += fcR * l_abfx(idxA);
-        fy += fcR * l_abfy(idxA);
-        fz += fcR * l_abfz(idxA);
+        fcAdR += fcdR * static_cast<KK_ACC_FLOAT>(l_abf(idxA));
+        fx += fcR * static_cast<KK_ACC_FLOAT>(l_abfx(idxA));
+        fy += fcR * static_cast<KK_ACC_FLOAT>(l_abfy(idxA));
+        fz += fcR * static_cast<KK_ACC_FLOAT>(l_abfz(idxA));
       }
 
       const int i1 = 3 * j;
-      fx += fcAdR * l_rij(i1 + 0);
-      fy += fcAdR * l_rij(i1 + 1);
-      fz += fcAdR * l_rij(i1 + 2);
+      fx += fcAdR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 0));
+      fy += fcAdR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 1));
+      fz += fcAdR * static_cast<KK_ACC_FLOAT>(l_rij(i1 + 2));
 
-      fij(i1 + 0) += fx;
-      fij(i1 + 1) += fy;
-      fij(i1 + 2) += fz;
+      fij(i1 + 0) += static_cast<KK_FLOAT>(fx);
+      fij(i1 + 1) += static_cast<KK_FLOAT>(fy);
+      fij(i1 + 2) += static_cast<KK_FLOAT>(fz);
     });
 }
 
@@ -1619,12 +1619,12 @@ void PairPODKokkos<DeviceType>::cluster_cutoff_poly_sq(const KK_FLOAT pc, const 
 {
   const KK_FLOAT u   = (pc * pc) * inv_rcut2;
   const KK_FLOAT u2  = u * u;
-  const KK_FLOAT omu = 1.0 - u;
+  const KK_FLOAT omu = static_cast<KK_FLOAT>(1.0) - u;
 
-  fcut  = 1.0 - u2 * u * (10.0 - u * (15.0 - 6.0 * u));
+  fcut  = static_cast<KK_FLOAT>(1.0) - u2 * u * (static_cast<KK_FLOAT>(10.0) - u * (static_cast<KK_FLOAT>(15.0) - static_cast<KK_FLOAT>(6.0) * u));
 
   // dfcut := (1/(2pc)) * d(fcut)/dpc
-  dfcut = -30.0 * u2 * omu * omu * inv_rcut2;
+  dfcut = static_cast<KK_FLOAT>(-30.0) * u2 * omu * omu * inv_rcut2;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1635,13 +1635,13 @@ void PairPODKokkos<DeviceType>::cluster_cutoff_hat(
     const KK_FLOAT pc, const KK_FLOAT inv_rcut2, KK_FLOAT &fcut, KK_FLOAT &dfcut)
 {
   const KK_FLOAT y2   = (pc * pc) * inv_rcut2; // (pc/r)^2
-  const KK_FLOAT omy  = 1.0 - y2 * y2;         // 1-(pc/r)^4
+  const KK_FLOAT omy  = static_cast<KK_FLOAT>(1.0) - y2 * y2;         // 1-(pc/r)^4
   const KK_FLOAT omy2 = omy * omy;
 
   fcut = omy2 * omy2; // (1-y^4)^4
 
   // dfcut := (1/(2pc)) * d(fcut)/dpc
-  dfcut = -8.0 * inv_rcut2 * y2 * omy2 * omy;
+  dfcut = static_cast<KK_FLOAT>(-8.0) * inv_rcut2 * y2 * omy2 * omy;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1684,15 +1684,15 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
 
       KK_ACC_FLOAT pcai = 0.0;
       for (int m = 0; m < nDes; ++m) {
-        pcai += proj[ncdt + m] * B[i + Ni * m];
+        pcai += static_cast<KK_ACC_FLOAT>(proj[ncdt + m] * B[i + Ni * m]);
       }
-      pca[i] = pcai;
+      pca[i] = static_cast<KK_FLOAT>(pcai);
 
       // lower_bound on redges[ncct + k], ks in [0, nCls-1]
       int lo = 0, hi = nCls;
       while (lo < hi) {
         const int mid = (lo + hi) >> 1;
-        if (redges[ncct + mid] < pcai) lo = mid + 1;
+        if (static_cast<KK_ACC_FLOAT>(redges[ncct + mid]) < pcai) lo = mid + 1;
         else                           hi = mid;
       }
       const int ksi = lo;
@@ -1703,7 +1703,7 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       lo++;
       while (lo < hi) {
         const int mid = (lo + hi) >> 1;
-        if (ledges[ncct + mid] <= pcai) lo = mid + 1;
+        if (static_cast<KK_ACC_FLOAT>(ledges[ncct + mid]) <= pcai) lo = mid + 1;
         else                            hi = mid;
       }
 
@@ -1732,45 +1732,45 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
         const int kg = k + kncct;
 
         const KK_FLOAT pc        = pcai - cent[kg];
-        const KK_FLOAT inv_rcut2 = (pc >= 0.0) ? invrcut2[kg] : invlcut2[kg];
+        const KK_FLOAT inv_rcut2 = (pc >= static_cast<KK_FLOAT>(0.0)) ? invrcut2[kg] : invlcut2[kg];
 
         cluster_cutoff_hat(pc, inv_rcut2, fcut, dfcut);
         //cluster_cutoff_poly_sq(pc, inv_rcut2, fcut, dfcut);
 
-        const KK_FLOAT invDk = 1.0 / (pc * pc + 1e-20);
+        const KK_FLOAT invDk = static_cast<KK_FLOAT>(1.0) / (pc * pc + static_cast<KK_FLOAT>(1e-20));
         const KK_FLOAT fDk   = fcut * invDk;
-        const KK_FLOAT dfDkdpc = 2.0 * pc * invDk * (dfcut - fDk);
+        const KK_FLOAT dfDkdpc = static_cast<KK_FLOAT>(2.0) * pc * invDk * (dfcut - fDk);
 
         const int idx = i + Ni * k;
         D[idx]       = fDk;
         dD_dpca[idx] = dfDkdpc;
 
-        sumfDi += fDk;
-        S      += dfDkdpc;
+        sumfDi += static_cast<KK_ACC_FLOAT>(fDk);
+        S      += static_cast<KK_ACC_FLOAT>(dfDkdpc);
       }
-      sumfDi = 1.0 / sumfDi;
+      sumfDi = static_cast<KK_ACC_FLOAT>(1.0) / sumfDi;
 
-      KK_ACC_FLOAT eival = cefs[nc];
+      KK_ACC_FLOAT eival = static_cast<KK_ACC_FLOAT>(cefs[nc]);
       KK_ACC_FLOAT T     = 0.0;
       KK_ACC_FLOAT A     = 0.0;
       for (int k = 0; k < kni; ++k) {
         int idx = knc + k*nDes;
         KK_ACC_FLOAT sumE = 0.0;
         for (int m = 0; m < nDes; ++m)
-          sumE += cefs[m + idx] * B[i + Ni*m];
+          sumE += static_cast<KK_ACC_FLOAT>(cefs[m + idx] * B[i + Ni*m]);
 
         idx = i + Ni * k;
-        const KK_FLOAT Pk  = D[idx] * sumfDi;
-        const KK_FLOAT cpk = sumE * sumfDi;
+        const KK_FLOAT Pk  = static_cast<KK_FLOAT>(static_cast<KK_ACC_FLOAT>(D[idx]) * sumfDi);
+        const KK_FLOAT cpk = static_cast<KK_FLOAT>(sumE * sumfDi);
 
         D[idx] = Pk;
 
-        eival += sumE * Pk;
-        T     += cpk * Pk;
-        A     += cpk * dD_dpca[idx];
+        eival += sumE * static_cast<KK_ACC_FLOAT>(Pk);
+        T     += static_cast<KK_ACC_FLOAT>(cpk * Pk);
+        A     += static_cast<KK_ACC_FLOAT>(cpk * dD_dpca[idx]);
       }
-      ei[i] = eival;
-      U[i]  = A - S * T;
+      ei[i] = static_cast<KK_FLOAT>(eival);
+      U[i]  = static_cast<KK_FLOAT>(A - S * T);
   });
 
   // 3) Environment force coefficients: O(Mdesc * nActiveClusters)
@@ -1784,11 +1784,11 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       const int typei = tyai[i];
       const int knc   = 1 + m + kl * nDes + nCoeff * typei;
 
-      KK_ACC_FLOAT sum = U[i] * proj[m + nDes*typei];
+      KK_ACC_FLOAT sum = static_cast<KK_ACC_FLOAT>(U[i] * proj[m + nDes*typei]);
       for (int k = 0; k < kni; ++k)
-        sum += cefs[knc + k*nDes] * D[i + Ni*k];
+        sum += static_cast<KK_ACC_FLOAT>(cefs[knc + k*nDes] * D[i + Ni*k]);
 
-      cb[i + Ni*m] = sum;
+      cb[i + Ni*m] = static_cast<KK_FLOAT>(sum);
   });
 }
 
@@ -1828,13 +1828,13 @@ void PairPODKokkos<DeviceType>::blockatom_environment_descriptors(t_pod_1d ei, t
     int i = idx % Ni;
     int j = idx / Ni;
     int typei = tyai[i];
-    KK_FLOAT sum = 1e-20;
+    KK_FLOAT sum = static_cast<KK_FLOAT>(1e-20);
     for (int k = 0; k < nCom; k++) {
       KK_FLOAT c = cent[k + j * nCom + nCls*nCom*typei];
       KK_FLOAT p = pca[i + Ni*k];
       sum += (p - c) * (p - c);
     }
-    D[i + Ni*j] = 1.0 / sum;
+    D[i + Ni*j] = static_cast<KK_FLOAT>(1.0) / sum;
   });
 
   Kokkos::parallel_for("Probabilities", Kokkos::RangePolicy<DeviceType>(0,Ni), KOKKOS_LAMBDA(int i) {
@@ -1951,12 +1951,12 @@ void PairPODKokkos<DeviceType>::tallyforce(t_pod_1d l_fij, t_pod_1i l_ai, t_pod_
     KK_FLOAT fx = l_fij(n3 + 0);
     KK_FLOAT fy = l_fij(n3 + 1);
     KK_FLOAT fz = l_fij(n3 + 2);
-    Kokkos::atomic_add(&l_f(im, 0), fx);
-    Kokkos::atomic_add(&l_f(im, 1), fy);
-    Kokkos::atomic_add(&l_f(im, 2), fz);
-    Kokkos::atomic_sub(&l_f(jm, 0), fx);
-    Kokkos::atomic_sub(&l_f(jm, 1), fy);
-    Kokkos::atomic_sub(&l_f(jm, 2), fz);
+    Kokkos::atomic_add(&l_f(im, 0), static_cast<KK_ACC_FLOAT>(fx));
+    Kokkos::atomic_add(&l_f(im, 1), static_cast<KK_ACC_FLOAT>(fy));
+    Kokkos::atomic_add(&l_f(im, 2), static_cast<KK_ACC_FLOAT>(fz));
+    Kokkos::atomic_sub(&l_f(jm, 0), static_cast<KK_ACC_FLOAT>(fx));
+    Kokkos::atomic_sub(&l_f(jm, 1), static_cast<KK_ACC_FLOAT>(fy));
+    Kokkos::atomic_sub(&l_f(jm, 2), static_cast<KK_ACC_FLOAT>(fz));
   });
 }
 
@@ -1973,13 +1973,13 @@ void PairPODKokkos<DeviceType>::tallyenergy(t_pod_1d l_ei, int istart, int Ni)
     }, local_eng_vdwl);
 
     // Update global energy on the host after the parallel region
-    eng_vdwl += local_eng_vdwl;
+    eng_vdwl += static_cast<double>(local_eng_vdwl);
   }
 
   // For per-atom energy tally
   if (eflag_atom) {
     Kokkos::parallel_for("PerAtomEnergyTally", Kokkos::RangePolicy<DeviceType>(0,Ni), KOKKOS_LAMBDA(int k) {
-      l_eatom(istart + k) += l_ei(k);
+      l_eatom(istart + k) += static_cast<KK_ACC_FLOAT>(l_ei(k));
     });
   }
 }
@@ -2016,12 +2016,12 @@ struct PODGlobalStressFunctor {
     const KK_FLOAT fy = l_fij(k3 + 1);
     const KK_FLOAT fz = l_fij(k3 + 2);
 
-    upd.v[0] += rx * fx;
-    upd.v[1] += ry * fy;
-    upd.v[2] += rz * fz;
-    upd.v[3] += rx * fy;
-    upd.v[4] += rx * fz;
-    upd.v[5] += ry * fz;
+    upd.v[0] += static_cast<KK_ACC_FLOAT>(rx * fx);
+    upd.v[1] += static_cast<KK_ACC_FLOAT>(ry * fy);
+    upd.v[2] += static_cast<KK_ACC_FLOAT>(rz * fz);
+    upd.v[3] += static_cast<KK_ACC_FLOAT>(rx * fy);
+    upd.v[4] += static_cast<KK_ACC_FLOAT>(rx * fz);
+    upd.v[5] += static_cast<KK_ACC_FLOAT>(ry * fz);
   }
 };
 
@@ -2041,7 +2041,7 @@ void PairPODKokkos<DeviceType>::tallystress(
       sumv
     );
 
-    for (int d = 0; d < 6; ++d) virial[d] -= sumv.v[d];
+    for (int d = 0; d < 6; ++d) virial[d] -= static_cast<double>(sumv.v[d]);
   }
 
   if (vflag_atom) {
@@ -2051,9 +2051,9 @@ void PairPODKokkos<DeviceType>::tallystress(
         const int j  = l_aj(k);
         const int k3 = 3 * k;
 
-        const KK_FLOAT rx = -0.5 * l_rij(k3 + 0);
-        const KK_FLOAT ry = -0.5 * l_rij(k3 + 1);
-        const KK_FLOAT rz = -0.5 * l_rij(k3 + 2);
+        const KK_FLOAT rx = static_cast<KK_FLOAT>(-0.5) * l_rij(k3 + 0);
+        const KK_FLOAT ry = static_cast<KK_FLOAT>(-0.5) * l_rij(k3 + 1);
+        const KK_FLOAT rz = static_cast<KK_FLOAT>(-0.5) * l_rij(k3 + 2);
 
         const KK_FLOAT fx = l_fij(k3 + 0);
         const KK_FLOAT fy = l_fij(k3 + 1);
@@ -2069,8 +2069,8 @@ void PairPODKokkos<DeviceType>::tallystress(
 
         for (int d = 0; d < 6; ++d) {
           const KK_FLOAT v_l = v_local[d];
-          Kokkos::atomic_add(&l_vatom(i, d), v_l);
-          Kokkos::atomic_add(&l_vatom(j, d), v_l);
+          Kokkos::atomic_add(&l_vatom(i, d), static_cast<KK_ACC_FLOAT>(v_l));
+          Kokkos::atomic_add(&l_vatom(j, d), static_cast<KK_ACC_FLOAT>(v_l));
         }
       });
   }
