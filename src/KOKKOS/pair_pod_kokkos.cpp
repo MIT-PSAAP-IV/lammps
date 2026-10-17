@@ -121,12 +121,9 @@ template<class DeviceType>
 double PairPODKokkos<DeviceType>::init_one(int i, int j)
 {
   double cutone = PairPOD::init_one(i,j);
-  //double cutoneji = PairPOD::init_one(j,i);
-  //k_cutsq.view_host()(i,j) = cutone*cutone;
-  //k_cutsq.view_host()(j,i) = cutoneji*cutoneji;
 
-  //k_cutsq.view_host()(i,j) = k_cutsq.view_host()(j,i) = cutone*cutone;
-  //k_cutsq.modify_host();
+  k_cutsq.view_host()(i,j) = k_cutsq.view_host()(j,i) = static_cast<KK_FLOAT>(cutone*cutone);
+  k_cutsq.modify_host();
 
   return cutone;
 }
@@ -193,10 +190,7 @@ void PairPODKokkos<DeviceType>::coeff(int narg, char **arg)
   auto h_rcutsq = Kokkos::create_mirror_view(rcutsq);
   for (int i = 0; i < nelements; i++)
     for (int j = 0; j < nelements; j++) {
-      KK_FLOAT rcutsq_ij = fastpodptr->rcutsq[i][j];
-      k_cutsq.view_host()(i,j) = rcutsq_ij;
-      k_cutsq.modify_host();
-      h_rcutsq(i, j) =  rcutsq_ij;
+      h_rcutsq(i, j) = static_cast<KK_FLOAT>(fastpodptr->rcutsq[i][j]);
     }
   d_cutsq = k_cutsq.template view<DeviceType>();
   Kokkos::deep_copy(rcutsq, h_rcutsq);
