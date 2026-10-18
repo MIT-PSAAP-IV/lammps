@@ -55,172 +55,19 @@ inline int nblocks_for(long n, int nthreads)
   return static_cast<int>((n + nthreads - 1) / nthreads);
 }
 
-/* ----------------------------------------------------------------------
-   sumU(e, k, m, i) = sum_j [tj(j) == e] rbf(j, m) * abf(j, k)
-
-   one block per atom i; the neighbors of atom i are processed in tiles that
-   are staged in LDS with coalesced loads, laid out [j][k] and [j][m] so that
-   neighboring threads (consecutive k) read consecutive LDS words.  each
-   thread owns one (k, m) output and accumulates all elements in registers.
-------------------------------------------------------------------------- */
-
-template <typename T, typename TA>
-__global__ void radialangularsum_kernel(T *__restrict__ sumU, const T *__restrict__ rbf,
-                                        const T *__restrict__ abf, const int *__restrict__ tj,
-                                        const int *__restrict__ numij, const int nelements,
-                                        const int nrbf3, const int K3, const int Nij,
-                                        const int jtile)
-{
-  extern __shared__ char lds_raw[];
-  T *abf_s = reinterpret_cast<T *>(lds_raw);    // [jtile][K3]
-  T *rbf_s = abf_s + jtile * K3;                // [jtile][nrbf3]
-  int *tj_s = reinterpret_cast<int *>(rbf_s + jtile * nrbf3);
-
-  const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
-  const int nout = nrbf3 * K3;
-  const int o = threadIdx.x;    // output index o = k + K3*m, as in the Kokkos kernel
-  const int k = o % K3;
-  const int m = o / K3;
-
-  TA acc[MAX_ELEMENTS];
-  for (int e = 0; e < MAX_ELEMENTS; e++) acc[e] = TA(0);
-
-  for (int j0 = 0; j0 < nj; j0 += jtile) {
-    const int nt = min(jtile, nj - j0);
-
-    // coalesced loads along j, transposed into LDS
-    for (int t = threadIdx.x; t < nt * K3; t += blockDim.x) {
-      const int jj = t % nt, kk = t / nt;
-      abf_s[jj * K3 + kk] = abf[start + j0 + jj + Nij * kk];
-    }
-    for (int t = threadIdx.x; t < nt * nrbf3; t += blockDim.x) {
-      const int jj = t % nt, mm = t / nt;
-      rbf_s[jj * nrbf3 + mm] = rbf[start + j0 + jj + Nij * mm];
-    }
-    if (nelements > 1)
-      for (int t = threadIdx.x; t < nt; t += blockDim.x) tj_s[t] = tj[start + j0 + t];
-    __syncthreads();
-
-    if (o < nout) {
-      if (nelements == 1) {
-        for (int jj = 0; jj < nt; jj++)
-          acc[0] += static_cast<TA>(rbf_s[jj * nrbf3 + m] * abf_s[jj * K3 + k]);
-      } else {
-        for (int jj = 0; jj < nt; jj++)
-          acc[tj_s[jj]] += static_cast<TA>(rbf_s[jj * nrbf3 + m] * abf_s[jj * K3 + k]);
-      }
-    }
-    __syncthreads();
+// geometry of the pairs (i, j) of a block: distance r and unit vector (u, v, w) = (rj - ri)/r,
+// stored as rhat[j + N*d], d = 0, 1, 2
+template <typename T> struct PairGeom {
+  const T *rr, *rhat;
+  int N;
+  __device__ T r(const int j) const { return rr[j]; }
+  __device__ void uvw(const int j, T &u, T &v, T &w) const
+  {
+    u = rhat[j];
+    v = rhat[j + N];
+    w = rhat[j + 2 * N];
   }
-
-  if (o < nout) {
-    const int base = nelements * (o + nout * i);
-    for (int e = 0; e < nelements; e++) sumU[base + e] = static_cast<T>(acc[e]);
-  }
-}
-
-template <typename T, typename TA>
-bool radialangularsum(hipStream_t stream, T *sumU, const T *rbf, const T *abf, const int *tj,
-                      const int *numij, int nelements, int nrbf3, int K3, int Ni, int Nij)
-{
-  const int nout = nrbf3 * K3;
-  if ((Ni <= 0) || (nout > MAX_THREADS) || (nelements > MAX_ELEMENTS)) return false;
-
-  const int bytes_per_j = (K3 + nrbf3) * sizeof(T) + sizeof(int);
-  int jtile = LDS_BUDGET / bytes_per_j;
-  if (jtile > 128) jtile = 128;
-  if (jtile < 8) return false;
-
-  const int threads = ((nout + 63) / 64) * 64;
-  const size_t lds = (size_t) jtile * bytes_per_j;
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_kernel<T, TA>), dim3(Ni), dim3(threads), lds,
-                     stream, sumU, rbf, abf, tj, numij, nelements, nrbf3, K3, Nij, jtile);
-  return hipGetLastError() == hipSuccess;
-}
-
-/* ----------------------------------------------------------------------
-   fij(j) += sum_k sum_m forcecoeff(tj, k, m, i) * d/dr [ rbf(j, m) abf(j, k) ]
-
-   one block per atom i with one thread per neighbor j.  the forcecoeff block
-   of atom i is staged in LDS once and shared by all its neighbors, and the
-   radial functions of pair j are kept in registers instead of being reloaded
-   for every angular function.
-------------------------------------------------------------------------- */
-
-template <typename T, typename TA>
-__global__ void allbody_forces_kernel(T *__restrict__ fij, const T *__restrict__ forcecoeff,
-                                      const T *__restrict__ rbf, const T *__restrict__ drbf,
-                                      const T *__restrict__ rij, const T *__restrict__ abf,
-                                      const T *__restrict__ abfx, const T *__restrict__ abfy,
-                                      const T *__restrict__ abfz, const int *__restrict__ tj,
-                                      const int *__restrict__ numij, const int nelements,
-                                      const int nrbf3, const int K3, const int Nij)
-{
-  extern __shared__ char lds_raw[];
-  T *fc_s = reinterpret_cast<T *>(lds_raw);    // forcecoeff of atom i: [m][k][e]
-
-  const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
-  const int NeK3 = nelements * K3;
-  const int nfc = NeK3 * nrbf3;
-
-  for (int t = threadIdx.x; t < nfc; t += blockDim.x) fc_s[t] = forcecoeff[t + nfc * i];
-  __syncthreads();
-
-  for (int jj = threadIdx.x; jj < nj; jj += blockDim.x) {
-    const int j = start + jj;
-    const int e = (nelements > 1) ? tj[j] : 0;
-
-    T r[MAX_RADIAL], dr[MAX_RADIAL];
-    for (int m = 0; m < nrbf3; m++) {
-      r[m] = rbf[j + Nij * m];
-      dr[m] = drbf[j + Nij * m];
-    }
-
-    TA fcAdR = TA(0), fx = TA(0), fy = TA(0), fz = TA(0);
-    for (int k = 0; k < K3; k++) {
-      const T *fck = fc_s + e + nelements * k;
-      TA fcR = TA(0), fcdR = TA(0);
-      for (int m = 0; m < nrbf3; m++) {
-        const T fc = fck[NeK3 * m];
-        fcR += static_cast<TA>(fc * r[m]);
-        fcdR += static_cast<TA>(fc * dr[m]);
-      }
-      const int idxA = j + Nij * k;
-      fcAdR += fcdR * static_cast<TA>(abf[idxA]);
-      fx += fcR * static_cast<TA>(abfx[idxA]);
-      fy += fcR * static_cast<TA>(abfy[idxA]);
-      fz += fcR * static_cast<TA>(abfz[idxA]);
-    }
-
-    const int i1 = 3 * j;
-    fx += fcAdR * static_cast<TA>(rij[i1 + 0]);
-    fy += fcAdR * static_cast<TA>(rij[i1 + 1]);
-    fz += fcAdR * static_cast<TA>(rij[i1 + 2]);
-    fij[i1 + 0] += static_cast<T>(fx);
-    fij[i1 + 1] += static_cast<T>(fy);
-    fij[i1 + 2] += static_cast<T>(fz);
-  }
-}
-
-template <typename T, typename TA>
-bool allbody_forces(hipStream_t stream, T *fij, const T *forcecoeff, const T *rbf, const T *drbf,
-                    const T *rij, const T *abf, const T *abfx, const T *abfy, const T *abfz,
-                    const int *tj, const int *numij, int nelements, int nrbf3, int K3, int Ni,
-                    int Nij)
-{
-  if ((Ni <= 0) || (nrbf3 > MAX_RADIAL) || (nelements > MAX_ELEMENTS)) return false;
-  const size_t lds = (size_t) nelements * K3 * nrbf3 * sizeof(T);
-  if (lds > 65536) return false;
-
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_kernel<T, TA>), dim3(Ni), dim3(64), lds, stream,
-                     fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz, tj, numij, nelements,
-                     nrbf3, K3, Nij);
-  return hipGetLastError() == hipSuccess;
-}
+};
 
 /* ----------------------------------------------------------------------
    three- and four-body force coefficients, fused:
@@ -347,10 +194,9 @@ bool forcecoeff34(hipStream_t stream, T *fb, const T *cb3, const T *cb4, const T
 
 
 /* ----------------------------------------------------------------------
-   kernels that compute the angular basis on the fly from rij instead of
-   reading the abf/abfx/abfy/abfz arrays written by angularbasis(), so that
-   angularbasis() can be skipped.  the angular functions of pair j are the
-   monomials u^a v^b w^c (a+b+c <= L) of the unit vector (u,v,w) = rij/|rij|.
+   kernels that compute the angular basis on the fly instead of reading it
+   from memory.  the angular functions of pair j are the monomials u^a v^b w^c
+   (a+b+c <= L) of its unit vector (u,v,w).
 ------------------------------------------------------------------------- */
 
 // matrix core (MFMA) support: one 16x16x4 product per instruction, wave64.
@@ -429,7 +275,7 @@ inline bool device_has_mfma()
 
 template <typename T, typename TA>
 __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rbf, T *__restrict__ drbf,
-                                       const T *__restrict__ rij, const T *__restrict__ rin,
+                                       const PairGeom<T> pg, const T *__restrict__ rin,
                                        const T *__restrict__ invrdiff, const int rs0,
                                        const int rs1, const int ds0, const int ds1,
                                        const T *__restrict__ neg_alpha,
@@ -453,10 +299,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
   const int jtype = tj[n];
   const int bc_base = (itype * nelements + jtype) * nbesselpars;
 
-  const T xij = rij[3 * n + 0];
-  const T yij = rij[3 * n + 1];
-  const T zij = rij[3 * n + 2];
-  const T dij = sqrt(xij * xij + yij * yij + zij * zij);
+  const T dij = pg.r(n);
   const T invdij = static_cast<T>(1.0) / dij;
 
   const T invrmax = invrdiff[itype * ds0 + jtype * ds1];
@@ -532,7 +375,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
 }
 
 template <typename T, typename TA>
-bool radialbasis_phi(hipStream_t stream, T *rbf, T *drbf, const T *rij, const T *rin,
+bool radialbasis_phi(hipStream_t stream, T *rbf, T *drbf, const PairGeom<T> &pg, const T *rin,
                      const T *invrdiff, int rs0, int rs1, int ds0, int ds1, const T *neg_alpha,
                      const T *pi_inv_t1, const T *dx_factor, const T *Phi, const int *ti,
                      const int *tj, int nelements, int besseldegree, int inversedegree,
@@ -543,7 +386,7 @@ bool radialbasis_phi(hipStream_t stream, T *rbf, T *drbf, const T *rij, const T 
   const size_t lds = (size_t) ns * nrbfmax * sizeof(T);
   if (lds > 65536) return false;
   return launch(radialbasis_phi_kernel<T, TA>, nblocks_for(Nij, 256), 256, lds, stream, rbf, drbf,
-                rij, rin, invrdiff, rs0, rs1, ds0, ds1, neg_alpha, pi_inv_t1, dx_factor, Phi, ti,
+                pg, rin, invrdiff, rs0, rs1, ds0, ds1, neg_alpha, pi_inv_t1, dx_factor, Phi, ti,
                 tj, nelements, besseldegree, inversedegree, nbesselpars, ns, nrbfmax, Nij);
 }
 
@@ -577,7 +420,7 @@ template <typename T> struct RadialSrc {
 // calls emit(m, rbf(j, m), drbf(j, m)) for m < nrbf3; MAXR > 0 unrolls the
 // loop to MAXR (nrbf3 <= MAXR) so that emit may index register arrays
 template <int MAXR, typename T, typename F>
-__device__ inline void pair_radial(const RadialSrc<T> &s, const T *rij, const int j,
+__device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg, const int j,
                                    const int nrbf3, F &&emit)
 {
   constexpr int MR = (MAXR > 0) ? MAXR : 1;
@@ -593,8 +436,7 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const T *rij, const in
     return;
   }
   const int pair = s.ti[j] * s.ne + s.tj[j];
-  const T x = rij[3 * j + 0], y = rij[3 * j + 1], z = rij[3 * j + 2];
-  const T r = sqrt(x * x + y * y + z * z);
+  const T r = pg.r(j);
   const T r0 = s.r0v[pair];
   const T invdr = s.invdrv[pair];
   const T invdrr = invdr / r;
@@ -621,7 +463,7 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const T *rij, const in
 
 template <typename T, typename TA>
 __global__ void radialangularsum_otf_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
-                                            const T *__restrict__ rij,
+                                            const PairGeom<T> pg,
                                             const int *__restrict__ tj,
                                             const int *__restrict__ numij,
                                             const int *__restrict__ pq_m,
@@ -659,20 +501,15 @@ __global__ void radialangularsum_otf_kernel(T *__restrict__ sumU, const RadialSr
 
     for (int jj = threadIdx.x; jj < nt; jj += blockDim.x) {
       const int j = start + j0 + jj;
-      const T x = rij[3 * j + 0];
-      const T y = rij[3 * j + 1];
-      const T z = rij[3 * j + 2];
-      const T invdij = static_cast<T>(1.0) / sqrt(x * x + y * y + z * z);
-      const T u = x * invdij;
-      const T v = y * invdij;
-      const T w = z * invdij;
+      T u, v, w;
+      pg.uvw(j, u, v, w);
       abf_s[jj] = static_cast<T>(1.0);
       for (int k = 1; k < K3; k++) {
         const int d = pqd_s[k];
         const T c = (d == 1) ? u : ((d == 2) ? v : w);
         abf_s[k * ld + jj] = abf_s[pqm_s[k] * ld + jj] * c;
       }
-      pair_radial<0>(rs, rij, j, nrbf3, [&](int m, T f, T) { rbf_s[m * ld + jj] = f; });
+      pair_radial<0>(rs, pg, j, nrbf3, [&](int m, T f, T) { rbf_s[m * ld + jj] = f; });
       tj_s[jj] = (nelements > 1) ? tj[j] : 0;
     }
     __syncthreads();
@@ -774,7 +611,7 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
 template <typename T, typename TA, int RTM, int CTM>
 __global__ void __launch_bounds__(64)
     radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
-                                 const T *__restrict__ rij, const int *__restrict__ tj,
+                                 const PairGeom<T> pg, const int *__restrict__ tj,
                                  const int *__restrict__ numij, const int *__restrict__ pq_m,
                                  const int *__restrict__ pq_d, const int nelements,
                                  const int nrbf3, const int K3, const int L, const int Nij,
@@ -837,11 +674,8 @@ __global__ void __launch_bounds__(64)
       T *pw = pow_s + jj * 3 * L1;
       if (jj < nt) {
         const int j = start + j0 + jj;
-        const T x = rij[3 * j + 0];
-        const T y = rij[3 * j + 1];
-        const T z = rij[3 * j + 2];
-        const T invdij = static_cast<T>(1.0) / sqrt(x * x + y * y + z * z);
-        const T u = x * invdij, v = y * invdij, w = z * invdij;
+        T u, v, w;
+        pg.uvw(j, u, v, w);
         T pu = static_cast<T>(1.0), pv = pu, pz = pu;
         for (int n = 0; n < L1; n++) {
           pw[n] = pu;
@@ -851,7 +685,7 @@ __global__ void __launch_bounds__(64)
           pv *= v;
           pz *= w;
         }
-        pair_radial<0>(rs, rij, j, nrbf3, [&](int m, T f, T) { rbf_s[m * ldr + jj] = f; });
+        pair_radial<0>(rs, pg, j, nrbf3, [&](int m, T f, T) { rbf_s[m * ldr + jj] = f; });
         tj_s[jj] = (nelements > 1) ? tj[j] : 0;
       } else {
         for (int n = 0; n < 3 * L1; n++) pw[n] = T(0);
@@ -896,7 +730,8 @@ __global__ void __launch_bounds__(64)
 }
 
 template <typename T, typename TA>
-bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, const T *rij, const int *tj,
+bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, const PairGeom<T> &pg,
+                          const int *tj,
                           const int *numij, const int *pq_m, const int *pq_d, int nelements,
                           int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile)
 {
@@ -925,7 +760,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C>), dim3(Ni),      \
-                     dim3(threads), lds2, stream, sumU, rs, rij, tj, numij, pq_m, pq_d,        \
+                     dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,        \
                      nelements, nrbf3, K3, L, Nij, jtile)
     if (CT == 1) {
       if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
@@ -941,7 +776,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
 #undef LMP_POD_RAS_MFMA
   } else
     hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_otf_kernel<T, TA>), dim3(Ni),
-                       dim3(threads), lds, stream, sumU, rs, rij, tj, numij, pq_m, pq_d,
+                       dim3(threads), lds, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,
                        nelements, nrbf3, K3, Nij, jtile);
   return hipGetLastError() == hipSuccess;
 }
@@ -964,13 +799,10 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
 
 // powers u^n, v^n, w^n (n = 0..L) of pair j, stored [u^n][v^n][w^n]
 template <typename T>
-__device__ inline void pod_pair_powers(T *pd, const T *rij, const int j, const int L1)
+__device__ inline void pod_pair_powers(T *pd, const PairGeom<T> &pg, const int j, const int L1)
 {
-  const T x = rij[3 * j + 0];
-  const T y = rij[3 * j + 1];
-  const T z = rij[3 * j + 2];
-  const T invdij = static_cast<T>(1.0) / sqrt(x * x + y * y + z * z);
-  const T u = x * invdij, v = y * invdij, w = z * invdij;
+  T u, v, w;
+  pg.uvw(j, u, v, w);
   T pu = static_cast<T>(1.0), pv = pu, pz = pu;
   for (int n = 0; n < L1; n++) {
     pd[n] = pu;
@@ -982,24 +814,24 @@ __device__ inline void pod_pair_powers(T *pd, const T *rij, const int j, const i
   }
 }
 
-// du/dx, du/dy, du/dz, dv/dy, dv/dz, dw/dz, x, y, z of pair j
-template <typename T> __device__ inline void pod_pair_gradients(T *g, const T *rij, const int j)
+// du/dx, du/dy, du/dz, dv/dy, dv/dz, dw/dz, x, y, z of pair j, with grad(u, v, w) =
+// (I - rhat rhat^T) / r
+template <typename T>
+__device__ inline void pod_pair_gradients(T *g, const PairGeom<T> &pg, const int j)
 {
-  const T x = rij[3 * j + 0];
-  const T y = rij[3 * j + 1];
-  const T z = rij[3 * j + 2];
-  const T xx = x * x, yy = y * y, zz = z * z;
-  const T invdij = static_cast<T>(1.0) / sqrt(xx + yy + zz);
-  const T invdij3 = invdij * invdij * invdij;
-  g[0] = (yy + zz) * invdij3;
-  g[1] = -(x * y) * invdij3;
-  g[2] = -(x * z) * invdij3;
-  g[3] = (xx + zz) * invdij3;
-  g[4] = -(y * z) * invdij3;
-  g[5] = (xx + yy) * invdij3;
-  g[6] = x;
-  g[7] = y;
-  g[8] = z;
+  T u, v, w;
+  pg.uvw(j, u, v, w);
+  const T r = pg.r(j);
+  const T invr = static_cast<T>(1.0) / r;
+  g[0] = (v * v + w * w) * invr;
+  g[1] = -(u * v) * invr;
+  g[2] = -(u * w) * invr;
+  g[3] = (u * u + w * w) * invr;
+  g[4] = -(v * w) * invr;
+  g[5] = (u * u + v * v) * invr;
+  g[6] = r * u;
+  g[7] = r * v;
+  g[8] = r * w;
 }
 
 // P_k and its derivatives for the packed exponents ex = a | b<<8 | c<<16
@@ -1045,7 +877,7 @@ __device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d
 template <typename T, typename TA>
 __global__ void __launch_bounds__(64)
     allbody_forces_otf_kernel(T *__restrict__ fij, const T *__restrict__ forcecoeff,
-                              const RadialSrc<T> rs, const T *__restrict__ rij, const int *__restrict__ tj,
+                              const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
                               const int *__restrict__ numij, const int *__restrict__ pq_m,
                               const int *__restrict__ pq_d, const int nelements, const int nrbf3,
                               const int K3, const int L, const int Nij)
@@ -1071,10 +903,10 @@ __global__ void __launch_bounds__(64)
   for (int jj = threadIdx.x; jj < nj; jj += blockDim.x) {
     const int j = start + jj;
     const int e = (nelements > 1) ? tj[j] : 0;
-    pod_pair_powers<T>(pd, rij, j, L1);
+    pod_pair_powers<T>(pd, pg, j, L1);
 
     T r[MAX_RADIAL], dr[MAX_RADIAL];
-    pair_radial<MAX_RADIAL>(rs, rij, j, nrbf3, [&](int m, T f, T df) {
+    pair_radial<MAX_RADIAL>(rs, pg, j, nrbf3, [&](int m, T f, T df) {
       r[m] = f;
       dr[m] = df;
     });
@@ -1098,7 +930,7 @@ __global__ void __launch_bounds__(64)
       SW += G * static_cast<TA>(Pw);
     }
     T g[9];
-    pod_pair_gradients<T>(g, rij, j);
+    pod_pair_gradients<T>(g, pg, j);
     pod_pair_force<T, TA>(fij, g, j, SA, SU, SV, SW);
   }
 }
@@ -1132,7 +964,7 @@ static constexpr int MFMA_PAIR_TILE = 16;
 template <typename T, typename TA, int CSM, int JT>
 __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     allbody_forces_mfma_kernel(T *__restrict__ fij, const T *__restrict__ forcecoeff,
-                               const RadialSrc<T> rs, const T *__restrict__ rij, const int *__restrict__ tj,
+                               const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int *__restrict__ pq_m,
                                const int *__restrict__ pq_d, const int nelements,
                                const int nrbf3, const int K3, const int L, const int Nij)
@@ -1178,8 +1010,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       T *pd = pd_s + jj * PD;
       if (jj < nt) {
         const int j = start + j0 + jj;
-        pod_pair_powers<T>(pd, rij, j, L1);
-        pair_radial<0>(rs, rij, j, nrbf3, [&](int m, T f, T df) {
+        pod_pair_powers<T>(pd, pg, j, L1);
+        pair_radial<0>(rs, pg, j, nrbf3, [&](int m, T f, T df) {
           r_s[m * JT + jj] = f;
           dr_s[m * JT + jj] = df;
         });
@@ -1252,7 +1084,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
           const TA sv = (lr == 0) ? SV[0] : ((lr == 1) ? SV[1] : ((lr == 2) ? SV[2] : SV[3]));
           const TA sw = (lr == 0) ? SW[0] : ((lr == 1) ? SW[1] : ((lr == 2) ? SW[2] : SW[3]));
           T g[9];
-          pod_pair_gradients<T>(g, rij, start + j0 + jj);
+          pod_pair_gradients<T>(g, pg, start + j0 + jj);
           pod_pair_force<T, TA>(fij, g, start + j0 + jj, sa, su, sv, sw);
         }
       }
@@ -1262,7 +1094,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
 
 template <typename T, typename TA>
 bool allbody_forces_otf(hipStream_t stream, T *fij, const T *forcecoeff, const RadialSrc<T> &rs,
-                        const T *rij, const int *tj, const int *numij,
+                        const PairGeom<T> &pg, const int *tj, const int *numij,
                         const int *pq_m, const int *pq_d, int nelements, int nrbf3, int K3,
                         int Ni, int Nij, bool use_mfma)
 {
@@ -1281,7 +1113,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const T *forcecoeff, const R
     if (lds <= 65536) {
 #define LMP_POD_ALLBODY_MFMA(CSM)                                                                 \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT>), dim3(Ni),       \
-                     dim3(64), lds, stream, fij, forcecoeff, rs, rij, tj, numij, pq_m,            \
+                     dim3(64), lds, stream, fij, forcecoeff, rs, pg, tj, numij, pq_m,             \
                      pq_d, nelements, nrbf3, K3, L, Nij)
       if (CS <= 2)
         LMP_POD_ALLBODY_MFMA(2);
@@ -1297,7 +1129,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const T *forcecoeff, const R
   const size_t lds = (nfc + (size_t) 64 * PD) * sizeof(T) + (size_t) K3 * sizeof(int);
   if (lds > 65536) return false;
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_otf_kernel<T, TA>), dim3(Ni), dim3(64), lds,
-                     stream, fij, forcecoeff, rs, rij, tj, numij, pq_m, pq_d, nelements,
+                     stream, fij, forcecoeff, rs, pg, tj, numij, pq_m, pq_d, nelements,
                      nrbf3, K3, L, Nij);
   return hipGetLastError() == hipSuccess;
 }
@@ -1559,11 +1391,12 @@ __global__ void __launch_bounds__(256)
 
 template <typename T>
 __global__ void __launch_bounds__(256)
-    neighbor_list_kernel(T *__restrict__ rij, int *__restrict__ typeai, int *__restrict__ idxi,
+    neighbor_list_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
+                         int *__restrict__ idxi,
                          int *__restrict__ ai, int *__restrict__ aj, int *__restrict__ ti,
                          int *__restrict__ tj, const int *__restrict__ numij,
                          const T *__restrict__ x, const T *__restrict__ rcutsq,
-                         const NeighArgs a, const int gi1, const int Ni)
+                         const NeighArgs a, const int gi1, const int Ni, const int Nij)
 {
   const int i = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
   const int lane = threadIdx.x & 63;
@@ -1585,9 +1418,13 @@ __global__ void __launch_bounds__(256)
     const unsigned long long mask = __ballot(in);
     if (in) {
       const int n = offset + __popcll(mask & below);
-      rij[3 * n + 0] = dx;
-      rij[3 * n + 1] = dy;
-      rij[3 * n + 2] = dz;
+      // as in the Kokkos version of PairPODKokkos::NeighborList()
+      const T r = sqrt(dx * dx + dy * dy + dz * dz);
+      const T sinv = static_cast<T>(1.0) / r;
+      rr[n] = r;
+      rhat[n] = dx * sinv;
+      rhat[n + Nij] = dy * sinv;
+      rhat[n + 2 * Nij] = dz * sinv;
       idxi[n] = i;
       ai[n] = gi;
       aj[n] = gj;
@@ -1683,12 +1520,12 @@ int neighbor_count(hipStream_t stream, int *numij, int *aux, const T *x, const T
 }
 
 template <typename T>
-bool neighbor_list(hipStream_t stream, T *rij, int *typeai, int *idxi, int *ai, int *aj, int *ti,
-                   int *tj, const int *numij, const T *x, const T *rcutsq, const NeighArgs &a,
-                   int gi1, int Ni)
+bool neighbor_list(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, int *ai, int *aj,
+                   int *ti, int *tj, const int *numij, const T *x, const T *rcutsq,
+                   const NeighArgs &a, int gi1, int Ni, int Nij)
 {
-  return launch(neighbor_list_kernel<T>, nblocks_for(Ni, 4), 256, 0, stream, rij, typeai, idxi,
-                ai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni);
+  return launch(neighbor_list_kernel<T>, nblocks_for(Ni, 4), 256, 0, stream, rr, rhat, typeai,
+                idxi, ai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, Nij);
 }
 
 // maximum number of neighbors of the atoms in ilist, or -1 on failure
@@ -1729,7 +1566,7 @@ inline int max_neighs(hipStream_t stream, int *dscratch, const int *ilist, const
 template <typename T, typename TA, bool PERATOM>
 __global__ void __launch_bounds__(256)
     radialbasis_hermite_kernel(T *__restrict__ rbf, T *__restrict__ drbf,
-                               const T *__restrict__ rij, const int *__restrict__ ti,
+                               const PairGeom<T> pg, const int *__restrict__ ti,
                                const int *__restrict__ tj, const T *__restrict__ r0v,
                                const T *__restrict__ invdrv, const T *__restrict__ coef,
                                const int ne, const int nb, const int nr, const int N,
@@ -1743,8 +1580,7 @@ __global__ void __launch_bounds__(256)
   }
   auto pair = [&](const int n) {
   const int pair = ti[n] * ne + tj[n];
-  const T x = rij[3 * n + 0], y = rij[3 * n + 1], z = rij[3 * n + 2];
-  const T r = sqrt(x * x + y * y + z * z);
+  const T r = pg.r(n);
   const T r0 = r0v[pair];
   const T invdr = invdrv[pair];
   const T invdrr = invdr / r;
@@ -1812,12 +1648,11 @@ template <typename T> struct BsplineArgs {
 // the 4 nonzero B-splines of pair n and their derivatives (times 1/r), in the slots
 // of the window that starts at the returned base index, as in PairPODKokkos::bspline4()
 template <typename T>
-__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const T *__restrict__ rij,
+__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
                                        const int n, T (&Bq)[4], T (&dBq)[4])
 {
   const int pair = g.ti[n] * g.ne + g.tj[n];
-  const T x = rij[3 * n + 0], y = rij[3 * n + 1], z = rij[3 * n + 2];
-  const T r = sqrt(x * x + y * y + z * z);
+  const T r = pg.r(n);
   const T invh = g.invhv[pair];
   T tg = (r - g.r0v[pair]) * invh;
   const bool inside = (tg >= T(0));
@@ -1855,13 +1690,13 @@ __device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const T *__restr
 template <typename T>
 __global__ void __launch_bounds__(256)
     radialbasis_bspline_kernel(T *__restrict__ rbf2, T *__restrict__ drbf2,
-                               int *__restrict__ base, const T *__restrict__ rij,
+                               int *__restrict__ base, const PairGeom<T> pg,
                                const BsplineArgs<T> g, const int N)
 {
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   if (n >= N) return;
   T Bq[4], dBq[4];
-  base[n] = pod_bspline_pair(g, rij, n, Bq, dBq);
+  base[n] = pod_bspline_pair(g, pg, n, Bq, dBq);
 #pragma unroll
   for (int q = 0; q < 4; q++) {
     rbf2[n + q * N] = Bq[q];
@@ -1877,7 +1712,7 @@ __global__ void __launch_bounds__(256)
 template <typename T, typename TA>
 __global__ void __launch_bounds__(256)
     twobody_forces_kernel(T *__restrict__ fij, const T *__restrict__ cb2,
-                          const T *__restrict__ drbf2, const T *__restrict__ rij,
+                          const T *__restrict__ drbf2, const PairGeom<T> pg,
                           const int *__restrict__ base, const int *__restrict__ idxi,
                           const int *__restrict__ tj, const int nrbf2, const int nm,
                           const int Ni, const int Nij, const BsplineArgs<T> bs)
@@ -1888,7 +1723,7 @@ __global__ void __launch_bounds__(256)
   if (bs.r0v) {
     // B-splines evaluated here instead of read from drbf2/base
     T Bq[4], dBq[4];
-    const int ii = idxi[n] + Ni * (pod_bspline_pair(bs, rij, n, Bq, dBq) + nrbf2 * tj[n]);
+    const int ii = idxi[n] + Ni * (pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * tj[n]);
 #pragma unroll
     for (int m = 0; m < 4; ++m) cR += static_cast<TA>(cb2[ii + Ni * m] * dBq[m]);
   } else {
@@ -1896,9 +1731,12 @@ __global__ void __launch_bounds__(256)
     const int ii = idxi[n] + Ni * ((base ? base[n] : 0) + nrbf2 * tj[n]);
     for (int m = 0; m < nm; ++m) cR += static_cast<TA>(cb2[ii + Ni * m] * drbf2[n + Nij * m]);
   }
-  fij[3 * n + 0] += static_cast<T>(cR * static_cast<TA>(rij[3 * n + 0]));
-  fij[3 * n + 1] += static_cast<T>(cR * static_cast<TA>(rij[3 * n + 1]));
-  fij[3 * n + 2] += static_cast<T>(cR * static_cast<TA>(rij[3 * n + 2]));
+  T u, v, w;
+  pg.uvw(n, u, v, w);
+  cR *= static_cast<TA>(pg.r(n));
+  fij[3 * n + 0] += static_cast<T>(cR * static_cast<TA>(u));
+  fij[3 * n + 1] += static_cast<T>(cR * static_cast<TA>(v));
+  fij[3 * n + 2] += static_cast<T>(cR * static_cast<TA>(w));
 }
 
 template <typename T, typename TA>
@@ -1907,7 +1745,7 @@ __global__ void __launch_bounds__(64)
                                const int *__restrict__ base, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int nelements,
                                const int nrbf2, const int Ni, const int Nij,
-                               const BsplineArgs<T> bs, const T *__restrict__ rij)
+                               const BsplineArgs<T> bs, const PairGeom<T> pg)
 {
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
@@ -1920,7 +1758,7 @@ __global__ void __launch_bounds__(64)
     if (bs.r0v) {
       // B-splines evaluated here instead of read from rbf2/base
       T Bq[4], dBq[4];
-      TA *se = s_s + pod_bspline_pair(bs, rij, n, Bq, dBq) + nrbf2 * tj[n];
+      TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * tj[n];
 #pragma unroll
       for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
     } else {
@@ -2367,16 +2205,19 @@ __global__ void __launch_bounds__(256)
 template <typename T, typename TA>
 __global__ void __launch_bounds__(256)
     tallystress_kernel(TA *__restrict__ acc, TA *__restrict__ vatom, const int vs0,
-                       const int vs1, const T *__restrict__ fij, const T *__restrict__ rij,
+                       const int vs1, const T *__restrict__ fij, const PairGeom<T> pg,
                        const int *__restrict__ ai, const int *__restrict__ aj, const int Nij,
                        const int global)
 {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
   T rx = 0, ry = 0, rz = 0, fx = 0, fy = 0, fz = 0;
   if (k < Nij) {
-    rx = rij[3 * k + 0];
-    ry = rij[3 * k + 1];
-    rz = rij[3 * k + 2];
+    T u, v, w;
+    pg.uvw(k, u, v, w);
+    const T r = pg.r(k);
+    rx = r * u;
+    ry = r * v;
+    rz = r * w;
     fx = fij[3 * k + 0];
     fy = fij[3 * k + 1];
     fz = fij[3 * k + 2];
