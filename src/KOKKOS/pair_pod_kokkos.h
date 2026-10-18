@@ -97,6 +97,10 @@ class PairPODKokkos : public PairPOD {
   int hip_jtile;           // neighbor tile size of the native HIP radial-angular sum
   int abf_degree;          // angular degree L of the 3-body monomials, or -1
   bool angular_otf;        // true if the angular basis of the current block was not stored
+  bool hip_acc_used;       // true if global energy/virial are accumulated in hip_acc
+  bool d2_fused;           // true if the 2-body descriptors of the block are already computed
+  t_pod_1i hip_iscratch;   // scratch for the native neighbor kernels
+  Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
 
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block
@@ -186,6 +190,7 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d pd;   // environment probability descriptors ni x (1 + nComponents + 3*nClusters)
   t_pod_1d coefficients; // coefficients nCoeffPerElement x nelements
   t_pod_1i pq_m, pq_d, pn3, pc3; // arrays to compute 3-body angular basis functions
+  t_pod_1i p3_qrange;  // pn3[p3_active[a]] and pn3[p3_active[a]+1] for each active channel a
   t_pod_1i pa4, pb4, pc4; // arrays to compute 4-body angular basis functions
   t_pod_1i ind33l, ind33r; // nl33
   t_pod_1i ind34l, ind34r; // nl34

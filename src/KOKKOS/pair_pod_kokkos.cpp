@@ -49,7 +49,62 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_MFMA = 4,       // matrix cores for the radial-angular sums
        HIP_MFMA_FORCE = 8,      // matrix cores for the force coefficient products
        HIP_DESC = 16,           // fused 3- and 4-body descriptors
-       HIP_TALLY = 32 };        // per-atom reductions in the force tally and 2-body descriptors
+       HIP_TALLY = 32,          // per-atom reductions in the force tally and 2-body descriptors
+       HIP_PORT = 64 };         // native versions of all other kernels
+
+#ifdef KOKKOS_ENABLE_HIP
+namespace {
+// views used by the native neighbor kernels, as raw pointers and strides
+template <class VI, class VN, class VT, class VM, class VX, class VC>
+PODHIP::NeighArgs pod_neigh_args(const VI &ilist, const VI &numneigh, const VN &neighbors,
+                                 const VT &type, const VM &map, const VX &x, const VC &rcutsq)
+{
+  PODHIP::NeighArgs a;
+  a.ilist = ilist.data();
+  a.numneigh = numneigh.data();
+  a.neighbors = neighbors.data();
+  a.type = type.data();
+  a.map = map.data();
+  a.ns0 = neighbors.stride(0);
+  a.ns1 = neighbors.stride(1);
+  a.xs0 = x.stride(0);
+  a.xs1 = x.stride(1);
+  a.cs0 = rcutsq.stride(0);
+  a.cs1 = rcutsq.stride(1);
+  return a;
+}
+
+// arguments of the native 3- and 4-body descriptor kernels
+template <class VD, class VI>
+PODHIP::DescArgs<KK_FLOAT> pod_desc_args(const VD &d3, const VD &d4, const VI &pc3, const VI &pn3,
+                                         const VI &p3_active, const VI &qrange3, const VI &pa4,
+                                         const VI &pb4, const VI &pc4, int nelements, int nrbf3,
+                                         int nabf3_active, int nrbf4, int nabf4, int K3, int Q4,
+                                         int Ni, bool do4)
+{
+  PODHIP::DescArgs<KK_FLOAT> g;
+  g.d3 = d3.data();
+  g.d4 = d4.data();
+  g.pc3 = pc3.data();
+  g.pn3 = pn3.data();
+  g.p3_active = p3_active.data();
+  g.qrange3 = reinterpret_cast<const int2 *>(qrange3.data());
+  g.pa4 = pa4.data();
+  g.pb4 = pb4.data();
+  g.pc4 = pc4.data();
+  g.nelements = nelements;
+  g.nrbf3 = nrbf3;
+  g.nabf3_active = nabf3_active;
+  g.nrbf4 = nrbf4;
+  g.nabf4 = nabf4;
+  g.K3 = K3;
+  g.Q4 = Q4;
+  g.Ni = Ni;
+  g.do4 = do4 ? 1 : 0;
+  return g;
+}
+}    // namespace
+#endif
 
 /* ---------------------------------------------------------------------- */
 
@@ -80,7 +135,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   native_hip = 1;
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
-  hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY;
+  hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT;
   angular_otf = false;
   env = getenv("LAMMPS_POD_HIP_FLAGS");
   if (env) hip_flags = atoi(env);
@@ -311,7 +366,18 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     d_ilist = k_list->d_ilist;
     inum = list->inum;
     int maxneighs;
-    Kokkos::parallel_reduce("PairPODKokkos::find_max_neighs",inum, FindMaxNumNeighs<DeviceType>(k_list), Kokkos::Max<int>(maxneighs));
+    maxneighs = -1;
+#ifdef KOKKOS_ENABLE_HIP
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+      if (native_hip && (hip_flags & HIP_PORT)) {
+        if ((int) hip_iscratch.extent(0) < 1) MemKK::realloc_kokkos(hip_iscratch, "pair_pod:hip_iscratch", 1024);
+        maxneighs = PODHIP::max_neighs(Kokkos::HIP().hip_stream(), hip_iscratch.data(),
+                                       d_ilist.data(), d_numneigh.data(), inum);
+      }
+    }
+#endif
+    if (maxneighs < 0)
+      Kokkos::parallel_reduce("PairPODKokkos::find_max_neighs",inum, FindMaxNumNeighs<DeviceType>(k_list), Kokkos::Max<int>(maxneighs));
     maxneigh = maxneighs;
   }
 
@@ -327,6 +393,17 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
   }
   grow_atoms(nmax);
   grow_pairs(nmax*maxneigh);
+
+  hip_acc_used = false;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT)) {
+      if ((int) hip_acc.extent(0) < 8) MemKK::realloc_kokkos(hip_acc, "pair_pod:hip_acc", 8);
+      hip_acc_used = (hipMemsetAsync(hip_acc.data(), 0, 8 * sizeof(KK_ACC_FLOAT),
+                                     Kokkos::HIP().hip_stream()) == hipSuccess);
+    }
+  }
+#endif
 
   for (int block=0; block<nAtomBlocks; block++) {
     int gi1 = atomBlocks[block]-1;
@@ -354,6 +431,22 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     }
 
   }
+
+#ifdef KOKKOS_ENABLE_HIP
+  // global energy and virial accumulated on the device by the native tallies
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (hip_acc_used && (eflag_global || vflag_global)) {
+      KK_ACC_FLOAT h_acc[8];
+      if ((hipMemcpyAsync(h_acc, hip_acc.data(), 8 * sizeof(KK_ACC_FLOAT), hipMemcpyDeviceToHost,
+                          Kokkos::HIP().hip_stream()) != hipSuccess) ||
+          (hipStreamSynchronize(Kokkos::HIP().hip_stream()) != hipSuccess))
+        error->one(FLERR, "pair pod/kk: reading the energy and virial from the GPU failed");
+      if (eflag_global) eng_vdwl += static_cast<double>(h_acc[0]);
+      if (vflag_global)
+        for (int d = 0; d < 6; ++d) virial[d] -= static_cast<double>(h_acc[1 + d]);
+    }
+  }
+#endif
 
   if (vflag_fdotr) pair_virial_fdotr_compute(this);
 
@@ -579,6 +672,15 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   for (int i=0; i<nabf3_active; i++) h_p3_active[i] = podptr->p3_active[i];
   Kokkos::deep_copy(p3_active, h_p3_active);
 
+  // range of the 3-body angular terms of each active channel, for the native kernels
+  MemKK::realloc_kokkos(p3_qrange, "pair_pod:p3_qrange", 2 * nabf3_active);
+  auto h_p3_qrange = Kokkos::create_mirror_view(p3_qrange);
+  for (int a = 0; a < nabf3_active; a++) {
+    h_p3_qrange[2 * a] = podptr->pn3[podptr->p3_active[a]];
+    h_p3_qrange[2 * a + 1] = podptr->pn3[podptr->p3_active[a] + 1];
+  }
+  Kokkos::deep_copy(p3_qrange, h_p3_qrange);
+
   if (nl4 > 0) {
     MemKK::realloc_kokkos(pa4, "pa4", nabf4+1);
     MemKK::realloc_kokkos(pb4, "pb4", Q4*3);
@@ -735,6 +837,18 @@ void PairPODKokkos<DeviceType>::grow_pairs(int Nij)
 template<class DeviceType>
 int PairPODKokkos<DeviceType>::NeighborCount(t_pod_1i l_numij, int gi1, int Ni)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT)) {
+      const int naux = (Ni + PODHIP::SCAN_BLOCK - 1) / PODHIP::SCAN_BLOCK + 1;
+      if ((int) hip_iscratch.extent(0) < naux) MemKK::realloc_kokkos(hip_iscratch, "pair_pod:hip_iscratch", naux + 1024);
+      const int total = PODHIP::neighbor_count<KK_FLOAT>(Kokkos::HIP().hip_stream(), l_numij.data(),
+          hip_iscratch.data(), x.data(), rcutsq.data(), pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq), gi1, Ni);
+      if (total >= 0) return total;
+    }
+  }
+#endif
+
   // create local shadow views for KOKKOS_LAMBDA to pass them into parallel_for
   auto l_ilist = d_ilist;
   auto l_x = x;
@@ -789,6 +903,16 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::NeighborList(t_pod_1d l_rij, t_pod_1i l_numij,  t_pod_1i l_typeai,
   t_pod_1i l_idxi, t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj, int gi1, int Ni)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::neighbor_list<KK_FLOAT>(Kokkos::HIP().hip_stream(), l_rij.data(), l_typeai.data(),
+            l_idxi.data(), l_ai.data(), l_aj.data(), l_ti.data(), l_tj.data(), l_numij.data(),
+            x.data(), rcutsq.data(), pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq), gi1, Ni))
+      return;
+  }
+#endif
+
   // create local shadow views for KOKKOS_LAMBDA to pass them into parallel_for
   auto l_ilist = d_ilist;
   auto l_x = x;
@@ -967,6 +1091,29 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::radialbasis_hermite(
     t_pod_1d l_rbf, t_pod_1d l_drbf, t_pod_1d l_rij, t_pod_1i ti, t_pod_1i tj, int N)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT)) {
+      // with use_bspline == 0 the 2-body descriptors are computed in the same pass
+      const bool fuse = !use_bspline && (nelements * nrbf2 <= 256);
+      if (fuse) {
+        d2_fused = PODHIP::launch(PODHIP::radialbasis_hermite_kernel<KK_FLOAT, KK_ACC_FLOAT, true>,
+            ni, 64, 0, Kokkos::HIP().hip_stream(), l_rbf.data(), l_drbf.data(), l_rij.data(),
+            ti.data(), tj.data(), hermite_r0.data(), hermite_invdr.data(),
+            rbf_hermite_coeffs.data(), nelements, nhermite_bins, nrbfmax, N, numij.data(),
+            bd.data(), nrbf2, ni);
+        if (d2_fused) return;
+      }
+      if (PODHIP::launch(PODHIP::radialbasis_hermite_kernel<KK_FLOAT, KK_ACC_FLOAT, false>,
+            PODHIP::nblocks_for(N, 256), 256, 0, Kokkos::HIP().hip_stream(), l_rbf.data(),
+            l_drbf.data(), l_rij.data(), ti.data(), tj.data(), hermite_r0.data(),
+            hermite_invdr.data(), rbf_hermite_coeffs.data(), nelements, nhermite_bins, nrbfmax, N,
+            (const int *) nullptr, (KK_FLOAT *) nullptr, 0, 0))
+        return;
+    }
+  }
+#endif
+
   const int ne = nelements;
   const int nb = nhermite_bins;
   const int nr = nrbfmax;
@@ -1061,6 +1208,17 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
     t_pod_1d l_rbf2, t_pod_1d l_drbf2, t_pod_1d l_rij,
     t_pod_1i l_base, t_pod_1i ti, t_pod_1i tj, int N)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::radialbasis_bspline_kernel<KK_FLOAT>, PODHIP::nblocks_for(N, 256), 256,
+            0, Kokkos::HIP().hip_stream(), l_rbf2.data(), l_drbf2.data(), l_base.data(),
+            l_rij.data(), ti.data(), tj.data(), bs_r0.data(), bs_invh.data(), nelements,
+            bs_nb - 1, nrbf2 - 4, bs_ileft, N))
+      return;
+  }
+#endif
+
   const int ne   = nelements;
   const int nbm1 = bs_nb - 1;  // largest admissible bin index
   const int gmax = nrbf2 - 4;  // largest admissible base index
@@ -1266,6 +1424,17 @@ void PairPODKokkos<DeviceType>::twobody_forces(
     t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rij,
     t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::twobody_forces_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+            PODHIP::nblocks_for(Nij, 256), 256, 0, Kokkos::HIP().hip_stream(), fij.data(),
+            cb2.data(), l_drbf2.data(), l_rij.data(), (const int *) nullptr, l_idxi.data(),
+            l_tj.data(), l_nrbf2, l_nrbf2, Ni, Nij))
+      return;
+  }
+#endif
+
   Kokkos::parallel_for("twobody_forces",
     Kokkos::RangePolicy<DeviceType>(0, Nij),
     KOKKOS_LAMBDA(const int n) {
@@ -1287,6 +1456,18 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_1i l_base,
         t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    // d2 is written, not accumulated, by the native kernel; it was zeroed before
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::twobodydesc_bspline_kernel<KK_FLOAT, KK_ACC_FLOAT>, Ni, 64,
+            (size_t) nelements * l_nrbf2 * sizeof(KK_ACC_FLOAT), Kokkos::HIP().hip_stream(),
+            d2.data(), l_rbf2.data(), l_base.data(), l_tj.data(), numij.data(), nelements,
+            l_nrbf2, Ni, Nij))
+      return;
+  }
+#endif
+
   Kokkos::parallel_for("twobodydesc_bspline",
     Kokkos::RangePolicy<DeviceType>(0, Nij), KOKKOS_LAMBDA(const int n) {
       const int i0 = l_idxi(n) + Ni * (l_base(n) + l_nrbf2 * l_tj(n));
@@ -1300,6 +1481,17 @@ void PairPODKokkos<DeviceType>::twobody_forces_bspline(
     t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rij,
     t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::twobody_forces_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+            PODHIP::nblocks_for(Nij, 256), 256, 0, Kokkos::HIP().hip_stream(), fij.data(),
+            cb2.data(), l_drbf2.data(), l_rij.data(), l_base.data(), l_idxi.data(),
+            l_tj.data(), l_nrbf2, 4, Ni, Nij))
+      return;
+  }
+#endif
+
   Kokkos::parallel_for("twobody_forces_bspline",
     Kokkos::RangePolicy<DeviceType>(0, Nij), KOKKOS_LAMBDA(const int n) {
       const int ii = l_idxi(n) + Ni * (l_base(n) + l_nrbf2 * l_tj(n));
@@ -1578,6 +1770,16 @@ void PairPODKokkos<DeviceType>::allbody_forces(
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::crossdesc(t_pod_1d d12, t_pod_1d d1, t_pod_1d d2, t_pod_1i ind1, t_pod_1i ind2, int n12, int Ni)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::crossdesc_kernel<KK_FLOAT>, PODHIP::nblocks_for((long) n12 * Ni, 256),
+            256, 0, Kokkos::HIP().hip_stream(), d12.data(), d1.data(), d2.data(), ind1.data(),
+            ind2.data(), n12, Ni))
+      return;
+  }
+#endif
+
   int totalIterations = n12 * Ni;
   Kokkos::parallel_for("crossdesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
     int n = idx % Ni;
@@ -1591,6 +1793,17 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::crossdesc_reduction(t_pod_1d cb1, t_pod_1d cb2, t_pod_1d c12, t_pod_1d d1,
         t_pod_1d d2, t_pod_1i ind1, t_pod_1i ind2, int n12, int Ni)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::crossdesc_reduction_kernel<KK_FLOAT>,
+            PODHIP::nblocks_for((long) n12 * Ni, 256), 256, 0, Kokkos::HIP().hip_stream(),
+            cb1.data(), cb2.data(), c12.data(), d1.data(), d2.data(), ind1.data(), ind2.data(),
+            n12, Ni))
+      return;
+  }
+#endif
+
   int totalIterations = n12 * Ni;
   Kokkos::parallel_for("crossdesc_reduction", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
     int n = idx % Ni; // Ni
@@ -1608,6 +1821,16 @@ void PairPODKokkos<DeviceType>::crossdesc_reduction(t_pod_1d cb1, t_pod_1d cb2, 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::set_array_to_zero(t_pod_1d a, int N)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    constexpr int V = 16 / sizeof(KK_FLOAT);
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::zero_kernel<KK_FLOAT>, PODHIP::nblocks_for(N / V + 1, 256), 256, 0,
+                       Kokkos::HIP().hip_stream(), a.data(), (long) N))
+      return;
+  }
+#endif
+
   Kokkos::parallel_for("initialize_array", Kokkos::RangePolicy<DeviceType>(0,N), KOKKOS_LAMBDA(int i) {
     a(i) = 0.0;
   });
@@ -1623,6 +1846,8 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   auto d33 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4), Ni * (nl2 + nl3 + nl4 + nl33)));
   auto d34 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33), Ni * (nl2 + nl3 + nl4 + nl33 + nl34)));
   auto d44 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
+
+  d2_fused = false;
 
   if (use_hermite) {
     // Directly fills final basis rbf/drbf (Phi-orthogonalized)
@@ -1652,9 +1877,11 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
 
   if (use_bspline) radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nij);
 
-  set_array_to_zero(d2, Ni*nl2);
-  if (use_bspline) twobodydesc_bspline(d2, rbf2, bs_base, idxi, tj, nrbf2, Ni, Nij);
-  else             twobodydesc(d2, rbf2, idxi, tj, nrbf2, Ni, Nij);
+  if (!d2_fused) {
+    set_array_to_zero(d2, Ni*nl2);
+    if (use_bspline) twobodydesc_bspline(d2, rbf2, bs_base, idxi, tj, nrbf2, Ni, Nij);
+    else             twobodydesc(d2, rbf2, idxi, tj, nrbf2, Ni, Nij);
+  }
 
   if ((nl3 > 0) && (Nij>1)) {
     // with the native HIP kernels the angular basis can be computed on the fly
@@ -1681,9 +1908,9 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if (native_hip && (hip_flags & HIP_DESC) && (nl3 > 0) && (Nij > 1))
       desc_done = PODHIP::desc34<KK_FLOAT, KK_ACC_FLOAT>(
-          Kokkos::HIP().hip_stream(), d3.data(), d4.data(), sumU.data(), pc3.data(), pn3.data(),
-          p3_active.data(), pa4.data(), pb4.data(), pc4.data(), nelements, nrbf3, nabf3_active,
-          nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2));
+          Kokkos::HIP().hip_stream(), pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4, nelements, nrbf3, nabf3_active,
+                          nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2)),
+          sumU.data());
   }
 #endif
 
@@ -1711,6 +1938,16 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT) &&
+        PODHIP::launch(PODHIP::base_coefficients_kernel<KK_FLOAT>, PODHIP::nblocks_for(Ni, 256), 256,
+            0, Kokkos::HIP().hip_stream(), ei.data(), cb.data(), B.data(), coefficients.data(),
+            typeai.data(), Mdesc, nCoeffPerElement, Ni))
+      return;
+  }
+#endif
+
   auto cefs = coefficients;
   auto tyai = typeai;
   int nDes = Mdesc;
@@ -1794,6 +2031,36 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
 
   auto ks = d_ks;
   auto kn = d_kn;
+
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT)) {
+      const hipStream_t stream = Kokkos::HIP().hip_stream();
+      const PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax};
+      const bool split = (nActMax <= PODHIP::LP_KMAX);
+      const bool ok = split
+          ? (PODHIP::launch(PODHIP::localenv_pca_split_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+                 PODHIP::nblocks_for(Ni, 64), 256, 0, stream, pca.data(), ks.data(), kn.data(),
+                 B.data(), proj.data(), ledges.data(), redges.data(), tyai.data(), la, Ni) &&
+             PODHIP::launch(PODHIP::localenv_atom_split_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+                 PODHIP::nblocks_for(Ni, 64), 256, 0, stream, ei.data(), D.data(),
+                 dD_dpca.data(), U.data(), pca.data(), ks.data(), kn.data(), B.data(),
+                 cent.data(), cefs.data(), invlcut2.data(), invrcut2.data(), tyai.data(), la, Ni))
+          : (PODHIP::launch(PODHIP::localenv_pca_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+                 PODHIP::nblocks_for(Ni, 256), 256, 0, stream, pca.data(), ks.data(), kn.data(),
+                 B.data(), proj.data(), ledges.data(), redges.data(), tyai.data(), la, Ni) &&
+             PODHIP::launch(PODHIP::localenv_atom_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+                 PODHIP::nblocks_for(Ni, 256), 256, 0, stream, ei.data(), D.data(),
+                 dD_dpca.data(), U.data(), pca.data(), ks.data(), kn.data(), B.data(),
+                 cent.data(), cefs.data(), invlcut2.data(), invrcut2.data(), tyai.data(), la, Ni));
+      if (ok &&
+          PODHIP::launch(PODHIP::localenv_cb_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+              PODHIP::nblocks_for((long) Ni * nDes, 256), 256, 0, stream, cb.data(), D.data(),
+              U.data(), ks.data(), kn.data(), proj.data(), cefs.data(), tyai.data(), la, Ni))
+        return;
+    }
+  }
+#endif
 
   // 1) PCA + active cluster search
   Kokkos::parallel_for("pca_and_active_clusters",
@@ -1931,6 +2198,26 @@ void PairPODKokkos<DeviceType>::blockatom_environment_descriptors(t_pod_1d ei, t
   int nCls = nClusters;
   int nDes = Mdesc;
   int nCoeff = nCoeffPerElement;
+
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (native_hip && (hip_flags & HIP_PORT)) {
+      const hipStream_t stream = Kokkos::HIP().hip_stream();
+      const PODHIP::EnvArgs ea{nCom, nCls, nDes, nCoeff};
+      if (PODHIP::launch(PODHIP::env_pca_kernel<KK_FLOAT>, PODHIP::nblocks_for((long) Ni * nCom, 256),
+              256, 0, stream, pca.data(), B.data(), proj.data(), tyai.data(), ea, Ni) &&
+          PODHIP::launch(PODHIP::env_prob_energy_kernel<KK_FLOAT>, PODHIP::nblocks_for(Ni, 256), 256,
+              0, stream, ei.data(), P.data(), D.data(), sumD.data(), pca.data(), B.data(),
+              cent.data(), cefs.data(), tyai.data(), ea, Ni) &&
+          PODHIP::launch(PODHIP::env_cp_kernel<KK_FLOAT>, PODHIP::nblocks_for((long) Ni * nCls, 256),
+              256, 0, stream, cp.data(), B.data(), cefs.data(), tyai.data(), ea, Ni) &&
+          PODHIP::launch(PODHIP::env_cb_kernel<KK_FLOAT>, PODHIP::nblocks_for((long) Ni * nDes, 256),
+              256, 0, stream, cb.data(), P.data(), D.data(), sumD.data(), cp.data(), pca.data(),
+              cent.data(), proj.data(), cefs.data(), tyai.data(), ea, Ni))
+        return;
+    }
+  }
+#endif
 
   int totalIterations = Ni*nCom;
   Kokkos::parallel_for("pca", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
@@ -2121,6 +2408,18 @@ void PairPODKokkos<DeviceType>::tallyforce(t_pod_1d l_fij, t_pod_1i l_ai, t_pod_
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::tallyenergy(t_pod_1d l_ei, int istart, int Ni)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (hip_acc_used && !eflag_global && !eflag_atom) return;
+    if (hip_acc_used &&
+        PODHIP::launch(PODHIP::tallyenergy_kernel<KK_FLOAT, KK_ACC_FLOAT>,
+            MIN(PODHIP::nblocks_for(Ni, 256), 128), 256, 0, Kokkos::HIP().hip_stream(), hip_acc.data(),
+            eflag_atom ? d_eatom.data() : (KK_ACC_FLOAT *) nullptr, l_ei.data(), istart, Ni,
+            eflag_global ? 1 : 0))
+      return;
+  }
+#endif
+
   auto l_eatom = d_eatom;
 
   // For global energy tally
@@ -2187,6 +2486,19 @@ template<class DeviceType>
 void PairPODKokkos<DeviceType>::tallystress(
     t_pod_1d l_fij, t_pod_1d l_rij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij)
 {
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (hip_acc_used && !vflag_global && !vflag_atom) return;
+    if (hip_acc_used &&
+        PODHIP::launch(PODHIP::tallystress_kernel<KK_FLOAT, KK_ACC_FLOAT>, PODHIP::nblocks_for(Nij, 256),
+            256, 0, Kokkos::HIP().hip_stream(), hip_acc.data(),
+            vflag_atom ? d_vatom.data() : (KK_ACC_FLOAT *) nullptr, (int) d_vatom.stride(0),
+            (int) d_vatom.stride(1), l_fij.data(), l_rij.data(), l_ai.data(), l_aj.data(), Nij,
+            vflag_global ? 1 : 0))
+      return;
+  }
+#endif
+
   auto l_vatom = d_vatom;
 
   if (vflag_global) {
