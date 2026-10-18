@@ -47,7 +47,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
     leftClusterEdges(nullptr), rightClusterEdges(nullptr),
     invPcaSpan(nullptr), clusterOccupancy(nullptr),
     bd(nullptr), bdd(nullptr), pd(nullptr), pdd(nullptr),
-    pn3(nullptr), pq3(nullptr), pc3(nullptr), ps3(nullptr),
+    pn3(nullptr), pq3_m(nullptr), pq3_d(nullptr), pc3(nullptr), ps3(nullptr),
     pa4(nullptr), pb4(nullptr), pc4(nullptr),
     sumU(nullptr), forcecoeff(nullptr),
     tmpmem(nullptr), tmpint(nullptr), tmpenvmem(nullptr),
@@ -69,7 +69,7 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   hat_q = 2;
   hat_p1 = hat_p - 1;
   hat_q1 = hat_q - 1;
-  h_pq = hat_p*hat_q;
+  hat_pq = hat_p*hat_q;
   nComponents = 1;
   besseldegree = 4;
   inversedegree = 8;
@@ -143,7 +143,8 @@ EAPOD::~EAPOD()
   memory->destroy(tmpint);
   memory->destroy(tmpenvmem);
   memory->destroy(pn3);
-  memory->destroy(pq3);
+  memory->destroy(pq3_m);
+  memory->destroy(pq3_d);
   memory->destroy(pc3);
   memory->destroy(ps3);
   memory->destroy(pa4);
@@ -306,6 +307,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
         P44 = utils::inumeric(FLERR,words[1],false,lmp);
     }
   }
+  
   if (P3 < P4) error->all(FLERR,"four-body angular degree must be equal or less than three-body angular degree");
   if (P4 < P33) error->all(FLERR,"five-body angular degree must be equal or less than four-body angular degree");
   if (P4 < P34) error->all(FLERR,"six-body angular degree must be equal or less than four-body angular degree");
@@ -364,7 +366,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
 
   if (uncertaintyflag && !eapod) uncertaintyflag = false;
 
-  h_pq = hat_p * hat_q;
+  hat_pq = hat_p * hat_q;
   hat_p1 = hat_p - 1;
   hat_q1 = hat_q - 1;
 
@@ -835,7 +837,7 @@ void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, doub
     double *abfz = &temp[nt + 3*n3 + n4 + 3*n5]; // Nj*K3
     double *tm = &temp[nt + 3*n3 + n4 + 4*n5]; // 4*K3
 
-    angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
+    angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3_m, pq3_d, Nj, K3);
 
     radialangularbasis(sumU, Ux, Uy, Uz, rbf, drbf, rij,
             abf, abfx, abfy, abfz, tm, tj, Nj, K3, nrbf3, nelements);
@@ -1320,14 +1322,14 @@ double EAPOD::peratomenergyforce2(double *fij, double *rij, double *temp,
   else             twobodydesc(d2, rbf2, tj, Nj, nelements);
 
   int n3 = Nj*K3;
-  double *abf = &temp[nt]; // Nj*K3
-  double *abfx = &temp[nt + n3]; // Nj*K3
+  double *abf  = &temp[nt];        // Nj*K3
+  double *abfx = &temp[nt + n3];   // Nj*K3
   double *abfy = &temp[nt + 2*n3]; // Nj*K3
   double *abfz = &temp[nt + 3*n3]; // Nj*K3
-  double *tm = &temp[nt + 4*n3]; // 4*K3
+  double *tm   = &temp[nt + 4*n3]; //  4*K3
 
   if ((nl3 > 0) && (Nj>1)) {
-    angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3, Nj, K3);
+    angularbasis(abf, abfx, abfy, abfz, rij, tm, pq3_m, pq3_d, Nj, K3);
 
     radialangularsum(sumU, rbf, abf, tj, Nj, K3, nrbf3, nelements);
 
@@ -1528,7 +1530,6 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *x,
 
       myneighbors(rij, x, ai, aj, ti, tj, jlist, pairnumsum, atomtype, alist, i);
 
-      // many-body descriptors
       peratombase_descriptors(bd, bdd, rij, &tmpmem[3*Nj], ti, tj, Nj);
 
       for (int m=0; m<Mdesc; m++) {
@@ -2432,11 +2433,13 @@ void EAPOD::radialbasis_hermite(double *rbf, double *drbf, double *rij, int *ti,
  * @param abfz  Pointer to the derivative of the angular basis functions w.r.t. z.
  * @param rij   Pointer to the relative positions of neighboring atoms and atom i.
  * @param tm    Pointer to temporary array.
- * @param pq    Pointer to array of indices for angular basis functions.
+ * @param pq_m  Pointer to array of monomial indices for angular basis functions.
+ * @param pq_d  Pointer to array of monomial vector direction for angular basis functions.
  * @param N     Number of neighboring atoms.
  * @param K     Number of angular basis functions.
  */
-void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, double *rij, double *tm, int *pq, int N, int K)
+void EAPOD::angularbasis(double *abf, double *abfx, double *abfy, double *abfz, double *rij, double *tm,
+                         int *pq_m, int *pq_d, int N, int K)
 {
   // Scratch: value + x/y/z derivatives for current j
   double *tmx = &tm[K];
@@ -2479,8 +2482,8 @@ void EAPOD::angularbasis(double *abf,double *abfx, double *abfy,double *abfz, do
     double c, dcx, dcy, dcz;
     for (int n = 1; n < K; ++n) {
       out += N;
-      const int m = pq[n];
-      const int d = pq[n + K];
+      const int m = pq_m[n];
+      const int d = pq_d[n];
 
       const double t0  = tm[m];
       const double tx0 = tmx[m];
@@ -3021,7 +3024,8 @@ int EAPOD::estimate_temp_memory(int Nj)
   if (use_bspline) nmax4 += 8*Nj;
 
   // rbft, drbft
-  int nmax5 = 2*Nj*ns;
+  int nmax5 = 0;
+  if (!use_hermite) nmax5 = 2*Nj*ns;
 
   // abf, abfx, abfy, abfz, tm
   int nmax6 = 4*Nj*K3 + 4*K3;
@@ -3076,10 +3080,11 @@ void EAPOD::free_temp_memory()
  */
 int EAPOD::estimate_temp_memory_md(int Nj)
 {
-  int n2 = 2*Nj*nrbfmax;        // rbf, drbf for the many-body descriptors
-  if (use_bspline) n2 += 8*Nj;  // plus 4 B-spline slots for each
-  int n3 = 2*Nj*ns;             // rbft, drbft
-  int n4 = 4*Nj*K3+4*K3;        // abf, abfx, abfy, abfz, tm  
+  int n2 = 2*Nj*nrbfmax;          // rbf, drbf for the many-body descriptors
+  if (use_bspline) n2 += 8*Nj;    // plus 4 B-spline slots for each
+  int n3 = 0;
+  if (!use_hermite) n3 = 2*Nj*ns; // rbft, drbft
+  int n4 = 4*Nj*K3+4*K3;          // abf, abfx, abfy, abfz, tm
 
   int ntemp = n2 + MAX(n3, n4);
 
@@ -3594,17 +3599,18 @@ void EAPOD::init_active_angular_ranges()
  */
 void EAPOD::init3body(int Pa3)
 {
-  nabf3 = Pa3 + 1;    // Number of angular basis functions
+  nabf3 = Pa3 + 1;  // Number of angular basis functions
   K3 = npa(nabf3);  // number of monomials
 
   // Allocate memory for the coefficients, the basis functions, and the cutoff function
-  memory->create(pn3, nabf3+1, "pn3"); // array stores the number of monomials for each degree
-  memory->create(pq3, K3*2, "pq3"); // array needed for the recursive computation of the angular basis functions
-  memory->create(pc3, K3, "pc3");   // array needed for the computation of the three-body descriptors
-  memory->create(ps3, K3, "ps3");   // array for signs of monomial involution: A_k(-r) -> (-1)^(deg A_k) A_k(r)
+  memory->create(pn3, nabf3+1, "pn3");  // array stores the number of monomials for each degree
+  memory->create(pq3_m, K3, "pq3_m");   // array for the monomial index in recursive computation of the angular basis functions
+  memory->create(pq3_d, K3, "pq3_d");   // array for the direction in recursive computation of the angular basis functions
+  memory->create(pc3, K3, "pc3");       // array for the computation of the three-body descriptors
+  memory->create(ps3, K3, "ps3");       // array for signs of monomial involution: A_k(-r) -> (-1)^(deg A_k) A_k(r)
 
   // Initialize the arrays
-  init3bodyarray(pn3, pq3, pc3, ps3, Pa3);
+  init3bodyarray(pn3, pq3_m, pq3_d, pc3, ps3, Pa3);
 }
 
 /**
@@ -3630,17 +3636,16 @@ void EAPOD::init4body(int Pa4)
   init4bodyarray(pa4, pb4, pc4, Pa4);
 }
 
-void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int *ps, int Pa)
+void EAPOD::init3bodyarray(int *np, int *pq_m, int *pq_d, int *pc, int *ps, int Pa)
 {
   const int maxD = Pa + 1;
   for (int d = 0; d <= maxD; ++d) np[d] = npa(d);
-  const int K = np[maxD];
 
   // seed: monomial (0,0,0)
   ps[0] = 1;    // sign(0) = 1
-  pc[0] = 1;
-  pq[0] = 0;    // parent monomial index (unused for d=0)
-  pq[K] = 0;    // recursion direction   (unused for d=0)
+  pc[0] = 1;    // trinom(0,0,0) = 1
+  pq_m[0] = 0;  // parent monomial index (unused for d=0)
+  pq_d[0] = 0;  // recursion direction   (unused for d=0)
 
   int idx = 1;
   for (int d = 1; d < maxD; ++d) {
@@ -3655,9 +3660,9 @@ void EAPOD::init3bodyarray(int *np, int *pq, int *pc, int *ps, int Pa)
         else if (q > 0) { qq = q - 1; dir = 2; }
         else            { pp = p - 1; dir = 1; }
 
-        pq[idx]     = monomial_idx(pp, qq, rr);
-        pq[idx + K] = dir;
-        ++idx;
+        pq_m[idx] = monomial_idx(pp, qq, rr);
+        pq_d[idx] = dir;
+        idx++;
       }
     }
   }

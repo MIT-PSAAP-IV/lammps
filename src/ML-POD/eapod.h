@@ -45,7 +45,7 @@ class EAPOD : protected Pointers {
   int crossindices(int *ind1, int *ind2, int *dabf1, int nabf1, int nrbf1, int nebf1, int *dabf2,
                    int nabf2, int nrbf2, int nebf2, int dabf12, int nrbf12);
 
-  void init3bodyarray(int *np, int *pq, int *pc, int *ps, int Pa3);
+  void init3bodyarray(int *np, int *pq_m, int *pq_d, int *pc, int *ps, int Pa3);
 
   void init4bodyarray(int *pa4, int *pb4, int *pc4, int Pa4);
 
@@ -75,7 +75,7 @@ class EAPOD : protected Pointers {
   void radialPhi(double *rbf, double *drbf, double *rbft, double *drbft, int *ti, int *tj, int N);
 
   void angularbasis(double *abf, double *abfx, double *abfy, double *abfz, double *rij, double *tm,
-                    int *pq, int N, int K);
+                    int *pq_m, int *pq_d, int N, int K);
 
   void radialangularsum(double *sumU, double *rbf, double *abf, int *tj, int Nj, int K, int M, int Ne);
   
@@ -105,7 +105,7 @@ class EAPOD : protected Pointers {
   double **invrdiff;
   double rcutmax;
 
-  int nelements;    // number of elements
+  int nelements;  // number of elements
   int pbc[3];
 
   int onebody;    // one-body descriptors
@@ -137,7 +137,7 @@ class EAPOD : protected Pointers {
   //double *newcoeff ;  // coefficients
   double *tmpmem;
 
-  // environmental variables
+  // --- Variables for environment-adaptive MLIP (EA-POD)
   bool uncertaintyflag;
   bool eapod; // flag for EAPOD
   bool localeapod; // flag for Local-EAPOD
@@ -145,9 +145,15 @@ class EAPOD : protected Pointers {
   int clusterSearchBox; // Range to search for active clusters around centroids
   int nMaxActiveClusters; // maximum (possible) number of active clusters
   int nComponents;    // number of principal components
-  //int nNeighbors; // numbe of neighbors
   int Mdesc;    // number of base descriptors
   double nActiveClusters; // average number of active clusters
+  int nproj;         // number of elements in projection matrix (nComponents * Mdesc * nelements)
+  int ncentroids;    // number of centroids (nComponents * nClusters * nelements)
+  int hat_p;   // order of hat basis function (cluster)
+  int hat_q;   // order of hat function (cluster)
+  int hat_p1;  // order-1 of hat basis function (cluster)
+  int hat_q1;  // order-1 of hat function (cluster)
+  int hat_pq;  // hat_p*hat_q
 
   double *Proj;         // PCA Projection matrix
   double *Centroids;    // centroids of the clusters
@@ -166,14 +172,7 @@ class EAPOD : protected Pointers {
   double *forcecoeff;   // [Ne*K3*nrbf3]
   double *tmpenvmem;    // [2*nMaxActiveClusters || 3*nClusters + nComponents]
 
-  int nproj;         // number of elements in projection matrix (nComponents * Mdesc * nelements)
-  int ncentroids;    // number of centroids (nComponents * nClusters * nelements)
-
-  int hat_p;   // order of hat basis function (cluster)
-  int hat_q;   // order of hat function (cluster)
-  int hat_p1;
-  int hat_q1;
-  int h_pq;
+  
 
   int Njmax;
   int nCoeffPerElement;    // number of coefficients per element = (nl1 + Mdesc*nClusters)
@@ -182,15 +181,15 @@ class EAPOD : protected Pointers {
   int ns;           // number of snapshots for Bessel radial basis functions
   int nrbfmax;      // number of orthogonal radial basis functions to keep (<=ns)
 
-  int nd1, nd2, nd3, nd4, nd;    // number of global descriptors
-  int nl1, nl2, nl3, nl4, nl;    // number of local descriptors
-  int nrbf2, nrbf3, nrbf4;       // number of radial basis functions
-  int nabf3, nabf4;              // number of angular basis functions
-  int P3, P4;                    // angular polynomial degrees
-  int K3, K4, Q4;                // number of monomials
-  int *pn3, *pq3, *pc3;          // arrays to compute 3-body angular basis functions
-  int *pa4, *pb4, *pc4;          // arrays to compute 4-body angular basis functions
-  int *ps3;                      // [K3] sign_k of monomial A_k for graded involution
+  int nd1, nd2, nd3, nd4, nd;     // number of global descriptors
+  int nl1, nl2, nl3, nl4, nl;     // number of local descriptors
+  int nrbf2, nrbf3, nrbf4;        // number of radial basis functions
+  int nabf3, nabf4;               // number of angular basis functions
+  int P3, P4;                     // angular polynomial degrees
+  int K3, K4, Q4;                 // number of monomials
+  int *pn3, *pq3_m, *pq3_d, *pc3; // arrays to compute 3-body angular basis functions
+  int *pa4, *pb4, *pc4;           // arrays to compute 4-body angular basis functions
+  int *ps3;                       // [K3] sign_k of monomial A_k for graded involution
   int *tmpint;
   int nintmem;    // number of integers in tmpint array
   int ndblmem;    // number of doubles in tmpmem array
@@ -247,6 +246,7 @@ class EAPOD : protected Pointers {
   static inline int fourbody_channels(int Pa, int *pa, int *deg);
 
   void snapshots(double *rbf, double *xij, double rin, double rmax, int N);
+  
   void init_active_angular_ranges();
 
   static inline void cutoff_exp(double r, double invrmax, double e_v, double &fcut, double &dfcut);
