@@ -101,6 +101,11 @@ class PairPODKokkos : public PairPOD {
   bool d2_fused;           // true if the 2-body descriptors of the block are already computed
   bool rbf_deferred;       // true if rbf/drbf of the block are not computed (yet)
   bool bs_deferred;        // true if rbf2/drbf2/bs_base of the block are not computed (yet)
+
+  // maximum neighbor count of the current neighbor list, reused until the next build
+  int mn_value, mn_inum;
+  bigint mn_ncalls;
+  NeighList *mn_list;
   t_pod_1i hip_iscratch;   // scratch for the native neighbor kernels
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
 

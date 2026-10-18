@@ -1101,9 +1101,20 @@ __global__ void __launch_bounds__(64)
 
 static constexpr int MFMA_MAX_CS = 8;    // nelements * nrbf3 <= 32
 static constexpr int MFMA_PAIR_TILE = 16;
+// register budget of the matrix core force kernel.  without it the compiler keeps the
+// accumulators in separate AGPRs (123 VGPRs + 16 AGPRs, 3 waves/SIMD); with the budget
+// they share the VGPRs (123 in total, no spills, 4 waves/SIMD)
+#ifndef LMP_POD_ALLBODY_VGPR
+#define LMP_POD_ALLBODY_VGPR 128
+#endif
+#if LMP_POD_ALLBODY_VGPR > 0
+#define LMP_POD_ALLBODY_ATTR __attribute__((amdgpu_num_vgpr(LMP_POD_ALLBODY_VGPR)))
+#else
+#define LMP_POD_ALLBODY_ATTR
+#endif
 
 template <typename T, typename TA, int CSM, int JT>
-__global__ void __launch_bounds__(64)
+__global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     allbody_forces_mfma_kernel(T *__restrict__ fij, const T *__restrict__ forcecoeff,
                                const RadialSrc<T> rs, const T *__restrict__ rij, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int *__restrict__ pq_m,
@@ -1216,15 +1227,17 @@ __global__ void __launch_bounds__(64)
           SV[v] += __shfl_xor(SV[v], off);
           SW[v] += __shfl_xor(SW[v], off);
         }
-      if (lr == 0) {
-#pragma unroll
-        for (int v = 0; v < 4; v++) {
-          const int jj = s0 + Mfma<TA>::row(lane, v);
-          if (jj < nt) {
-            T g[9];
-            pod_pair_gradients<T>(g, rij, start + j0 + jj);
-            pod_pair_force<T, TA>(fij, g, start + j0 + jj, SA[v], SU[v], SV[v], SW[v]);
-          }
+      // lanes lr = 0..3 of a row group add the forces of rows v = lr
+      if (lr < 4) {
+        const int jj = s0 + Mfma<TA>::row(lane, lr);
+        if (jj < nt) {
+          const TA sa = (lr == 0) ? SA[0] : ((lr == 1) ? SA[1] : ((lr == 2) ? SA[2] : SA[3]));
+          const TA su = (lr == 0) ? SU[0] : ((lr == 1) ? SU[1] : ((lr == 2) ? SU[2] : SU[3]));
+          const TA sv = (lr == 0) ? SV[0] : ((lr == 1) ? SV[1] : ((lr == 2) ? SV[2] : SV[3]));
+          const TA sw = (lr == 0) ? SW[0] : ((lr == 1) ? SW[1] : ((lr == 2) ? SW[2] : SW[3]));
+          T g[9];
+          pod_pair_gradients<T>(g, rij, start + j0 + jj);
+          pod_pair_force<T, TA>(fij, g, start + j0 + jj, sa, su, sv, sw);
         }
       }
     }

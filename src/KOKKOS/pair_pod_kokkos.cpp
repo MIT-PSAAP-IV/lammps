@@ -183,6 +183,10 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
+  mn_value = -1;
+  mn_ncalls = -1;
+  mn_list = nullptr;
+  mn_inum = -1;
   env = getenv("LAMMPS_POD_HIP_FLAGS");
   if (env) hip_flags = atoi(env);
   hip_jtile = 16;
@@ -416,9 +420,20 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
 #ifdef KOKKOS_ENABLE_HIP
     if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
       if (native_hip && (hip_flags & HIP_PORT)) {
-        if ((int) hip_iscratch.extent(0) < 1) MemKK::realloc_kokkos(hip_iscratch, "pair_pod:hip_iscratch", 1024);
-        maxneighs = PODHIP::max_neighs(Kokkos::HIP().hip_stream(), hip_iscratch.data(),
-                                       d_ilist.data(), d_numneigh.data(), inum);
+        // the neighbor counts change only when the list is rebuilt, so the maximum is reused
+        // (saving a reduction and a wait for the GPU) until the next build
+        if ((neighbor->ago != 0) && (neighbor->ncalls == mn_ncalls) && (list == mn_list) &&
+            (inum == mn_inum) && (mn_value >= 0)) {
+          maxneighs = mn_value;
+        } else {
+          if ((int) hip_iscratch.extent(0) < 1) MemKK::realloc_kokkos(hip_iscratch, "pair_pod:hip_iscratch", 1024);
+          maxneighs = PODHIP::max_neighs(Kokkos::HIP().hip_stream(), hip_iscratch.data(),
+                                         d_ilist.data(), d_numneigh.data(), inum);
+          mn_value = maxneighs;
+          mn_ncalls = neighbor->ncalls;
+          mn_list = list;
+          mn_inum = inum;
+        }
       }
     }
 #endif
