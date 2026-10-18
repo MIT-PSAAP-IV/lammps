@@ -50,7 +50,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_MFMA_FORCE = 8,      // matrix cores for the force coefficient products
        HIP_DESC = 16,           // fused 3- and 4-body descriptors
        HIP_TALLY = 32,          // per-atom reductions in the force tally and 2-body descriptors
-       HIP_PORT = 64 };         // native versions of all other kernels
+       HIP_PORT = 64,           // native versions of all other kernels
+       HIP_FUSE = 128 };        // radial Hermite spline evaluated inside its consumers
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -103,6 +104,48 @@ PODHIP::DescArgs<KK_FLOAT> pod_desc_args(const VD &d3, const VD &d4, const VI &p
   g.do4 = do4 ? 1 : 0;
   return g;
 }
+
+// radial functions of the native many-body kernels: the stored rbf/drbf, or with
+// hermite == true the radial Hermite spline table, evaluated by the kernels themselves
+template <class VD, class VI>
+PODHIP::RadialSrc<KK_FLOAT> pod_radial_src(bool hermite, const VD &rbf, const VD &drbf,
+                                           const VD &coef, const VD &r0, const VD &invdr,
+                                           const VI &ti, const VI &tj, int nelements, int nbins,
+                                           int nrbfmax, int Nij)
+{
+  PODHIP::RadialSrc<KK_FLOAT> s;
+  s.rbf = rbf.data();
+  s.drbf = drbf.data();
+  s.coef = hermite ? coef.data() : nullptr;
+  s.r0v = r0.data();
+  s.invdrv = invdr.data();
+  s.ti = ti.data();
+  s.tj = tj.data();
+  s.ne = nelements;
+  s.nb = nbins;
+  s.nr = nrbfmax;
+  s.Nij = Nij;
+  return s;
+}
+
+// B-spline radial basis of the 2-body terms; with otf == false the kernels read the
+// stored rbf2/drbf2/bs_base instead
+template <class VD, class VI>
+PODHIP::BsplineArgs<KK_FLOAT> pod_bspline_args(bool otf, const VD &r0, const VD &invh,
+                                               const VI &ti, const VI &tj, int nelements,
+                                               int nbins, int nrbf2, int ileft)
+{
+  PODHIP::BsplineArgs<KK_FLOAT> g;
+  g.r0v = otf ? r0.data() : nullptr;
+  g.invhv = invh.data();
+  g.ti = ti.data();
+  g.tj = tj.data();
+  g.ne = nelements;
+  g.nbm1 = nbins - 1;    // largest admissible bin index
+  g.gmax = nrbf2 - 4;    // largest admissible base index
+  g.ish = ileft;         // 0 if left open, 3 if clamped
+  return g;
+}
 }    // namespace
 #endif
 
@@ -135,8 +178,11 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   native_hip = 1;
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
-  hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT;
+  hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
+      HIP_FUSE;
   angular_otf = false;
+  rbf_deferred = false;
+  bs_deferred = false;
   env = getenv("LAMMPS_POD_HIP_FLAGS");
   if (env) hip_flags = atoi(env);
   hip_jtile = 16;
@@ -1167,6 +1213,24 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
 }
 
 template<class DeviceType>
+void PairPODKokkos<DeviceType>::ensure_rbf(int N)
+{
+  // computes the Hermite radial basis that was deferred in blockatom_base_descriptors()
+  if (!rbf_deferred) return;
+  rbf_deferred = false;
+  radialbasis_hermite(rbf, drbf, rij, ti, tj, N);
+}
+
+template<class DeviceType>
+void PairPODKokkos<DeviceType>::ensure_bspline(int N)
+{
+  // computes the B-spline radial basis that was deferred in blockatom_base_descriptors()
+  if (!bs_deferred) return;
+  bs_deferred = false;
+  radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, N);
+}
+
+template<class DeviceType>
 KOKKOS_INLINE_FUNCTION
 void PairPODKokkos<DeviceType>::bspline4(const KK_FLOAT t, const KK_FLOAT dscale,
     KK_FLOAT &B0,  KK_FLOAT &B1,  KK_FLOAT &B2,  KK_FLOAT &B3,
@@ -1213,8 +1277,8 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
     if (native_hip && (hip_flags & HIP_PORT) &&
         PODHIP::launch(PODHIP::radialbasis_bspline_kernel<KK_FLOAT>, PODHIP::nblocks_for(N, 256), 256,
             0, Kokkos::HIP().hip_stream(), l_rbf2.data(), l_drbf2.data(), l_base.data(),
-            l_rij.data(), ti.data(), tj.data(), bs_r0.data(), bs_invh.data(), nelements,
-            bs_nb - 1, nrbf2 - 4, bs_ileft, N))
+            l_rij.data(), pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2,
+                                           bs_ileft), N))
       return;
   }
 #endif
@@ -1430,7 +1494,7 @@ void PairPODKokkos<DeviceType>::twobody_forces(
         PODHIP::launch(PODHIP::twobody_forces_kernel<KK_FLOAT, KK_ACC_FLOAT>,
             PODHIP::nblocks_for(Nij, 256), 256, 0, Kokkos::HIP().hip_stream(), fij.data(),
             cb2.data(), l_drbf2.data(), l_rij.data(), (const int *) nullptr, l_idxi.data(),
-            l_tj.data(), l_nrbf2, l_nrbf2, Ni, Nij))
+            l_tj.data(), l_nrbf2, l_nrbf2, Ni, Nij, PODHIP::BsplineArgs<KK_FLOAT>{}))
       return;
   }
 #endif
@@ -1463,10 +1527,13 @@ void PairPODKokkos<DeviceType>::twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2
         PODHIP::launch(PODHIP::twobodydesc_bspline_kernel<KK_FLOAT, KK_ACC_FLOAT>, Ni, 64,
             (size_t) nelements * l_nrbf2 * sizeof(KK_ACC_FLOAT), Kokkos::HIP().hip_stream(),
             d2.data(), l_rbf2.data(), l_base.data(), l_tj.data(), numij.data(), nelements,
-            l_nrbf2, Ni, Nij))
+            l_nrbf2, Ni, Nij, pod_bspline_args(bs_deferred, bs_r0, bs_invh, ti, l_tj, nelements,
+                                               bs_nb, l_nrbf2, bs_ileft), rij.data()))
       return;
   }
 #endif
+
+  ensure_bspline(Nij);
 
   Kokkos::parallel_for("twobodydesc_bspline",
     Kokkos::RangePolicy<DeviceType>(0, Nij), KOKKOS_LAMBDA(const int n) {
@@ -1487,10 +1554,14 @@ void PairPODKokkos<DeviceType>::twobody_forces_bspline(
         PODHIP::launch(PODHIP::twobody_forces_kernel<KK_FLOAT, KK_ACC_FLOAT>,
             PODHIP::nblocks_for(Nij, 256), 256, 0, Kokkos::HIP().hip_stream(), fij.data(),
             cb2.data(), l_drbf2.data(), l_rij.data(), l_base.data(), l_idxi.data(),
-            l_tj.data(), l_nrbf2, 4, Ni, Nij))
+            l_tj.data(), l_nrbf2, 4, Ni, Nij,
+            pod_bspline_args(bs_deferred, bs_r0, bs_invh, ti, l_tj, nelements, bs_nb, l_nrbf2,
+                             bs_ileft)))
       return;
   }
 #endif
+
+  ensure_bspline(Nij);
 
   Kokkos::parallel_for("twobody_forces_bspline",
     Kokkos::RangePolicy<DeviceType>(0, Nij), KOKKOS_LAMBDA(const int n) {
@@ -1849,9 +1920,18 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
 
   d2_fused = false;
 
+  rbf_deferred = false;
   if (use_hermite) {
+#ifdef KOKKOS_ENABLE_HIP
+    // the native many-body kernels evaluate the Hermite spline of a pair when they need it.
+    // with B-splines for the 2-body terms nothing else reads rbf/drbf, so they are only
+    // computed (by ensure_rbf()) if one of those kernels falls back to a stored basis.
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>)
+      rbf_deferred = native_hip && (hip_flags & HIP_FUSE) && (hip_flags & HIP_ANGULAR) &&
+          (hip_flags & HIP_PORT) && use_bspline && (abf_degree >= 0);
+#endif
     // Directly fills final basis rbf/drbf (Phi-orthogonalized)
-    radialbasis_hermite(rbf, drbf, rij, ti, tj, Nij);
+    if (!rbf_deferred) radialbasis_hermite(rbf, drbf, rij, ti, tj, Nij);
   } else {
     // Original analytic path
     bool done = false;
@@ -1875,7 +1955,16 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     }
   }
 
-  if (use_bspline) radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nij);
+  bs_deferred = false;
+  if (use_bspline) {
+#ifdef KOKKOS_ENABLE_HIP
+    // the native 2-body kernels evaluate the B-splines of a pair themselves; the basis is
+    // only stored (by ensure_bspline()) if one of them falls back to the portable version
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>)
+      bs_deferred = native_hip && (hip_flags & HIP_FUSE) && (hip_flags & HIP_PORT);
+#endif
+    if (!bs_deferred) radialbasis_bspline(rbf2, drbf2, rij, bs_base, ti, tj, Nij);
+  }
 
   if (!d2_fused) {
     set_array_to_zero(d2, Ni*nl2);
@@ -1889,14 +1978,18 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     angular_otf = false;
 #ifdef KOKKOS_ENABLE_HIP
     if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
-      if (native_hip && (hip_flags & HIP_ANGULAR) && (abf_degree >= 0))
+      if (native_hip && (hip_flags & HIP_ANGULAR) && (abf_degree >= 0)) {
+        const auto rsrc = pod_radial_src(rbf_deferred, rbf, drbf, rbf_hermite_coeffs, hermite_r0,
+                                         hermite_invdr, ti, tj, nelements, nhermite_bins, nrbfmax, Nij);
         angular_otf = PODHIP::radialangularsum_otf<KK_FLOAT, KK_ACC_FLOAT>(
-            Kokkos::HIP().hip_stream(), sumU.data(), rbf.data(), rij.data(), tj.data(),
+            Kokkos::HIP().hip_stream(), sumU.data(), rsrc, rij.data(), tj.data(),
             numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
             (hip_flags & HIP_MFMA) != 0, hip_jtile);
+      }
     }
 #endif
     if (!angular_otf) {
+      ensure_rbf(Nij);
       angularbasis(abf, abfx, abfy, abfz, rij, pq_m, pq_d, K3, Nij);
 
       radialangularsum(sumU, rbf, abf, tj, numij, nelements, nrbf3, K3, Ni, Nij);
@@ -2361,15 +2454,19 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
     bool done = false;
 #ifdef KOKKOS_ENABLE_HIP
     if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
-      if (angular_otf)
+      if (angular_otf) {
+        const auto rsrc = pod_radial_src(rbf_deferred, rbf, drbf, rbf_hermite_coeffs, hermite_r0,
+                                         hermite_invdr, ti, tj, nelements, nhermite_bins, nrbfmax, Nij);
         done = PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
-            Kokkos::HIP().hip_stream(), l_fij.data(), forcecoeff.data(), rbf.data(), drbf.data(),
+            Kokkos::HIP().hip_stream(), l_fij.data(), forcecoeff.data(), rsrc,
             rij.data(), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3,
             K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0);
+      }
       // the angular basis was not stored; compute it now for the portable kernel
       if (angular_otf && !done) angularbasis(abf, abfx, abfy, abfz, rij, pq_m, pq_d, K3, Nij);
     }
 #endif
+    if (!done) ensure_rbf(Nij);
     if (!done) allbody_forces(l_fij, forcecoeff, rbf, drbf, rij, abf, abfx, abfy, abfz,
           idxi, tj, nelements, nrbf3, K3, Nij);
   }

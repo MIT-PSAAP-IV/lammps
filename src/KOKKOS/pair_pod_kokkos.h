@@ -99,6 +99,8 @@ class PairPODKokkos : public PairPOD {
   bool angular_otf;        // true if the angular basis of the current block was not stored
   bool hip_acc_used;       // true if global energy/virial are accumulated in hip_acc
   bool d2_fused;           // true if the 2-body descriptors of the block are already computed
+  bool rbf_deferred;       // true if rbf/drbf of the block are not computed (yet)
+  bool bs_deferred;        // true if rbf2/drbf2/bs_base of the block are not computed (yet)
   t_pod_1i hip_iscratch;   // scratch for the native neighbor kernels
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
 
@@ -237,6 +239,8 @@ class PairPODKokkos : public PairPOD {
                  t_pod_1d rbf, t_pod_1d drbf, int Nij, int ns, int nrbfmax);
 
   void radialbasis_hermite(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rij, t_pod_1i ti, t_pod_1i tj, int N);
+  void ensure_rbf(int N);
+  void ensure_bspline(int N);
 
   void radialbasis_bspline(t_pod_1d l_rbf2, t_pod_1d l_drbf2, t_pod_1d l_rij,
                            t_pod_1i l_base, t_pod_1i ti, t_pod_1i tj, int N);
