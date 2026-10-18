@@ -770,7 +770,8 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
    powers.
 ------------------------------------------------------------------------- */
 
-template <typename T, typename TA>
+// RTM x CTM output tiles (RTM >= ceil(K3/16), CTM >= ceil(Ne*nrbf3/16)) are kept in registers
+template <typename T, typename TA, int RTM, int CTM>
 __global__ void __launch_bounds__(64)
     radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
                                  const T *__restrict__ rij, const int *__restrict__ tj,
@@ -782,8 +783,9 @@ __global__ void __launch_bounds__(64)
   extern __shared__ char lds_raw[];
   const int L1 = L + 1;
   T *pow_s = reinterpret_cast<T *>(lds_raw);      // [jtile][3][L1]
-  T *rbf_s = pow_s + jtile * 3 * L1;              // [nrbf3][jtile]
-  int *tj_s = reinterpret_cast<int *>(rbf_s + nrbf3 * jtile);    // [jtile]
+  const int ldr = jtile + 1;                      // padded row: functions m of a pair in different banks
+  T *rbf_s = pow_s + jtile * 3 * L1;              // [nrbf3][ldr]
+  int *tj_s = reinterpret_cast<int *>(rbf_s + nrbf3 * ldr);    // [jtile]
   int *ex_s = tj_s + jtile;                                      // [K3] packed a | b<<8 | c<<16
 
   const int i = blockIdx.x;
@@ -803,29 +805,29 @@ __global__ void __launch_bounds__(64)
 
   // exponents of the A rows owned by this lane (offsets into pow_s), and the
   // (m, e) of the B columns owned by this lane
-  int oa[MFMA_MAX_RT], ob[MFMA_MAX_RT], oc[MFMA_MAX_RT];
+  int oa[RTM], ob[RTM], oc[RTM];
 #pragma unroll
-  for (int rt = 0; rt < MFMA_MAX_RT; rt++) {
+  for (int rt = 0; rt < RTM; rt++) {
     const int k = rt * 16 + lr;
     const int ex = (k < K3) ? ex_s[k] : 0;
     oa[rt] = ex & 255;
     ob[rt] = L1 + ((ex >> 8) & 255);
     oc[rt] = 2 * L1 + ((ex >> 16) & 255);
   }
-  int bm[MFMA_MAX_CT], be[MFMA_MAX_CT];
+  int bm[CTM], be[CTM];
 #pragma unroll
-  for (int ct = 0; ct < MFMA_MAX_CT; ct++) {
+  for (int ct = 0; ct < CTM; ct++) {
     const int c = ct * 16 + lr;
     bm[ct] = (c < NC) ? c % nrbf3 : -1;
     be[ct] = (c < NC) ? c / nrbf3 : -1;
   }
 
   typedef typename Mfma<TA>::acc_t acc_t;
-  acc_t acc[MFMA_MAX_RT][MFMA_MAX_CT];
+  acc_t acc[RTM][CTM];
 #pragma unroll
-  for (int rt = 0; rt < MFMA_MAX_RT; rt++)
+  for (int rt = 0; rt < RTM; rt++)
 #pragma unroll
-    for (int ct = 0; ct < MFMA_MAX_CT; ct++) acc[rt][ct] = acc_t{0, 0, 0, 0};
+    for (int ct = 0; ct < CTM; ct++) acc[rt][ct] = acc_t{0, 0, 0, 0};
 
   for (int j0 = 0; j0 < nj; j0 += jtile) {
     const int nt = min(jtile, nj - j0);
@@ -849,11 +851,11 @@ __global__ void __launch_bounds__(64)
           pv *= v;
           pz *= w;
         }
-        pair_radial<0>(rs, rij, j, nrbf3, [&](int m, T f, T) { rbf_s[m * jtile + jj] = f; });
+        pair_radial<0>(rs, rij, j, nrbf3, [&](int m, T f, T) { rbf_s[m * ldr + jj] = f; });
         tj_s[jj] = (nelements > 1) ? tj[j] : 0;
       } else {
         for (int n = 0; n < 3 * L1; n++) pw[n] = T(0);
-        for (int m = 0; m < nrbf3; m++) rbf_s[m * jtile + jj] = T(0);
+        for (int m = 0; m < nrbf3; m++) rbf_s[m * ldr + jj] = T(0);
         tj_s[jj] = -1;
       }
     }
@@ -863,28 +865,28 @@ __global__ void __launch_bounds__(64)
       const int jj = q + lq;
       const T *pw = pow_s + jj * 3 * L1;
       const int tjj = tj_s[jj];
-      TA a[MFMA_MAX_RT], b[MFMA_MAX_CT];
+      TA a[RTM], b[CTM];
 #pragma unroll
-      for (int rt = 0; rt < MFMA_MAX_RT; rt++)
+      for (int rt = 0; rt < RTM; rt++)
         a[rt] = (rt * 16 + lr < K3) ? static_cast<TA>(pw[oa[rt]] * pw[ob[rt]] * pw[oc[rt]])
                                     : TA(0);
 #pragma unroll
-      for (int ct = 0; ct < MFMA_MAX_CT; ct++)
-        b[ct] = ((bm[ct] >= 0) && (be[ct] == tjj)) ? static_cast<TA>(rbf_s[bm[ct] * jtile + jj])
+      for (int ct = 0; ct < CTM; ct++)
+        b[ct] = ((bm[ct] >= 0) && (be[ct] == tjj)) ? static_cast<TA>(rbf_s[bm[ct] * ldr + jj])
                                                    : TA(0);
 #pragma unroll
-      for (int rt = 0; rt < MFMA_MAX_RT; rt++)
+      for (int rt = 0; rt < RTM; rt++)
         if (rt < RT)
 #pragma unroll
-          for (int ct = 0; ct < MFMA_MAX_CT; ct++)
+          for (int ct = 0; ct < CTM; ct++)
             if (ct < CT) acc[rt][ct] = Mfma<TA>::mma(a[rt], b[ct], acc[rt][ct]);
     }
   }
 
 #pragma unroll
-  for (int rt = 0; rt < MFMA_MAX_RT; rt++)
+  for (int rt = 0; rt < RTM; rt++)
 #pragma unroll
-    for (int ct = 0; ct < MFMA_MAX_CT; ct++)
+    for (int ct = 0; ct < CTM; ct++)
 #pragma unroll
       for (int v = 0; v < 4; v++) {
         const int k = rt * 16 + Mfma<TA>::row(lane, v);
@@ -918,11 +920,25 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     int L = 0;
     while ((L + 1) * (L + 2) * (L + 3) / 6 < K3) L++;
     if ((L + 1) * (L + 2) * (L + 3) / 6 != K3) return false;
-    const size_t lds2 = (size_t) (3 * (L + 1) + nrbf3) * jtile * sizeof(T) +
+    const size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
         ((size_t) jtile + K3) * sizeof(int);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA>), dim3(Ni),
-                       dim3(threads), lds2, stream, sumU, rs, rij, tj, numij, pq_m, pq_d,
-                       nelements, nrbf3, K3, L, Nij, jtile);
+    const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
+#define LMP_POD_RAS_MFMA(R, C)                                                                   \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C>), dim3(Ni),      \
+                     dim3(threads), lds2, stream, sumU, rs, rij, tj, numij, pq_m, pq_d,        \
+                     nelements, nrbf3, K3, L, Nij, jtile)
+    if (CT == 1) {
+      if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
+      else if (RT == 2) LMP_POD_RAS_MFMA(2, 1);
+      else if (RT == 3) LMP_POD_RAS_MFMA(3, 1);
+      else LMP_POD_RAS_MFMA(4, 1);
+    } else {
+      if (RT == 1) LMP_POD_RAS_MFMA(1, 2);
+      else if (RT == 2) LMP_POD_RAS_MFMA(2, 2);
+      else if (RT == 3) LMP_POD_RAS_MFMA(3, 2);
+      else LMP_POD_RAS_MFMA(4, 2);
+    }
+#undef LMP_POD_RAS_MFMA
   } else
     hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_otf_kernel<T, TA>), dim3(Ni),
                        dim3(threads), lds, stream, sumU, rs, rij, tj, numij, pq_m, pq_d,
