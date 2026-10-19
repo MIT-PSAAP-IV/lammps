@@ -462,6 +462,43 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg,
   }
 }
 
+// the radial functions of one pair, evaluated one m at a time: the Hermite bin of the
+// pair is found once, or the stored rbf/drbf are read
+template <typename T> struct PairRadial {
+  const T *c;    // Hermite coefficients of the bin, [m][4]; nullptr: stored rbf/drbf
+  T t, s;        // position in the bin and d(t)/dr / r
+  const T *rbf, *drbf;
+  int j, Nij;
+
+  __device__ PairRadial(const RadialSrc<T> &rs, const PairGeom<T> &pg, const int jj) :
+      c(nullptr), t(T(0)), s(T(0)), rbf(rs.rbf), drbf(rs.drbf), j(jj), Nij(rs.Nij)
+  {
+    if (rs.coef == nullptr) return;
+    const int pair = rs.ti[j] * rs.ne + rs.tj[j];
+    const T r = pg.r(j);
+    const T invdr = rs.invdrv[pair];
+    const T tg = (r - rs.r0v[pair]) * invdr;
+    int b = (int) tg;
+    if (b < 0) b = 0;
+    else if (b > rs.nb - 1) b = rs.nb - 1;
+    t = tg - (T) b;
+    s = invdr / r;
+    c = rs.coef + ((size_t) pair * (size_t) rs.nb + (size_t) b) * (size_t) rs.nr * 4ull;
+  }
+
+  __device__ void operator()(const int m, T &f, T &df) const
+  {
+    if (c == nullptr) {
+      f = rbf[j + Nij * m];
+      df = drbf ? drbf[j + Nij * m] : T(0);
+      return;
+    }
+    const T *cm = c + 4 * m;
+    f = cm[0] + t * (cm[1] + t * (cm[2] + t * cm[3]));
+    df = (cm[1] + t * (static_cast<T>(2.0) * cm[2] + static_cast<T>(3.0) * cm[3] * t)) * s;
+  }
+};
+
 template <typename T, typename TA>
 __global__ void radialangularsum_otf_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
                                             const PairGeom<T> pg,
@@ -1095,20 +1132,21 @@ __global__ void __launch_bounds__(64)
 /* ----------------------------------------------------------------------
    matrix core version: one wavefront per atom i.  for a tile of 16 pairs,
 
-     G (16 x K3) = R (16 x Ne*nrbf3) * F (Ne*nrbf3 x K3)
+     G^T (K3 x 16) = F^T (K3 x Ne*nrbf3) * R^T (Ne*nrbf3 x 16)
 
    with R(j, m + nrbf3*e) = [tj(j) == e] rbf(j, m) and F the forcecoeff
    block of atom i (H likewise with drbf), in 16x16 output tiles.  each lane
-   then holds G and H for 4 pairs and one angular index k, multiplies them
-   with P_k and its derivatives, and SA, SU, SV, SW of a pair are reduced
-   across the 16 lanes that hold its row.
+   holds G and H for one pair (its column) and 4 angular indices k, so it
+   accumulates SA, SU, SV, SW of that pair over its own k, and only the 4
+   lanes that share the column are reduced.  the lanes evaluate the radial
+   functions of their own entries of R, so only the powers of u, v, w go
+   through LDS.
 ------------------------------------------------------------------------- */
 
 static constexpr int MFMA_MAX_CS = 8;    // nelements * nrbf3 <= 32
 static constexpr int MFMA_PAIR_TILE = 16;
-// register budget of the matrix core force kernel.  without it the compiler keeps the
-// accumulators in separate AGPRs (123 VGPRs + 16 AGPRs, 3 waves/SIMD); with the budget
-// they share the VGPRs (123 in total, no spills, 4 waves/SIMD)
+// register budget of the matrix core force kernel: without it the compiler keeps the
+// accumulators in separate AGPRs, which costs occupancy
 #ifndef LMP_POD_ALLBODY_VGPR
 #define LMP_POD_ALLBODY_VGPR 128
 #endif
@@ -1136,10 +1174,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   const int KT = (K3 + 15) / 16;
   extern __shared__ char lds_raw[];
   T *fc_s = reinterpret_cast<T *>(lds_raw);    // [m][k][e]
-  T *pd_s = fc_s + nfc;                        // [JT][PD]
-  T *r_s = pd_s + JT * PD;                     // [nrbf3][JT]
-  T *dr_s = r_s + nrbf3 * JT;                  // [nrbf3][JT]
-  int *tj_s = reinterpret_cast<int *>(dr_s + nrbf3 * JT);    // [JT]
+  T *pd_s = fc_s + nfc;                                      // [JT][PD]
+  int *tj_s = reinterpret_cast<int *>(pd_s + JT * PD);       // [JT]
   int *ex_s = tj_s + JT;                                     // [K3]
 
   const int i = blockIdx.x;
@@ -1166,39 +1202,51 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   for (int j0 = 0; j0 < nj; j0 += JT) {
     const int nt = min(JT, nj - j0);
     __syncthreads();
-    for (int jj = lane; jj < JT; jj += 64) {
-      T *pd = pd_s + jj * PD;
+    // powers of u, v and w of the pairs of the tile, one direction per lane
+    for (int t = lane; t < 3 * JT; t += 64) {
+      const int jj = t % JT, d = t / JT;
+      T *pd = pd_s + jj * PD + d * L1;
       if (jj < nt) {
         const int j = start + j0 + jj;
-        pod_pair_powers<T>(pd, pg, j, L1);
-        pair_radial<0>(rs, pg, j, nrbf3, [&](int m, T f, T df) {
-          r_s[m * JT + jj] = f;
-          dr_s[m * JT + jj] = df;
-        });
-        tj_s[jj] = (nelements > 1) ? tj[j] : 0;
+        T u, v, w;
+        pg.uvw(j, u, v, w);
+        const T x = (d == 0) ? u : ((d == 1) ? v : w);
+        T p = static_cast<T>(1.0);
+        for (int n = 0; n < L1; n++) {
+          pd[n] = p;
+          p *= x;
+        }
+        if (d == 0) tj_s[jj] = (nelements > 1) ? tj[j] : 0;
       } else {
-        for (int n = 0; n < PD; n++) pd[n] = T(0);
-        for (int m = 0; m < nrbf3; m++) r_s[m * JT + jj] = dr_s[m * JT + jj] = T(0);
-        tj_s[jj] = -1;
+        for (int n = 0; n < L1; n++) pd[n] = T(0);
+        if (d == 0) tj_s[jj] = -1;
       }
     }
     __syncthreads();
 
+    // C^T (k x pairs) = F^T R^T on the matrix cores: lane column lr is pair s0 + lr and
+    // its four accumulators are rows k = 16 kt + row(lane, v), so each lane sums over its own
+    // k and only the four row groups of a pair have to be reduced
     for (int s0 = 0; s0 < nt; s0 += 16) {
-      TA SA[4], SU[4], SV[4], SW[4];
-#pragma unroll
-      for (int v = 0; v < 4; v++) SA[v] = SU[v] = SV[v] = SW[v] = TA(0);
+      TA SA = TA(0), SU = TA(0), SV = TA(0), SW = TA(0);
 
-      // A operands of this pair tile: row s0 + lr, inner index 4*cs + lq
-      const int ja = s0 + lr;
-      const int tja = tj_s[ja];
-      TA ar[CSM], adr[CSM];
+      // B operands of this pair tile: column s0 + lr, inner index 4*cs + lq; each lane
+      // evaluates the radial functions of its own entries
+      const int jb = s0 + lr;
+      const int tjb = tj_s[jb];
+      TA br[CSM], bdr[CSM];
+      const PairRadial<T> prad(rs, pg, start + j0 + min(jb, nt - 1));
 #pragma unroll
       for (int cs = 0; cs < CSM; cs++) {
-        const bool on = (cs < CS) && (ce[cs] == tja);
-        ar[cs] = on ? static_cast<TA>(r_s[cm[cs] * JT + ja]) : TA(0);
-        adr[cs] = on ? static_cast<TA>(dr_s[cm[cs] * JT + ja]) : TA(0);
+        br[cs] = bdr[cs] = TA(0);
+        if ((cs < CS) && (jb < nt) && (ce[cs] == tjb)) {
+          T f, df;
+          prad(cm[cs], f, df);
+          br[cs] = static_cast<TA>(f);
+          bdr[cs] = static_cast<TA>(df);
+        }
       }
+      const T *pd = pd_s + jb * PD;
 
       for (int kt = 0; kt < KT; kt++) {
         const int k = 16 * kt + lr;
@@ -1206,48 +1254,38 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
 #pragma unroll
         for (int cs = 0; cs < CSM; cs++)
           if (cs < CS) {
-            const TA b = ((k < K3) && (ce[cs] >= 0))
+            const TA a = ((k < K3) && (ce[cs] >= 0))
                 ? static_cast<TA>(fc_s[ce[cs] + nelements * k + NeK3 * cm[cs]])
                 : TA(0);
-            accG = Mfma<TA>::mma(ar[cs], b, accG);
-            accH = Mfma<TA>::mma(adr[cs], b, accH);
+            accG = Mfma<TA>::mma(a, br[cs], accG);
+            accH = Mfma<TA>::mma(a, bdr[cs], accH);
           }
-        const int ex = (k < K3) ? ex_s[k] : 0;
 #pragma unroll
         for (int v = 0; v < 4; v++) {
-          const T *pd = pd_s + (s0 + Mfma<TA>::row(lane, v)) * PD;
-          T P, Pu, Pv, Pw;
-          pod_monomial<T>(pd, ex, L1, P, Pu, Pv, Pw);
-          SA[v] += accH[v] * static_cast<TA>(P);
-          SU[v] += accG[v] * static_cast<TA>(Pu);
-          SV[v] += accG[v] * static_cast<TA>(Pv);
-          SW[v] += accG[v] * static_cast<TA>(Pw);
+          const int kv = 16 * kt + Mfma<TA>::row(lane, v);
+          if (kv < K3) {
+            T P, Pu, Pv, Pw;
+            pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+            SA += accH[v] * static_cast<TA>(P);
+            SU += accG[v] * static_cast<TA>(Pu);
+            SV += accG[v] * static_cast<TA>(Pv);
+            SW += accG[v] * static_cast<TA>(Pw);
+          }
         }
       }
 
-      // reduce over the 16 lanes (columns k) that hold the same rows
+      // reduce over the four row groups (lanes lr, lr + 16, lr + 32, lr + 48)
 #pragma unroll
-      for (int v = 0; v < 4; v++)
-#pragma unroll
-        for (int off = 1; off < 16; off <<= 1) {
-          SA[v] += __shfl_xor(SA[v], off);
-          SU[v] += __shfl_xor(SU[v], off);
-          SV[v] += __shfl_xor(SV[v], off);
-          SW[v] += __shfl_xor(SW[v], off);
-        }
-      // lanes lr = 0..3 of a row group add the forces of rows v = lr
-      if (lr < 4) {
-        const int jj = s0 + Mfma<TA>::row(lane, lr);
-        if (jj < nt) {
-          const TA sa = (lr == 0) ? SA[0] : ((lr == 1) ? SA[1] : ((lr == 2) ? SA[2] : SA[3]));
-          const TA su = (lr == 0) ? SU[0] : ((lr == 1) ? SU[1] : ((lr == 2) ? SU[2] : SU[3]));
-          const TA sv = (lr == 0) ? SV[0] : ((lr == 1) ? SV[1] : ((lr == 2) ? SV[2] : SV[3]));
-          const TA sw = (lr == 0) ? SW[0] : ((lr == 1) ? SW[1] : ((lr == 2) ? SW[2] : SW[3]));
-          T g[9];
-          pod_pair_gradients<T>(g, pg, start + j0 + jj);
-          pod_pair_finish<T, TA>(ft, pg, fij, i, start + j0 + jj, tj_s[jj], g, sa, su, sv, sw,
-                                 acc_s);
-        }
+      for (int off = 16; off < 64; off <<= 1) {
+        SA += __shfl_xor(SA, off);
+        SU += __shfl_xor(SU, off);
+        SV += __shfl_xor(SV, off);
+        SW += __shfl_xor(SW, off);
+      }
+      if ((lq == 0) && (jb < nt)) {
+        T g[9];
+        pod_pair_gradients<T>(g, pg, start + j0 + jb);
+        pod_pair_finish<T, TA>(ft, pg, fij, i, start + j0 + jb, tjb, g, SA, SU, SV, SW, acc_s);
       }
     }
   }
@@ -1272,8 +1310,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
 
   if (use_mfma && device_has_mfma() && (CS <= MFMA_MAX_CS)) {
     constexpr int JT = MFMA_PAIR_TILE;
-    const size_t lds = (nfc + (size_t) JT * (PD + 2 * nrbf3)) * sizeof(T) +
-        ((size_t) JT + K3) * sizeof(int);
+    const size_t lds = (nfc + (size_t) JT * PD) * sizeof(T) + ((size_t) JT + K3) * sizeof(int);
     if (lds <= 65536) {
 #define LMP_POD_ALLBODY_MFMA(CSM)                                                                 \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT>), dim3(Ni),       \
