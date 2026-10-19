@@ -30,6 +30,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace LAMMPS_NS {
@@ -848,21 +849,6 @@ __device__ inline void pod_monomial(const T *pd, const int ex, const int L1, T &
   Pw = static_cast<T>(c) * pa * pb * pd[2 * L1 + (c > 0 ? c - 1 : 0)];
 }
 
-template <typename T, typename TA>
-__device__ inline void pod_pair_force(T *fij, const T *g, const int j, const TA SA, const TA SU,
-                                      const TA SV, const TA SW)
-{
-  const TA fx = SU * static_cast<TA>(g[0]) + SV * static_cast<TA>(g[1]) +
-      SW * static_cast<TA>(g[2]) + SA * static_cast<TA>(g[6]);
-  const TA fy = SU * static_cast<TA>(g[1]) + SV * static_cast<TA>(g[3]) +
-      SW * static_cast<TA>(g[4]) + SA * static_cast<TA>(g[7]);
-  const TA fz = SU * static_cast<TA>(g[2]) + SV * static_cast<TA>(g[4]) +
-      SW * static_cast<TA>(g[5]) + SA * static_cast<TA>(g[8]);
-  fij[3 * j + 0] += static_cast<T>(fx);
-  fij[3 * j + 1] += static_cast<T>(fy);
-  fij[3 * j + 2] += static_cast<T>(fz);
-}
-
 template <typename T>
 __device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d, const int K3)
 {
@@ -872,11 +858,177 @@ __device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d
   }
 }
 
+template <typename T> __device__ inline T pod_sel4(int i, T v0, T v1, T v2, T v3)
+{
+  T r = T(0);
+  r = (i == 0) ? v0 : r;
+  r = (i == 1) ? v1 : r;
+  r = (i == 2) ? v2 : r;
+  r = (i == 3) ? v3 : r;
+  return r;
+}
+
+// B-spline radial basis of the 2-body terms; r0v == nullptr: use the stored rbf2/drbf2/base
+template <typename T> struct BsplineArgs {
+  const T *r0v, *invhv;    // bin origin and 1/width per element pair
+  const int *ti, *tj;
+  int ne, nbm1, gmax, ish;
+};
+
+// the 4 nonzero B-splines of pair n and their derivatives (times 1/r), in the slots
+// of the window that starts at the returned base index, as in PairPODKokkos::bspline4()
+template <typename T>
+__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
+                                       const int n, T (&Bq)[4], T (&dBq)[4])
+{
+  const int pair = g.ti[n] * g.ne + g.tj[n];
+  const T r = pg.r(n);
+  const T invh = g.invhv[pair];
+  T tg = (r - g.r0v[pair]) * invh;
+  const bool inside = (tg >= T(0));
+  const T dscale = inside ? invh / r : T(0);
+  if (!inside) tg = T(0);
+  int b = (int) tg;
+  if (b > g.nbm1) b = g.nbm1;
+
+  // uniform cubic B-spline values and derivatives, as in PairPODKokkos::bspline4()
+  const T t = tg - (T) b;
+  constexpr T S = (T) (1.0 / 6.0);
+  const T t2 = t * t, a = (T) 1.0 - t, a2 = a * a, t3 = (T) 3.0 * t, hd = (T) 0.5 * dscale;
+  const T B0 = S * a2 * a;
+  const T B1 = (T) 4.0 * S + (T) 0.5 * t2 * (t - (T) 2.0);
+  const T B2 = S + (T) 0.5 * t * ((T) 1.0 + t * a);
+  const T B3 = S * t2 * t;
+  const T dB0 = -a2 * hd;
+  const T dB1 = t * (t3 - (T) 4.0) * hd;
+  const T dB2 = ((T) 1.0 + t * ((T) 2.0 - t3)) * hd;
+  const T dB3 = t2 * hd;
+
+  const int g0 = b - g.ish;
+  int gb = g0;
+  if (gb < 0) gb = 0;
+  else if (gb > g.gmax) gb = g.gmax;
+  const int sh = gb - g0;
+#pragma unroll
+  for (int q = 0; q < 4; q++) {
+    Bq[q] = pod_sel4(sh + q, B0, B1, B2, B3);
+    dBq[q] = pod_sel4(sh + q, dB0, dB1, dB2, dB3);
+  }
+  return gb;
+}
+
+
+/* ----------------------------------------------------------------------
+   the 2-body force of a pair and the tally of the pair forces into the
+   forces and the virial of the atoms, done inside the many-body force
+   kernels (one wavefront per atom i) so that the pair forces need not be
+   stored: f_j -= f_ij per pair, while f_i and the virial of atom i are
+   summed in LDS and added once per atom.  the per-atom virial sums go to
+   vir[6*i + d], summed over the atoms by virial_reduce_kernel, instead of
+   one global atomic per atom on the same six addresses.
+------------------------------------------------------------------------- */
+
+template <typename T, typename TA> struct ForceTally {
+  TA *f;                       // atom forces, f[a*fs0 + d*fs1]; nullptr: write fij instead
+  int fs0, fs1;
+  TA *vir;                     // [6*Ni] virial of the atoms of the block, or nullptr
+  TA *vatom;                   // per-atom virial vatom[a*vs0 + d*vs1], or nullptr
+  int vs0, vs1;
+  const int *ai, *aj;          // atom indices of the pairs
+  const T *cb2;                // 2-body force coefficients [i + Ni*m]; nullptr: no 2-body part
+  const T *drbf2;              // stored 2-body basis derivatives (used when bs.r0v == nullptr)
+  const int *base2;            // stored B-spline base index, or nullptr
+  BsplineArgs<T> bs;           // bs.r0v != nullptr: B-splines evaluated here
+  int nrbf2, nm2, Ni;
+};
+
+// adds the force (SA, SU, SV, SW contracted with the gradients g) of pair j of atom i,
+// whose neighbor has element e, plus its 2-body force, to the atoms
+template <typename T, typename TA>
+__device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGeom<T> &pg,
+                                       T *fij, const int i, const int j, const int e, const T *g,
+                                       const TA SA, const TA SU, const TA SV, const TA SW,
+                                       TA *acc_s)
+{
+  TA fx = SU * static_cast<TA>(g[0]) + SV * static_cast<TA>(g[1]) + SW * static_cast<TA>(g[2]) +
+      SA * static_cast<TA>(g[6]);
+  TA fy = SU * static_cast<TA>(g[1]) + SV * static_cast<TA>(g[3]) + SW * static_cast<TA>(g[4]) +
+      SA * static_cast<TA>(g[7]);
+  TA fz = SU * static_cast<TA>(g[2]) + SV * static_cast<TA>(g[4]) + SW * static_cast<TA>(g[5]) +
+      SA * static_cast<TA>(g[8]);
+  if (ft.f == nullptr) {
+    fij[3 * j + 0] += static_cast<T>(fx);
+    fij[3 * j + 1] += static_cast<T>(fy);
+    fij[3 * j + 2] += static_cast<T>(fz);
+    return;
+  }
+  T u, v, w;
+  pg.uvw(j, u, v, w);
+  const T r = pg.r(j);
+  if (ft.cb2) {
+    TA cR = TA(0);
+    if (ft.bs.r0v) {
+      T Bq[4], dBq[4];
+      const int ii = i + ft.Ni * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
+#pragma unroll
+      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * dBq[m]);
+    } else {
+      const int ii = i + ft.Ni * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
+      for (int m = 0; m < ft.nm2; ++m)
+        cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * ft.drbf2[j + pg.N * m]);
+    }
+    cR *= static_cast<TA>(r);
+    fx += cR * static_cast<TA>(u);
+    fy += cR * static_cast<TA>(v);
+    fz += cR * static_cast<TA>(w);
+  }
+  TA *fj = ft.f + ft.aj[j] * ft.fs0;
+  atomicAdd(fj, -fx);
+  atomicAdd(fj + ft.fs1, -fy);
+  atomicAdd(fj + 2 * ft.fs1, -fz);
+  atomicAdd(acc_s + 0, fx);
+  atomicAdd(acc_s + 1, fy);
+  atomicAdd(acc_s + 2, fz);
+  if (ft.vir || ft.vatom) {
+    const TA rx = static_cast<TA>(r * u), ry = static_cast<TA>(r * v), rz = static_cast<TA>(r * w);
+    const TA vl[6] = {rx * fx, ry * fy, rz * fz, rx * fy, rx * fz, ry * fz};
+#pragma unroll
+    for (int d = 0; d < 6; ++d) atomicAdd(acc_s + 3 + d, vl[d]);
+    if (ft.vatom) {
+      TA *vj = ft.vatom + ft.aj[j] * ft.vs0;
+#pragma unroll
+      for (int d = 0; d < 6; ++d) atomicAdd(vj + d * ft.vs1, static_cast<TA>(-0.5) * vl[d]);
+    }
+  }
+}
+
+// adds the sums of atom i (pairs start .. start+nj-1) to its force and virial; called by
+// all threads of the block after the last pair
+template <typename T, typename TA>
+__device__ inline void pod_atom_finish(const ForceTally<T, TA> &ft, const int i, const int start,
+                                       const int nj, const TA *acc_s)
+{
+  if ((ft.f == nullptr) || (threadIdx.x != 0)) return;
+  if (nj > 0) {
+    TA *fi = ft.f + ft.ai[start] * ft.fs0;
+    atomicAdd(fi, acc_s[0]);
+    atomicAdd(fi + ft.fs1, acc_s[1]);
+    atomicAdd(fi + 2 * ft.fs1, acc_s[2]);
+    if (ft.vatom) {
+      TA *vi = ft.vatom + ft.ai[start] * ft.vs0;
+      for (int d = 0; d < 6; ++d) atomicAdd(vi + d * ft.vs1, static_cast<TA>(-0.5) * acc_s[3 + d]);
+    }
+  }
+  if (ft.vir)
+    for (int d = 0; d < 6; ++d) ft.vir[6 * i + d] = acc_s[3 + d];
+}
+
 // scalar version: one block per atom i, one thread per neighbor j
 
 template <typename T, typename TA>
 __global__ void __launch_bounds__(64)
-    allbody_forces_otf_kernel(T *__restrict__ fij, const T *__restrict__ forcecoeff,
+    allbody_forces_otf_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft,
+                              const T *__restrict__ forcecoeff,
                               const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
                               const int *__restrict__ numij, const int *__restrict__ pq_m,
                               const int *__restrict__ pq_d, const int nelements, const int nrbf3,
@@ -891,11 +1043,14 @@ __global__ void __launch_bounds__(64)
   T *pd_s = fc_s + nfc;                        // [blockDim.x][PD]
   int *ex_s = reinterpret_cast<int *>(pd_s + blockDim.x * PD);    // [K3]
 
+  __shared__ TA acc_s[9];    // force and virial sums of atom i
+
   const int i = blockIdx.x;
   const int start = numij[i];
   const int nj = numij[i + 1] - start;
 
   for (int t = threadIdx.x; t < nfc; t += blockDim.x) fc_s[t] = forcecoeff[t + nfc * i];
+  if (threadIdx.x < 9) acc_s[threadIdx.x] = TA(0);
   pod_exponents<T>(ex_s, pq_m, pq_d, K3);
   __syncthreads();
 
@@ -931,8 +1086,10 @@ __global__ void __launch_bounds__(64)
     }
     T g[9];
     pod_pair_gradients<T>(g, pg, j);
-    pod_pair_force<T, TA>(fij, g, j, SA, SU, SV, SW);
+    pod_pair_finish<T, TA>(ft, pg, fij, i, j, e, g, SA, SU, SV, SW, acc_s);
   }
+  __syncthreads();
+  pod_atom_finish<T, TA>(ft, i, start, nj, acc_s);
 }
 
 /* ----------------------------------------------------------------------
@@ -963,7 +1120,8 @@ static constexpr int MFMA_PAIR_TILE = 16;
 
 template <typename T, typename TA, int CSM, int JT>
 __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
-    allbody_forces_mfma_kernel(T *__restrict__ fij, const T *__restrict__ forcecoeff,
+    allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft,
+                               const T *__restrict__ forcecoeff,
                                const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int *__restrict__ pq_m,
                                const int *__restrict__ pq_d, const int nelements,
@@ -990,7 +1148,9 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   const int lane = threadIdx.x;
   const int lr = lane & 15, lq = lane >> 4;
 
+  __shared__ TA acc_s[9];    // force and virial sums of atom i
   for (int t = lane; t < nfc; t += 64) fc_s[t] = forcecoeff[t + nfc * i];
+  if (lane < 9) acc_s[lane] = TA(0);
   pod_exponents<T>(ex_s, pq_m, pq_d, K3);
 
   // (m, e) of the inner index c = 4*cs + lq owned by this lane
@@ -1085,15 +1245,19 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
           const TA sw = (lr == 0) ? SW[0] : ((lr == 1) ? SW[1] : ((lr == 2) ? SW[2] : SW[3]));
           T g[9];
           pod_pair_gradients<T>(g, pg, start + j0 + jj);
-          pod_pair_force<T, TA>(fij, g, start + j0 + jj, sa, su, sv, sw);
+          pod_pair_finish<T, TA>(ft, pg, fij, i, start + j0 + jj, tj_s[jj], g, sa, su, sv, sw,
+                                 acc_s);
         }
       }
     }
   }
+  __syncthreads();
+  pod_atom_finish<T, TA>(ft, i, start, nj, acc_s);
 }
 
 template <typename T, typename TA>
-bool allbody_forces_otf(hipStream_t stream, T *fij, const T *forcecoeff, const RadialSrc<T> &rs,
+bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
+                        const T *forcecoeff, const RadialSrc<T> &rs,
                         const PairGeom<T> &pg, const int *tj, const int *numij,
                         const int *pq_m, const int *pq_d, int nelements, int nrbf3, int K3,
                         int Ni, int Nij, bool use_mfma)
@@ -1113,7 +1277,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const T *forcecoeff, const R
     if (lds <= 65536) {
 #define LMP_POD_ALLBODY_MFMA(CSM)                                                                 \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT>), dim3(Ni),       \
-                     dim3(64), lds, stream, fij, forcecoeff, rs, pg, tj, numij, pq_m,             \
+                     dim3(64), lds, stream, fij, ft, forcecoeff, rs, pg, tj, numij, pq_m,         \
                      pq_d, nelements, nrbf3, K3, L, Nij)
       if (CS <= 2)
         LMP_POD_ALLBODY_MFMA(2);
@@ -1129,7 +1293,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const T *forcecoeff, const R
   const size_t lds = (nfc + (size_t) 64 * PD) * sizeof(T) + (size_t) K3 * sizeof(int);
   if (lds > 65536) return false;
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_otf_kernel<T, TA>), dim3(Ni), dim3(64), lds,
-                     stream, fij, forcecoeff, rs, pg, tj, numij, pq_m, pq_d, nelements,
+                     stream, fij, ft, forcecoeff, rs, pg, tj, numij, pq_m, pq_d, nelements,
                      nrbf3, K3, L, Nij);
   return hipGetLastError() == hipSuccess;
 }
@@ -1628,64 +1792,6 @@ __global__ void __launch_bounds__(256)
   }
 }
 
-template <typename T> __device__ inline T pod_sel4(int i, T v0, T v1, T v2, T v3)
-{
-  T r = T(0);
-  r = (i == 0) ? v0 : r;
-  r = (i == 1) ? v1 : r;
-  r = (i == 2) ? v2 : r;
-  r = (i == 3) ? v3 : r;
-  return r;
-}
-
-// B-spline radial basis of the 2-body terms; r0v == nullptr: use the stored rbf2/drbf2/base
-template <typename T> struct BsplineArgs {
-  const T *r0v, *invhv;    // bin origin and 1/width per element pair
-  const int *ti, *tj;
-  int ne, nbm1, gmax, ish;
-};
-
-// the 4 nonzero B-splines of pair n and their derivatives (times 1/r), in the slots
-// of the window that starts at the returned base index, as in PairPODKokkos::bspline4()
-template <typename T>
-__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
-                                       const int n, T (&Bq)[4], T (&dBq)[4])
-{
-  const int pair = g.ti[n] * g.ne + g.tj[n];
-  const T r = pg.r(n);
-  const T invh = g.invhv[pair];
-  T tg = (r - g.r0v[pair]) * invh;
-  const bool inside = (tg >= T(0));
-  const T dscale = inside ? invh / r : T(0);
-  if (!inside) tg = T(0);
-  int b = (int) tg;
-  if (b > g.nbm1) b = g.nbm1;
-
-  // uniform cubic B-spline values and derivatives, as in PairPODKokkos::bspline4()
-  const T t = tg - (T) b;
-  constexpr T S = (T) (1.0 / 6.0);
-  const T t2 = t * t, a = (T) 1.0 - t, a2 = a * a, t3 = (T) 3.0 * t, hd = (T) 0.5 * dscale;
-  const T B0 = S * a2 * a;
-  const T B1 = (T) 4.0 * S + (T) 0.5 * t2 * (t - (T) 2.0);
-  const T B2 = S + (T) 0.5 * t * ((T) 1.0 + t * a);
-  const T B3 = S * t2 * t;
-  const T dB0 = -a2 * hd;
-  const T dB1 = t * (t3 - (T) 4.0) * hd;
-  const T dB2 = ((T) 1.0 + t * ((T) 2.0 - t3)) * hd;
-  const T dB3 = t2 * hd;
-
-  const int g0 = b - g.ish;
-  int gb = g0;
-  if (gb < 0) gb = 0;
-  else if (gb > g.gmax) gb = g.gmax;
-  const int sh = gb - g0;
-#pragma unroll
-  for (int q = 0; q < 4; q++) {
-    Bq[q] = pod_sel4(sh + q, B0, B1, B2, B3);
-    dBq[q] = pod_sel4(sh + q, dB0, dB1, dB2, dB3);
-  }
-  return gb;
-}
 
 template <typename T>
 __global__ void __launch_bounds__(256)
@@ -2200,6 +2306,27 @@ __global__ void __launch_bounds__(256)
     const TA b = block_sum(e, sh);
     if (threadIdx.x == 0) atomicAdd(acc, b);
   }
+}
+
+// acc[1 + d] += sum over the atoms of the block of vir[6*i + d]
+template <typename TA>
+__global__ void __launch_bounds__(256)
+    virial_reduce_kernel(TA *__restrict__ acc, const TA *__restrict__ vir, const int Ni)
+{
+  __shared__ TA sh[4];
+  TA v[6] = {TA(0), TA(0), TA(0), TA(0), TA(0), TA(0)};
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < Ni; i += gridDim.x * blockDim.x)
+    for (int d = 0; d < 6; d++) v[d] += vir[6 * i + d];
+  for (int d = 0; d < 6; d++) {
+    const TA b = block_sum(v[d], sh);
+    if (threadIdx.x == 0) atomicAdd(acc + 1 + d, b);
+  }
+}
+
+template <typename TA> bool virial_reduce(hipStream_t stream, TA *acc, const TA *vir, int Ni)
+{
+  return launch(virial_reduce_kernel<TA>, std::min(nblocks_for(Ni, 256), 1024), 256, 0, stream,
+                acc, vir, Ni);
 }
 
 template <typename T, typename TA>

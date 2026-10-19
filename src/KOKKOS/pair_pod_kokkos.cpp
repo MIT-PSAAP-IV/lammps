@@ -69,7 +69,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_DESC = 16,           // fused 3- and 4-body descriptors
        HIP_TALLY = 32,          // per-atom reductions in the force tally and 2-body descriptors
        HIP_PORT = 64,           // native versions of all other kernels
-       HIP_FUSE = 128 };        // radial Hermite spline evaluated inside its consumers
+       HIP_FUSE = 128,          // radial Hermite spline evaluated inside its consumers
+       HIP_FTALLY = 256 };      // 2-body forces and force/virial tally inside the force kernel
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -252,7 +253,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
-      HIP_FUSE;
+      HIP_FUSE | HIP_FTALLY;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2675,24 +2676,58 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   // fij, which tallyforce() and tallystress() then add to the atoms; otherwise
   // allbody_forces() computes both and tallies the forces and the virial itself
   forces_in_fij = false;
+  bool tallied = false;
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if (angular_otf && (nl3 > 0) && (Nij > 1)) {
-      set_array_to_zero(l_fij, 3*Nij);
+      // with HIP_FTALLY the force kernel also adds the 2-body forces, and tallies the pair
+      // forces and the virial into the atoms, so that fij is not used
+      const bool ftally = hip_acc_used && (hip_flags & HIP_FTALLY);
+      PODHIP::ForceTally<KK_FLOAT, KK_ACC_FLOAT> ft{};
+      if (ftally) {
+        if (vflag_global && ((int) hip_vir.extent(0) < 6 * Ni))
+          MemKK::realloc_kokkos(hip_vir, "pair_pod:hip_vir", 6 * Ni);
+        ft.f = f.data();
+        ft.fs0 = f.stride(0);
+        ft.fs1 = f.stride(1);
+        ft.vir = vflag_global ? hip_vir.data() : nullptr;
+        ft.vatom = vflag_atom ? d_vatom.data() : nullptr;
+        ft.vs0 = d_vatom.stride(0);
+        ft.vs1 = d_vatom.stride(1);
+        ft.ai = ai.data();
+        ft.aj = aj.data();
+        ft.cb2 = cb2.data();
+        ft.drbf2 = drbf2.data();
+        ft.base2 = use_bspline ? bs_base.data() : nullptr;
+        ft.bs = pod_bspline_args(use_bspline && bs_deferred, bs_r0, bs_invh, ti, tj, nelements,
+                                 bs_nb, nrbf2, bs_ileft);
+        ft.nrbf2 = nrbf2;
+        ft.nm2 = use_bspline ? 4 : nrbf2;
+        ft.Ni = Ni;
+      } else {
+        set_array_to_zero(l_fij, 3*Nij);
+      }
       const auto rsrc = pod_radial_src(rbf_deferred, rbf, drbf, rbf_hermite_coeffs, hermite_r0,
                                        hermite_invdr, ti, tj, nelements, nhermite_bins, nrbfmax, Nij);
-      forces_in_fij = PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
-          Kokkos::HIP().hip_stream(), l_fij.data(), forcecoeff.data(), rsrc,
+      const bool done = PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
+          Kokkos::HIP().hip_stream(), l_fij.data(), ft, forcecoeff.data(), rsrc,
           pod_geom(rr, rhat, Nij), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements,
           nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0);
-      if (forces_in_fij) {
+      if (done && ftally) {
+        tallied = true;
+        if (vflag_global &&
+            !PODHIP::virial_reduce<KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), hip_acc.data(),
+                                                 hip_vir.data(), Ni))
+          error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");
+      } else if (done) {
+        forces_in_fij = true;
         if (use_bspline) twobody_forces_bspline(l_fij, cb2, drbf2, rhat, rr, bs_base, idxi, tj, nrbf2, Ni, Nij);
         else             twobody_forces(l_fij, cb2, drbf2, rhat, rr, idxi, tj, nrbf2, Ni, Nij);
       }
     }
   }
 #endif
-  if (!forces_in_fij) {
+  if (!forces_in_fij && !tallied) {
     ensure_rbf(Nij);
     ensure_bspline(Nij);
     allbody_forces(l_fij, cb2, Ni, Nij);

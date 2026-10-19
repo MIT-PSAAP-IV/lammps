@@ -109,6 +109,7 @@ class PairPODKokkos : public PairPOD {
   NeighList *mn_list;
   t_pod_1i hip_iscratch;   // scratch for the native neighbor kernels
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
+  Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_vir;    // virial of each atom of a block [6*ni]
 
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block
