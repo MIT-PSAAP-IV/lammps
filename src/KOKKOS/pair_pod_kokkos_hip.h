@@ -271,7 +271,9 @@ inline bool device_has_mfma()
    one thread per pair; the ns raw radial functions are consumed as they are
    generated instead of being written to and read back from memory.  the
    arithmetic and the summation order are the same as in radialbasis() and
-   radialPhi().
+   radialPhi().  at most MAX_RADIAL outputs are kept in registers: with more,
+   blockIdx.y selects a group of at most MAX_RADIAL outputs and each group
+   regenerates the raw functions.
 ------------------------------------------------------------------------- */
 
 template <typename T, typename TA>
@@ -288,8 +290,11 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
                                        const int ns, const int nrbfmax, const int Nij)
 {
   extern __shared__ char lds_raw[];
-  T *phi_s = reinterpret_cast<T *>(lds_raw);    // Phi(s, n) at s + ns*n
-  for (int t = threadIdx.x; t < ns * nrbfmax; t += blockDim.x) phi_s[t] = Phi[t];
+  T *phi_s = reinterpret_cast<T *>(lds_raw);    // Phi(s, q0 + q) at s + ns*q
+  const int nq = (nrbfmax + gridDim.y - 1) / gridDim.y;
+  const int q0 = blockIdx.y * nq;
+  const int nr = min(nq, nrbfmax - q0);
+  for (int t = threadIdx.x; t < ns * nr; t += blockDim.x) phi_s[t] = Phi[t + ns * q0];
   __syncthreads();
 
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -330,7 +335,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
   auto add = [&](const T rv, const T dv) {
 #pragma unroll
     for (int q = 0; q < MAX_RADIAL; q++)
-      if (q < nrbfmax) {
+      if (q < nr) {
         const T phi = phi_s[s + ns * q];
         sum1[q] += static_cast<TA>(rv * phi);
         sum2[q] += static_cast<TA>(dv * phi);
@@ -369,9 +374,9 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
 
 #pragma unroll
   for (int q = 0; q < MAX_RADIAL; q++)
-    if (q < nrbfmax) {
-      rbf[n + Nij * q] = static_cast<T>(sum1[q]);
-      drbf[n + Nij * q] = static_cast<T>(sum2[q]);
+    if (q < nr) {
+      rbf[n + Nij * (q0 + q)] = static_cast<T>(sum1[q]);
+      drbf[n + Nij * (q0 + q)] = static_cast<T>(sum2[q]);
     }
 }
 
@@ -382,13 +387,18 @@ bool radialbasis_phi(hipStream_t stream, T *rbf, T *drbf, const PairGeom<T> &pg,
                      const int *tj, int nelements, int besseldegree, int inversedegree,
                      int nbesselpars, int ns, int nrbfmax, int Nij)
 {
-  if ((Nij <= 0) || (nrbfmax > MAX_RADIAL)) return false;
+  if ((Nij <= 0) || (nrbfmax <= 0)) return false;
   if (ns != nbesselpars * besseldegree + inversedegree) return false;
-  const size_t lds = (size_t) ns * nrbfmax * sizeof(T);
+  // groups of at most MAX_RADIAL outputs, of equal size
+  const int ng = (nrbfmax + MAX_RADIAL - 1) / MAX_RADIAL;
+  const int nq = (nrbfmax + ng - 1) / ng;
+  const size_t lds = (size_t) ns * nq * sizeof(T);
   if (lds > 65536) return false;
-  return launch(radialbasis_phi_kernel<T, TA>, nblocks_for(Nij, 256), 256, lds, stream, rbf, drbf,
-                pg, rin, invrdiff, rs0, rs1, ds0, ds1, neg_alpha, pi_inv_t1, dx_factor, Phi, ti,
-                tj, nelements, besseldegree, inversedegree, nbesselpars, ns, nrbfmax, Nij);
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialbasis_phi_kernel<T, TA>),
+                     dim3(nblocks_for(Nij, 256), ng), dim3(256), lds, stream, rbf, drbf, pg, rin, invrdiff, rs0, rs1, ds0, ds1,
+                     neg_alpha, pi_inv_t1, dx_factor, Phi, ti, tj, nelements, besseldegree,
+                     inversedegree, nbesselpars, ns, nrbfmax, Nij);
+  return hipGetLastError() == hipSuccess;
 }
 
 /* ----------------------------------------------------------------------
@@ -1145,6 +1155,7 @@ __global__ void __launch_bounds__(64)
 
 static constexpr int MFMA_MAX_CS = 8;    // nelements * nrbf3 <= 32
 static constexpr int MFMA_PAIR_TILE = 16;
+
 // register budget of the matrix core force kernel: without it the compiler keeps the
 // accumulators in separate AGPRs, which costs occupancy
 #ifndef LMP_POD_ALLBODY_VGPR
