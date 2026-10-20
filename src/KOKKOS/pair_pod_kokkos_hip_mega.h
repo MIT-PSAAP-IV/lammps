@@ -81,6 +81,7 @@ template <typename T, typename TA> struct MegaArgs {
   int pad;      // extra LDS bytes per block (occupancy experiments)
   int lenv;     // 1: local EA-POD with all lanes of the wave, 0: as the multi-kernel path
   int sdt;      // 1: spill the descriptors as bd [i + Ni*m] (input of the multi-kernel path)
+  int freg;     // 1: forcecoeff in registers during the force stage, its LDS shared with the tile
   int *pai, *ptype;    // sdt: atom index of the first pair slot [i*cap], element of atom i
 };
 
@@ -115,9 +116,15 @@ __host__ __device__ inline MegaLayout mega_layout(const MegaArgs<T, TA> &a)
   lo.d = o;
   if (lo.needD) o += mega_round(a.nDes * (int) sizeof(T));
   lo.f = o;
-  if (lo.needF) o += mega_round(nout * (int) sizeof(T));
+  if (lo.needF && !a.freg) o += mega_round(nout * (int) sizeof(T));
   lo.w = o;
   int w = lo.needU ? nout * (int) sizeof(T) : 0;
+  if (lo.needF && a.freg) {
+    // forcecoeff after sumU and the scratch of forcecoeff34_atom in the stage scratch
+    const int fo = mega_round(nout * (int) sizeof(T)) + mega_round((a.K3 + a.fc.Q4) * (int) sizeof(int));
+    lo.f = lo.w + fo;
+    w = mega_max(w, fo + nout * (int) sizeof(T));
+  }
   if (mega_has(S0, S1, 1)) w = mega_max(w, a.nrbf2 * (int) sizeof(TA));
   if (mega_has(S0, S1, 2)) {
     const int jt = a.jtile;
@@ -644,9 +651,6 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     ft.bs.ti = z_s;
     ft.bs.tj = z_s;
 
-    if (lane < 9) acc_s[lane] = TA(0);
-    pod_exponents<T>(ex_s, a.pq_m, a.pq_d, K3);
-
     int cm[CSM], ce[CSM];
 #pragma unroll
     for (int cs = 0; cs < CSM; cs++) {
@@ -654,6 +658,21 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       cm[cs] = (c < NC) ? c % nrbf3 : 0;
       ce[cs] = (c < NC) ? c / nrbf3 : -1;
     }
+    // the A operands (force coefficients) of this lane, loaded once; afterwards the
+    // forcecoeff LDS may be reused by the pair tile (a.freg)
+    TA fa[MEGA_RTM][CSM];
+#pragma unroll
+    for (int kt = 0; kt < MEGA_RTM; kt++)
+#pragma unroll
+      for (int cs = 0; cs < CSM; cs++) {
+        const int k = 16 * kt + lr;
+        fa[kt][cs] = ((kt < KT) && (cs < CS) && (k < K3) && (ce[cs] >= 0))
+            ? static_cast<TA>(fc_s[ce[cs] + nelements * k + NeK3 * cm[cs]])
+            : TA(0);
+      }
+    __syncthreads();
+    if (lane < 9) acc_s[lane] = TA(0);
+    pod_exponents<T>(ex_s, a.pq_m, a.pq_d, K3);
     typedef typename Mfma<TA>::acc_t acc_t;
     T xh = T(0);
     int tjh = -1;
@@ -702,15 +721,14 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
             bdr[cs] = static_cast<TA>(df);
           }
         }
-        for (int kt = 0; kt < KT; kt++) {
-          const int k = 16 * kt + lr;
+#pragma unroll
+        for (int kt = 0; kt < MEGA_RTM; kt++) {
+          if (kt >= KT) break;
           acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
 #pragma unroll
           for (int cs = 0; cs < CSM; cs++)
             if (cs < CS) {
-              const TA av = ((k < K3) && (ce[cs] >= 0))
-                  ? static_cast<TA>(fc_s[ce[cs] + nelements * k + NeK3 * cm[cs]])
-                  : TA(0);
+              const TA av = fa[kt][cs];
               accG = Mfma<TA>::mma(av, br[cs], accG);
               accH = Mfma<TA>::mma(av, bdr[cs], accH);
             }
@@ -917,6 +935,10 @@ bool mega_range(hipStream_t stream, const MegaArgs<T, TA> &a, int S0, int S1, in
   LMP_POD_MEGA_R(0, 4);
   LMP_POD_MEGA_R(5, 6);
   LMP_POD_MEGA_R(0, 5);
+  LMP_POD_MEGA_R(0, 1);
+  LMP_POD_MEGA_R(3, 6);
+  LMP_POD_MEGA_R(2, 6);
+  LMP_POD_MEGA_R(0, 2);
   LMP_POD_MEGA_R(0, 0);
   LMP_POD_MEGA_R(1, 1);
   LMP_POD_MEGA_R(2, 2);

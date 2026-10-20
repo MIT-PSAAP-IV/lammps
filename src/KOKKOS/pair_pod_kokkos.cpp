@@ -295,7 +295,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
       if (*s == ',') s++;
     }
   }
-  mega_cap = 48;
+  mega_cap = 40;
   env = getenv("LAMMPS_POD_MEGA_CAP");
   if (env) mega_cap = atoi(env);
   mega_pglobal = 0;
@@ -319,6 +319,9 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   mega_lenv = 1;
   env = getenv("LAMMPS_POD_MEGA_LENV");
   if (env) mega_lenv = atoi(env);
+  mega_freg = 1;
+  env = getenv("LAMMPS_POD_MEGA_FREG");
+  if (env) mega_freg = atoi(env);
   mega_logged = false;
 }
 
@@ -2879,6 +2882,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.stop = mega_stop;
     a.pad = mega_pad;
     a.lenv = mega_lenv;
+    a.freg = mega_freg;
     a.sdt = 0;
     a.pai = nullptr;
     a.ptype = nullptr;
@@ -2887,8 +2891,9 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       mega_logged = true;
       utils::logmesg(lmp, "pod mega study: ranges");
       for (int r = 0; r < mega_nr; r++) utils::logmesg(lmp, " {}-{}", mega_r0[r], mega_r1[r]);
-      utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {}\n", cap,
-                     mega_pglobal, mega_stop, mega_pad, a.jtile, mega_lenv, mega_hybrid);
+      utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {} freg {}\n",
+                     cap, mega_pglobal, mega_stop, mega_pad, a.jtile, mega_lenv, mega_hybrid,
+                     mega_freg);
       utils::logmesg(lmp, "pod mega study: Mdesc {} nl2 {} nl3 {} nl4 {} K3 {} L {} nrbf3 {} "
                      "nrbf4 {} nabf3_active {} nabf4 {} Q4 {} nClusters {} nActMax {} nCoeff {} "
                      "maxneigh {} Ni {}\n", Mdesc, nl2, nl3, nl4, K3, L, nrbf3, nrbf4, nabf3_active,
