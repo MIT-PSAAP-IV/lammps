@@ -1229,10 +1229,42 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   }
   typedef typename Mfma<TA>::acc_t acc_t;
 
+  // the direction (u, v or w) and element of the pairs of the next tile are loaded while the
+  // current tile is computed.  only where the 2 registers this takes do not lower the
+  // occupancy (2 slices, and 5 or 6 slices in groups)
+  constexpr bool PREFETCH = (CSM == 2) || GROUP;
+  T xh = T(0);
+  int tjh = -1;
+  auto fetch = [&](const int jbase) {
+    if (lane < 3 * JT) {
+      const int jj = lane % JT, d = lane / JT;
+      if (jbase + jj < nj) {
+        const int j = start + jbase + jj;
+        xh = pg.rhat[j + d * pg.N];
+        tjh = (nelements > 1) ? tj[j] : 0;
+      }
+    }
+  };
+  if constexpr (PREFETCH) fetch(0);
+
   for (int j0 = 0; j0 < nj; j0 += JT) {
     const int nt = min(JT, nj - j0);
     __syncthreads();
     // powers of u, v and w of the pairs of the tile, one direction per lane
+    if constexpr (PREFETCH) {
+      if (lane < 3 * JT) {
+        const int jj = lane % JT, d = lane / JT;
+        T *pd = pd_s + jj * PD + d * L1;
+        const bool in = (jj < nt);
+        T p = in ? static_cast<T>(1.0) : T(0);
+        for (int n = 0; n < L1; n++) {
+          pd[n] = p;
+          p *= xh;
+        }
+        if (d == 0) tj_s[jj] = in ? tjh : -1;
+      }
+      if (j0 + JT < nj) fetch(j0 + JT);
+    } else
     for (int t = lane; t < 3 * JT; t += 64) {
       const int jj = t % JT, d = t / JT;
       T *pd = pd_s + jj * PD + d * L1;
