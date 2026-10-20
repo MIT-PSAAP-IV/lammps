@@ -81,43 +81,41 @@ template <typename T> struct PairGeom {
    live in LDS.  the 3-body pass assigns one (m, q) item per thread; items
    write disjoint entries, so no atomics are needed.  the 4-body pass assigns
    one (m, q) item per thread as well, but its three updates go to arbitrary
-   entries of the m-row and use LDS atomics.
+   entries of the m-row and use LDS atomics.  forcecoeff34_atom() is also
+   called by the matrix core force kernel, which then needs no forcecoeff array.
 ------------------------------------------------------------------------- */
 
-template <typename T>
-__global__ void forcecoeff34_kernel(T *__restrict__ fb, const T *__restrict__ cb3,
-                                    const T *__restrict__ cb4, const T *__restrict__ sumU,
-                                    const int *__restrict__ pc3, const int *__restrict__ pn3,
-                                    const int *__restrict__ p3_active, const int *__restrict__ pa4,
-                                    const int *__restrict__ pb4, const int *__restrict__ pc4,
-                                    const int nelements, const int nrbf3, const int nabf3_active,
-                                    const int nrbf4, const int nabf4, const int K3, const int Q4,
-                                    const int Ni, const int do4)
-{
-  extern __shared__ char lds_raw[];
-  const int S = nelements * K3 * nrbf3;
-  T *u_s = reinterpret_cast<T *>(lds_raw);    // sumU of atom i: [m][q][e]
-  T *f_s = u_s + S;                           // result of atom i, same layout
-  int *qa_s = reinterpret_cast<int *>(f_s + S);    // active angular index a of q, or -1
-  int *qp_s = qa_s + K3;                           // 4-body angular index p of each term q
+template <typename T> struct FcArgs {
+  const T *cb3, *cb4, *sumU;    // sumU == nullptr: nothing to compute
+  const int *pc3, *pn3, *p3_active, *pa4, *pb4, *pc4;
+  int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
+};
 
-  const int i = blockIdx.x;
+// force coefficients of atom i into f_s, with u_s (nelements * K3 * nrbf3 values), qa_s (K3)
+// and qp_s (Q4) as scratch, all in LDS; called by all threads of the block, ends synchronized
+template <typename T>
+__device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int *qa_s,
+                                         int *qp_s, const int i)
+{
+  const int nelements = g.nelements, nrbf3 = g.nrbf3, nabf3_active = g.nabf3_active;
+  const int K3 = g.K3, Q4 = g.Q4, Ni = g.Ni;
+  const int S = nelements * K3 * nrbf3;
   const int base = S * i;
   const int NeK3 = nelements * K3;
 
   for (int t = threadIdx.x; t < S; t += blockDim.x) {
-    u_s[t] = sumU[base + t];
+    u_s[t] = g.sumU[base + t];
     f_s[t] = T(0);
   }
   for (int q = threadIdx.x; q < K3; q += blockDim.x) qa_s[q] = -1;
   __syncthreads();
   for (int a = threadIdx.x; a < nabf3_active; a += blockDim.x) {
-    const int p = p3_active[a];
-    for (int q = pn3[p]; q < pn3[p + 1]; q++) qa_s[q] = a;
+    const int p = g.p3_active[a];
+    for (int q = g.pn3[p]; q < g.pn3[p + 1]; q++) qa_s[q] = a;
   }
-  if (do4)
-    for (int p = threadIdx.x; p < nabf4; p += blockDim.x)
-      for (int q = pa4[p]; q < pa4[p + 1]; q++) qp_s[q] = p;
+  if (g.do4)
+    for (int p = threadIdx.x; p < g.nabf4; p += blockDim.x)
+      for (int q = g.pa4[p]; q < g.pa4[p + 1]; q++) qp_s[q] = p;
   __syncthreads();
 
   // three-body: cb3 index i + Ni*(a + nabf3_active*m) + N3*(element pair)
@@ -128,13 +126,13 @@ __global__ void forcecoeff34_kernel(T *__restrict__ fb, const T *__restrict__ cb
     const int m = item / K3;
     const int a = qa_s[q];
     if (a < 0) continue;
-    const T pk = static_cast<T>(pc3[q]);
+    const T pk = static_cast<T>(g.pc3[q]);
     const int iu = NeK3 * m + nelements * q;
     int em = i + Ni * (a + nabf3_active * m);
     for (int i1 = 0; i1 < nelements; i1++) {
       const T u1 = u_s[iu + i1];
       for (int i2 = i1; i2 < nelements; i2++, em += N3) {
-        const T w = pk * cb3[em];
+        const T w = pk * g.cb3[em];
         f_s[iu + i2] += w * u1;
         f_s[iu + i1] += w * u_s[iu + i2];
       }
@@ -144,25 +142,25 @@ __global__ void forcecoeff34_kernel(T *__restrict__ fb, const T *__restrict__ cb
 
   // four-body: cb4 index i + Ni*(p + nabf4*m) + N4*(element triple)
 
-  if (do4) {
-    const int N4 = Ni * nabf4 * nrbf4;
-    for (int item = threadIdx.x; item < nrbf4 * Q4; item += blockDim.x) {
+  if (g.do4) {
+    const int N4 = Ni * g.nabf4 * g.nrbf4;
+    for (int item = threadIdx.x; item < g.nrbf4 * Q4; item += blockDim.x) {
       const int q = item % Q4;
       const int m = item / Q4;
       const int p = qp_s[q];
-      const T c = static_cast<T>(pc4[q]);
+      const T c = static_cast<T>(g.pc4[q]);
       const int iu = NeK3 * m;
-      const int idx1 = iu + nelements * pb4[q];
-      const int idx2 = iu + nelements * pb4[q + Q4];
-      const int idx3 = iu + nelements * pb4[q + 2 * Q4];
-      int k = i + Ni * (p + nabf4 * m);
+      const int idx1 = iu + nelements * g.pb4[q];
+      const int idx2 = iu + nelements * g.pb4[q + Q4];
+      const int idx3 = iu + nelements * g.pb4[q + 2 * Q4];
+      int k = i + Ni * (p + g.nabf4 * m);
       for (int i1 = 0; i1 < nelements; i1++) {
         const T c1 = u_s[idx1 + i1];
         for (int i2 = i1; i2 < nelements; i2++) {
           const T c2 = u_s[idx2 + i2];
           for (int i3 = i2; i3 < nelements; i3++, k += N4) {
             const T c3 = u_s[idx3 + i3];
-            const T c4 = c * cb4[k];
+            const T c4 = c * g.cb4[k];
             atomicAdd(&f_s[idx3 + i3], c4 * (c1 * c2));
             atomicAdd(&f_s[idx2 + i2], c4 * (c1 * c3));
             atomicAdd(&f_s[idx1 + i1], c4 * (c2 * c3));
@@ -172,24 +170,37 @@ __global__ void forcecoeff34_kernel(T *__restrict__ fb, const T *__restrict__ cb
     }
     __syncthreads();
   }
-
-  for (int t = threadIdx.x; t < S; t += blockDim.x) fb[base + t] = f_s[t];
 }
 
-template <typename T>
-bool forcecoeff34(hipStream_t stream, T *fb, const T *cb3, const T *cb4, const T *sumU,
-                  const int *pc3, const int *pn3, const int *p3_active, const int *pa4,
-                  const int *pb4, const int *pc4, int nelements, int nrbf3, int nabf3_active,
-                  int nrbf4, int nabf4, int K3, int Q4, int Ni, bool do4)
+// LDS of forcecoeff34_atom() beyond the result: u_s, qa_s and qp_s
+template <typename T> inline size_t forcecoeff34_scratch(const FcArgs<T> &g)
 {
-  if ((Ni <= 0) || (nelements > MAX_ELEMENTS)) return false;
-  const size_t lds = 2 * (size_t) nelements * K3 * nrbf3 * sizeof(T) +
-      ((size_t) K3 + (do4 ? Q4 : 0)) * sizeof(int);
+  return (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T) +
+      ((size_t) g.K3 + (g.do4 ? g.Q4 : 0)) * sizeof(int);
+}
+
+template <typename T> __global__ void forcecoeff34_kernel(T *__restrict__ fb, const FcArgs<T> g)
+{
+  extern __shared__ char lds_raw[];
+  const int S = g.nelements * g.K3 * g.nrbf3;
+  T *u_s = reinterpret_cast<T *>(lds_raw);    // sumU of atom i: [m][q][e]
+  T *f_s = u_s + S;                           // result of atom i, same layout
+  int *qa_s = reinterpret_cast<int *>(f_s + S);    // active angular index a of q, or -1
+  int *qp_s = qa_s + g.K3;                         // 4-body angular index p of each term q
+
+  const int i = blockIdx.x;
+  forcecoeff34_atom<T>(g, f_s, u_s, qa_s, qp_s, i);
+  for (int t = threadIdx.x; t < S; t += blockDim.x) fb[S * i + t] = f_s[t];
+}
+
+template <typename T> bool forcecoeff34(hipStream_t stream, T *fb, const FcArgs<T> &g)
+{
+  if ((g.Ni <= 0) || (g.nelements > MAX_ELEMENTS)) return false;
+  const size_t lds = (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T) + forcecoeff34_scratch(g);
   if (lds > 65536) return false;
 
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(forcecoeff34_kernel<T>), dim3(Ni), dim3(128), lds, stream, fb,
-                     cb3, cb4, sumU, pc3, pn3, p3_active, pa4, pb4, pc4, nelements, nrbf3,
-                     nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4 ? 1 : 0);
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(forcecoeff34_kernel<T>), dim3(g.Ni), dim3(128), lds, stream,
+                     fb, g);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -1170,7 +1181,7 @@ static constexpr int MFMA_PAIR_TILE = 16;
 template <typename T, typename TA, int CSM, int JT>
 __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft,
-                               const T *__restrict__ forcecoeff,
+                               const T *__restrict__ forcecoeff, const FcArgs<T> fca,
                                const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int *__restrict__ pq_m,
                                const int *__restrict__ pq_d, const int nelements,
@@ -1185,7 +1196,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   const int KT = (K3 + 15) / 16;
   extern __shared__ char lds_raw[];
   T *fc_s = reinterpret_cast<T *>(lds_raw);    // [m][k][e]
-  T *pd_s = fc_s + nfc;                                      // [JT][PD]
+  T *pd_s = fc_s + nfc;    // [JT][PD]; before the pair loop, scratch of forcecoeff34_atom()
   int *tj_s = reinterpret_cast<int *>(pd_s + JT * PD);       // [JT]
   int *ex_s = tj_s + JT;                                     // [K3]
 
@@ -1196,7 +1207,12 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   const int lr = lane & 15, lq = lane >> 4;
 
   __shared__ TA acc_s[9];    // force and virial sums of atom i
-  for (int t = lane; t < nfc; t += 64) fc_s[t] = forcecoeff[t + nfc * i];
+  if (fca.sumU) {
+    int *qa_s = reinterpret_cast<int *>(pd_s + nfc);
+    forcecoeff34_atom<T>(fca, fc_s, pd_s, qa_s, qa_s + K3, i);
+  } else {
+    for (int t = lane; t < nfc; t += 64) fc_s[t] = forcecoeff[t + nfc * i];
+  }
   if (lane < 9) acc_s[lane] = TA(0);
   pod_exponents<T>(ex_s, pq_m, pq_d, K3);
 
@@ -1304,9 +1320,11 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   pod_atom_finish<T, TA>(ft, i, start, nj, acc_s);
 }
 
+// fca != nullptr: the force coefficients are not in forcecoeff yet.  the matrix core kernel
+// computes them itself; otherwise forcecoeff34() writes them first
 template <typename T, typename TA>
 bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
-                        const T *forcecoeff, const RadialSrc<T> &rs,
+                        T *forcecoeff, const FcArgs<T> *fca, const RadialSrc<T> &rs,
                         const PairGeom<T> &pg, const int *tj, const int *numij,
                         const int *pq_m, const int *pq_d, int nelements, int nrbf3, int K3,
                         int Ni, int Nij, bool use_mfma)
@@ -1318,14 +1336,24 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
   const int PD = 3 * (L + 1);
   const size_t nfc = (size_t) nelements * K3 * nrbf3;
   const int CS = (nelements * nrbf3 + 3) / 4;
+  bool fc_pending = (fca != nullptr);
 
   if (use_mfma && device_has_mfma() && (CS <= MFMA_MAX_CS)) {
     constexpr int JT = MFMA_PAIR_TILE;
-    const size_t lds = (nfc + (size_t) JT * PD) * sizeof(T) + ((size_t) JT + K3) * sizeof(int);
+    // the coefficients are only computed in the kernel if their scratch fits in the space of
+    // the pair tile: a larger block costs occupancy, which is slower than the separate kernel
+    const size_t tile = (size_t) JT * PD * sizeof(T) + ((size_t) JT + K3) * sizeof(int);
+    const bool fuse = fc_pending && (forcecoeff34_scratch(*fca) <= tile);
+    if (fc_pending && !fuse) {
+      if (!forcecoeff34(stream, forcecoeff, *fca)) return false;
+      fc_pending = false;
+    }
+    const size_t lds = nfc * sizeof(T) + tile;
+    const FcArgs<T> g = fuse ? *fca : FcArgs<T>{};
     if (lds <= 65536) {
 #define LMP_POD_ALLBODY_MFMA(CSM)                                                                 \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT>), dim3(Ni),       \
-                     dim3(64), lds, stream, fij, ft, forcecoeff, rs, pg, tj, numij, pq_m,         \
+                     dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij, pq_m,      \
                      pq_d, nelements, nrbf3, K3, L, Nij)
       if (CS <= 2)
         LMP_POD_ALLBODY_MFMA(2);
@@ -1338,6 +1366,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
     }
   }
 
+  if (fc_pending && !forcecoeff34(stream, forcecoeff, *fca)) return false;
   const size_t lds = (nfc + (size_t) 64 * PD) * sizeof(T) + (size_t) K3 * sizeof(int);
   if (lds > 65536) return false;
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_otf_kernel<T, TA>), dim3(Ni), dim3(64), lds,

@@ -70,7 +70,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_TALLY = 32,          // per-atom reductions in the force tally and 2-body descriptors
        HIP_PORT = 64,           // native versions of all other kernels
        HIP_FUSE = 128,          // radial Hermite spline evaluated inside its consumers
-       HIP_FTALLY = 256 };      // 2-body forces and force/virial tally inside the force kernel
+       HIP_FTALLY = 256,        // 2-body forces and force/virial tally inside the force kernel
+       HIP_FUSE_FC = 512 };     // 3- and 4-body force coefficients inside the force kernel
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -253,7 +254,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
-      HIP_FUSE | HIP_FTALLY;
+      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2655,22 +2656,40 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   if ((nl34>0) && (Nij>4)) crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34, Ni);
   if ((nl44>0) && (Nij>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44, Ni);
 
-  // force coefficients of the 3- and 4-body descriptors
-  bool fc_done = false;
+  // force coefficients of the 3- and 4-body descriptors.  with HIP_FUSE_FC the native force
+  // kernel computes them itself (fc_deferred), and they are only computed here if it does not run
+  bool fc_done = false, fc_deferred = false;
 #ifdef KOKKOS_ENABLE_HIP
+  PODHIP::FcArgs<KK_FLOAT> fca{};
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
-    if (native_hip && (nl3 > 0) && (Nij > 1))
-      fc_done = PODHIP::forcecoeff34<KK_FLOAT>(
-          Kokkos::HIP().hip_stream(), forcecoeff.data(), cb3.data(), cb4.data(), sumU.data(),
-          pc3.data(), pn3.data(), p3_active.data(), pa4.data(), pb4.data(), pc4.data(), nelements,
-          nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2));
+    if (native_hip && (nl3 > 0) && (Nij > 1)) {
+      fca = PODHIP::FcArgs<KK_FLOAT>{cb3.data(), cb4.data(), sumU.data(), pc3.data(), pn3.data(),
+                                     p3_active.data(), pa4.data(), pb4.data(), pc4.data(),
+                                     nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
+                                     ((nl4 > 0) && (Nij > 2)) ? 1 : 0};
+      fc_deferred = angular_otf && (hip_flags & HIP_FUSE_FC);
+      if (!fc_deferred)
+        fc_done =
+            PODHIP::forcecoeff34<KK_FLOAT>(Kokkos::HIP().hip_stream(), forcecoeff.data(), fca);
+    }
   }
 #endif
-  if (!fc_done && (Nij > 1)) {
-    set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
-    if (nl3 > 0) threebody_forcecoeff(forcecoeff, cb3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
-    if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
-  }
+  auto compute_forcecoeff = [&]() {
+#ifdef KOKKOS_ENABLE_HIP
+    if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+      if (fc_deferred)
+        fc_done =
+            PODHIP::forcecoeff34<KK_FLOAT>(Kokkos::HIP().hip_stream(), forcecoeff.data(), fca);
+      fc_deferred = false;
+    }
+#endif
+    if (!fc_done && (Nij > 1)) {
+      set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
+      if (nl3 > 0) threebody_forcecoeff(forcecoeff, cb3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
+      if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
+    }
+  };
+  if (!fc_deferred) compute_forcecoeff();
 
   // pair forces.  the native kernels add the many-body and 2-body forces of each pair to
   // fij, which tallyforce() and tallystress() then add to the atoms; otherwise
@@ -2710,9 +2729,11 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
       const auto rsrc = pod_radial_src(rbf_deferred, rbf, drbf, rbf_hermite_coeffs, hermite_r0,
                                        hermite_invdr, ti, tj, nelements, nhermite_bins, nrbfmax, Nij);
       const bool done = PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
-          Kokkos::HIP().hip_stream(), l_fij.data(), ft, forcecoeff.data(), rsrc,
+          Kokkos::HIP().hip_stream(), l_fij.data(), ft, forcecoeff.data(),
+          fc_deferred ? &fca : nullptr, rsrc,
           pod_geom(rr, rhat, Nij), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements,
           nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0);
+      if (done) fc_deferred = false;
       if (done && ftally) {
         tallied = true;
         if (vflag_global &&
@@ -2728,6 +2749,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   }
 #endif
   if (!forces_in_fij && !tallied) {
+    if (fc_deferred) compute_forcecoeff();
     ensure_rbf(Nij);
     ensure_bspline(Nij);
     allbody_forces(l_fij, cb2, Ni, Nij);
