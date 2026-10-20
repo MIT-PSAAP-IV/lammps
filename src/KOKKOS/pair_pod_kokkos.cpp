@@ -71,7 +71,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_PORT = 64,           // native versions of all other kernels
        HIP_FUSE = 128,          // radial Hermite spline evaluated inside its consumers
        HIP_FTALLY = 256,        // 2-body forces and force/virial tally inside the force kernel
-       HIP_FUSE_FC = 512 };     // 3- and 4-body force coefficients inside the force kernel
+       HIP_FUSE_FC = 512,       // 3- and 4-body force coefficients inside the force kernel
+       HIP_FUSE_NEIGH = 1024 }; // pair list in one pass, without reading its size back
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -254,11 +255,14 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
-      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC;
+      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
   forces_in_fij = false;
+  pairs_fused = false;
+  fused_abort = false;
+  fuse_neigh_off = false;
   mn_value = -1;
   mn_ncalls = -1;
   mn_list = nullptr;
@@ -547,23 +551,37 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     int gi2 = atomBlocks[block+1]-1;
     ni = gi2 - gi1; // total number of atoms in the current atom block
 
-    // calculate the total number of pairs (i,j) in the current atom block
-    nij = NeighborCount(numij, gi1, ni);
-
-    // obtain the neighbors within rcut
-    NeighborList(rr, rhat, numij, typeai, idxi, ai, aj, ti, tj, gi1, ni, nij);
+    // the neighbors within rcut, in one pass if every stage reads them atom by atom
+    // (nij is then an upper bound of the number of pairs), otherwise counted first
+    nij = FusedNeighborList(gi1, ni);
+    if (nij < 0) {
+      nij = NeighborCount(numij, gi1, ni);
+      NeighborList(rr, rhat, numij, typeai, idxi, ai, aj, ti, tj, gi1, ni, nij);
+    }
 
     // compute atomic energy and force for the current atom block
+    fused_abort = false;
     blockatom_energyforce(ei, fij, ni, nij);
+
+    // a stage that reads the pairs as one array needs their exact number: compute the
+    // block again, and the following ones, with the counted list
+    if (fused_abort) {
+      fused_abort = false;
+      fuse_neigh_off = true;
+      nij = exact_pairs(gi1);
+      blockatom_energyforce(ei, fij, ni, nij);
+    }
 
     // tally atomic energy to global energy
     tallyenergy(ei, gi1, ni);
 
     // tally the pair forces, if they were not tallied by allbody_forces()
     if (forces_in_fij) {
+      if (pairs_fused) nij = exact_pairs(gi1);
       tallyforce(fij, ai, aj, nij);
       if (vflag) tallystress(fij, rr, rhat, ai, aj, nij);
     } else if (!POD_FUSE_FORCE_TALLY) {
+      if (pairs_fused) nij = exact_pairs(gi1);
       tallyforce(fij, ai, aj, nij);    // benchmarking variant of allbody_forces()
     }
   }
@@ -1082,6 +1100,65 @@ int PairPODKokkos<DeviceType>::NeighborCount(t_pod_1i l_numij, int gi1, int Ni)
   return total_neighbors;
 }
 
+/* ----------------------------------------------------------------------
+   pairs of the block from one native kernel (HIP_FUSE_NEIGH), without reading their number
+   back.  only used when every stage of the block reads the pairs atom by atom through numij:
+   the pair arrays then have the stride ni * maxneigh (returned), an upper bound of the
+   number of pairs.  returns -1 if not used
+------------------------------------------------------------------------- */
+
+template<class DeviceType>
+int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
+{
+  pairs_fused = false;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    // the radial bases must be deferred to their consumers or computed atom by atom
+    const bool radial = use_hermite &&
+        (use_bspline ? ((hip_flags & HIP_FUSE) && (hip_flags & HIP_ANGULAR) && (abf_degree >= 0))
+                     : (nelements * nrbf2 <= 256));
+    if (!native_hip || fuse_neigh_off || !(hip_flags & HIP_FUSE_NEIGH) ||
+        !(hip_flags & HIP_PORT) || !(hip_flags & HIP_FTALLY) || !hip_acc_used || !radial ||
+        (nl3 <= 0) || (Ni <= 0))
+      return -1;
+    const size_t bytes = PODHIP::neighbor_fused_scratch(Ni);
+    const int nint = (int) ((bytes + sizeof(int) - 1) / sizeof(int));
+    if ((int) hip_lookback.extent(0) < nint)
+      MemKK::realloc_kokkos(hip_lookback, "pair_pod:hip_lookback", nint);
+    const int N = Ni * maxneigh;
+    if (PODHIP::neighbor_fused<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
+            typeai.data(), idxi.data(), ai.data(), aj.data(), ti.data(), tj.data(), numij.data(),
+            hip_lookback.data(), x.data(), rcutsq.data(),
+            pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq), gi1, Ni, N)) {
+      pairs_fused = true;
+      return N;
+    }
+  }
+#endif
+  return -1;
+}
+
+// the pairs of the block from NeighborCount() and NeighborList(), in the same order as those
+// of FusedNeighborList() but with the exact number of pairs as stride; returns that number
+template<class DeviceType>
+int PairPODKokkos<DeviceType>::exact_pairs(int gi1)
+{
+  pairs_fused = false;
+  const int n = NeighborCount(numij, gi1, ni);
+  NeighborList(rr, rhat, numij, typeai, idxi, ai, aj, ti, tj, gi1, ni, n);
+  return n;
+}
+
+// called before a stage that reads the pairs as one array of nij entries: with the pairs of
+// FusedNeighborList() the block has to be computed again (fused_abort), returns true
+template<class DeviceType>
+bool PairPODKokkos<DeviceType>::fused_abort_needed()
+{
+  if (!pairs_fused) return false;
+  fused_abort = true;
+  return true;
+}
+
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::NeighborList(t_pod_1d l_rr, t_pod_1d l_rhat, t_pod_1i l_numij,
   t_pod_1i l_typeai, t_pod_1i l_idxi, t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj,
@@ -1288,6 +1365,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
             bd.data(), nrbf2, ni);
         if (d2_fused) return;
       }
+      if (fused_abort_needed()) return;
       if (PODHIP::launch(PODHIP::radialbasis_hermite_kernel<KK_FLOAT, KK_ACC_FLOAT, false>,
             PODHIP::nblocks_for(N, 256), 256, 0, Kokkos::HIP().hip_stream(), l_rbf.data(),
             l_drbf.data(), pod_geom(l_rr, rhat, N), ti.data(), tj.data(), hermite_r0.data(),
@@ -1562,6 +1640,7 @@ void PairPODKokkos<DeviceType>::twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_
   }
 #endif
 
+  if (fused_abort_needed()) return;
   int totalIterations = l_nrbf2 * Nij;
   Kokkos::parallel_for("twobodydesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
     int n = idx / l_nrbf2;
@@ -1621,6 +1700,7 @@ void PairPODKokkos<DeviceType>::twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2
   }
 #endif
 
+  if (fused_abort_needed()) return;
   ensure_bspline(Nij);
 
   Kokkos::parallel_for("twobodydesc_bspline",
@@ -2223,6 +2303,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     }
 #endif
     if (!angular_otf) {
+      if (fused_abort_needed()) return;
       ensure_rbf(Nij);
       radialangularsum(sumU, rbf, rhat, tj, numij, nelements, nrbf3, K3, P3, Ni, Nij);
     }
@@ -2638,6 +2719,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
 
   // calculate base descriptors and their derivatives with respect to atom coordinates
   blockatom_base_descriptors(bd, Ni, Nij);
+  if (fused_abort) return;
 
   if (localeapod) blockatom_local_environment_descriptors(l_ei, cb, bd, Ni);
   else if (eapod) blockatom_environment_descriptors(l_ei, cb, bd, Ni);
@@ -2749,6 +2831,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   }
 #endif
   if (!forces_in_fij && !tallied) {
+    if (fused_abort_needed()) return;
     if (fc_deferred) compute_forcecoeff();
     ensure_rbf(Nij);
     ensure_bspline(Nij);

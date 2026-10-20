@@ -102,12 +102,16 @@ class PairPODKokkos : public PairPOD {
   bool forces_in_fij;      // true if the pair forces of the block are in fij, not yet tallied
   bool rbf_deferred;       // true if rbf/drbf of the block are not computed (yet)
   bool bs_deferred;        // true if rbf2/drbf2/bs_base of the block are not computed (yet)
+  bool pairs_fused;        // true if the pairs of the block come from FusedNeighborList()
+  bool fused_abort;        // true if a stage needed the pairs of NeighborCount()/NeighborList()
+  bool fuse_neigh_off;     // true once a block had to be computed again without the fused list
 
   // maximum neighbor count of the current neighbor list, reused until the next build
   int mn_value, mn_inum;
   bigint mn_ncalls;
   NeighList *mn_list;
   t_pod_1i hip_iscratch;   // scratch for the native neighbor kernels
+  t_pod_1i hip_lookback;   // scratch of the fused native neighbor kernel
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_vir;    // virial of each atom of a block [6*ni]
 
@@ -244,6 +248,9 @@ class PairPODKokkos : public PairPOD {
   void set_array_to_zero(t_pod_1d a, int N);
 
   int NeighborCount(t_pod_1i, int, int);
+  int FusedNeighborList(int gi1, int Ni);
+  int exact_pairs(int gi1);
+  bool fused_abort_needed();
 
   void NeighborList(t_pod_1d l_rr, t_pod_1d l_rhat, t_pod_1i l_numij, t_pod_1i l_typeai,
     t_pod_1i l_idxi, t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj,

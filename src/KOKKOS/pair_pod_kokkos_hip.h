@@ -1827,6 +1827,195 @@ bool neighbor_list(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, i
                 idxi, ai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, Nij);
 }
 
+/* ----------------------------------------------------------------------
+   neighbor_count() and neighbor_list() in one pass, without reading the
+   number of pairs back to the host.  one wavefront per atom, four atoms per
+   block: each wavefront counts the pairs of its atom inside the cutoff,
+   the block finds its offset with a single-pass scan over the blocks
+   (decoupled look-back, blocks numbered in the order they start), and the
+   wavefronts write their pairs.  the result is the same as that of the two
+   kernels and the scan: numij[i] and the pairs of each atom in the same order.
+   the pairs of the first two 64-entry chunks of the neighbor list are kept
+   in registers between the two passes; longer lists test the rest again.
+   rhat is stored with the stride N, an upper bound of the number of pairs.
+   status[] (one word per block) and *ticket must be zero at launch.
+------------------------------------------------------------------------- */
+
+static constexpr unsigned long long NB_AGG = 1ull << 32;     // status: aggregate of the block
+static constexpr unsigned long long NB_PRE = 2ull << 32;     // status: inclusive prefix
+// the status words carry only counts and publish no other data, so relaxed atomics suffice
+// (acquire loads would invalidate the L2 cache on every poll)
+
+template <typename T>
+__global__ void __launch_bounds__(256)
+    neighbor_fused_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
+                          int *__restrict__ idxi, int *__restrict__ ai, int *__restrict__ aj,
+                          int *__restrict__ ti, int *__restrict__ tj, int *__restrict__ numij,
+                          unsigned long long *__restrict__ status, int *__restrict__ ticket,
+                          const T *__restrict__ x, const T *__restrict__ rcutsq, const NeighArgs a,
+                          const int gi1, const int Ni, const int N)
+{
+  __shared__ int bid_s, cnt_s[4], base_s;
+  if (threadIdx.x == 0) bid_s = atomicAdd(ticket, 1);
+  __syncthreads();
+  const int bid = bid_s;
+  const int w = threadIdx.x >> 6, lane = threadIdx.x & 63;
+  const int i = 4 * bid + w;
+
+  int gi = 0, itype = 0, jnum = 0;
+  T xi0 = T(0), xi1 = T(0), xi2 = T(0);
+  if (i < Ni) {
+    gi = a.ilist[gi1 + i];
+    itype = a.map[a.type[gi]];
+    xi0 = x[gi * a.xs0];
+    xi1 = x[gi * a.xs0 + a.xs1];
+    xi2 = x[gi * a.xs0 + 2 * a.xs1];
+    jnum = a.numneigh[gi];
+  }
+
+  // pass 1: count, keeping the first two chunks
+  bool in0 = false, in1 = false;
+  int gj0 = 0, jt0 = 0, gj1 = 0, jt1 = 0;
+  T dx0 = T(0), dy0 = T(0), dz0 = T(0), dx1 = T(0), dy1 = T(0), dz1 = T(0);
+  int count = 0;
+  for (int j0 = 0; j0 < jnum; j0 += 64) {
+    const int jj = j0 + lane;
+    bool in = false;
+    int gj = 0, jtype = 0;
+    T dx = T(0), dy = T(0), dz = T(0);
+    if (jj < jnum)
+      in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
+    count += __popcll(__ballot(in));
+    if (j0 == 0) {
+      in0 = in;
+      gj0 = gj;
+      jt0 = jtype;
+      dx0 = dx;
+      dy0 = dy;
+      dz0 = dz;
+    } else if (j0 == 64) {
+      in1 = in;
+      gj1 = gj;
+      jt1 = jtype;
+      dx1 = dx;
+      dy1 = dy;
+      dz1 = dz;
+    }
+  }
+  if (lane == 0) cnt_s[w] = count;
+  __syncthreads();
+
+  // offset of the block: look back over the blocks that started before it
+  if (w == 0) {
+    const int agg = cnt_s[0] + cnt_s[1] + cnt_s[2] + cnt_s[3];
+    if (lane == 0)
+      __hip_atomic_store(&status[bid], (bid == 0 ? NB_PRE : NB_AGG) | (unsigned) agg,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    int excl = 0;
+    for (int p = bid - 1; p >= 0; p -= 64) {
+      unsigned long long st;
+      unsigned long long invalid, pre;
+      int first;
+      do {
+        const int q = p - lane;
+        st = (q >= 0) ? __hip_atomic_load(&status[q], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
+                      : NB_PRE;
+        pre = __ballot((st >> 32) == 2);
+        invalid = __ballot((st >> 32) == 0);
+        first = pre ? (__ffsll((long long) pre) - 1) : 63;
+        // wait until the blocks up to the nearest one with a prefix have published
+        if (!(invalid & ((first >= 63) ? ~0ull : ((2ull << first) - 1ull)))) break;
+        __builtin_amdgcn_s_sleep(1);
+      } while (true);
+      int v = (lane <= first) ? (int) (st & 0xffffffffull) : 0;
+      for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off);
+      excl += v;
+      if (pre) break;
+    }
+    if (lane == 0) {
+      if (bid > 0)
+        __hip_atomic_store(&status[bid], NB_PRE | (unsigned) (excl + agg), __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      base_s = excl;
+    }
+  }
+  __syncthreads();
+  if (i >= Ni) return;
+  int offset = base_s;
+  for (int q = 0; q < w; q++) offset += cnt_s[q];
+  if (lane == 0) {
+    numij[i + 1] = offset + count;
+    typeai[i] = itype;
+    if (i == 0) numij[0] = 0;
+  }
+
+  // pass 2: write the pairs
+  const unsigned long long below = (1ull << lane) - 1ull;
+  for (int j0 = 0; j0 < jnum; j0 += 64) {
+    const int jj = j0 + lane;
+    bool in;
+    int gj, jtype;
+    T dx, dy, dz;
+    if (j0 == 0) {
+      in = in0;
+      gj = gj0;
+      jtype = jt0;
+      dx = dx0;
+      dy = dy0;
+      dz = dz0;
+    } else if (j0 == 64) {
+      in = in1;
+      gj = gj1;
+      jtype = jt1;
+      dx = dx1;
+      dy = dy1;
+      dz = dz1;
+    } else {
+      in = false;
+      gj = jtype = 0;
+      dx = dy = dz = T(0);
+      if (jj < jnum)
+        in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
+    }
+    const unsigned long long mask = __ballot(in);
+    if (in) {
+      const int n = offset + __popcll(mask & below);
+      // as in neighbor_list_kernel
+      const T r = sqrt(dx * dx + dy * dy + dz * dz);
+      const T sinv = static_cast<T>(1.0) / r;
+      rr[n] = r;
+      rhat[n] = dx * sinv;
+      rhat[n + N] = dy * sinv;
+      rhat[n + 2 * N] = dz * sinv;
+      idxi[n] = i;
+      ai[n] = gi;
+      aj[n] = gj;
+      ti[n] = itype;
+      tj[n] = jtype;
+    }
+    offset += __popcll(mask);
+  }
+}
+
+// scratch: lookback needs nblocks + 1 words of 8 bytes (the last holds the ticket)
+inline size_t neighbor_fused_scratch(int Ni)
+{
+  return ((size_t) (Ni + 3) / 4 + 1) * sizeof(unsigned long long);
+}
+
+template <typename T>
+bool neighbor_fused(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, int *ai, int *aj,
+                    int *ti, int *tj, int *numij, void *lookback, const T *x, const T *rcutsq,
+                    const NeighArgs &a, int gi1, int Ni, int N)
+{
+  if (Ni <= 0) return false;
+  const int nb = (Ni + 3) / 4;
+  auto *status = reinterpret_cast<unsigned long long *>(lookback);
+  if (hipMemsetAsync(lookback, 0, neighbor_fused_scratch(Ni), stream) != hipSuccess) return false;
+  return launch(neighbor_fused_kernel<T>, nb, 256, 0, stream, rr, rhat, typeai, idxi, ai, aj, ti,
+                tj, numij, status, reinterpret_cast<int *>(status + nb), x, rcutsq, a, gi1, Ni, N);
+}
+
 // maximum number of neighbors of the atoms in ilist, or -1 on failure
 
 static __global__ void __launch_bounds__(256) max_neighs_kernel(int *__restrict__ out,
