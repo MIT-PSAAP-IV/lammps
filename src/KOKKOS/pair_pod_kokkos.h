@@ -118,10 +118,14 @@ class PairPODKokkos : public PairPOD {
   // study: whole step in one kernel (HIP_MEGA), see pair_pod_kokkos_hip_mega.h
   int mega_nr, mega_r0[8], mega_r1[8];   // stage ranges launched in order
   int mega_cap, mega_pglobal, mega_stop, mega_pad, mega_persist, mega_nblk, mega_hybrid, mega_lenv, mega_freg;
+  int mega_spill, mega_pool, mega_stats, mega_ncall;
   bool mega_logged;
   t_pod_1d mega_pr, mega_prh, mega_sd, mega_su, mega_sf;
   t_pod_1i mega_paj, mega_pnp, mega_flag, mega_pai, mega_zero;
+  t_pod_1d mega_gpr, mega_gprh;
+  t_pod_1i mega_gpaj, mega_hist;
   bool mega_block(int gi1, int Ni);
+  void mega_print_stats(int Ni);
 
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block

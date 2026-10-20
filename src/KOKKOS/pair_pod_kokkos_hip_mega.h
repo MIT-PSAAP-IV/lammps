@@ -44,6 +44,15 @@ enum { MS_NEIGH = 0, MS_TWOBODY, MS_RAS, MS_DESC, MS_LOCALENV, MS_FC, MS_FORCE, 
 static constexpr int MEGA_RTM = 2;    // K3 <= 32 (angular degree <= 3)
 static constexpr int MEGA_CSM = 2;    // nelements * nrbf3 <= 8
 
+// pairs beyond cap (study of the code variants): 0 none (dropped, reported), 1 pool (pool full:
+// dropped, reported), 2 pool, and when it is full the windows found again from the neighbor list
+#ifndef LMP_POD_MEGA_SPILLV
+#define LMP_POD_MEGA_SPILLV 1
+#endif
+#ifndef LMP_POD_MEGA_SPILLS
+#define LMP_POD_MEGA_SPILLS 0x46    // stages with extra windows (bit s: stage s)
+#endif
+
 template <typename T, typename TA> struct MegaArgs {
   // neighbors
   NeighArgs na;
@@ -83,6 +92,16 @@ template <typename T, typename TA> struct MegaArgs {
   int sdt;      // 1: spill the descriptors as bd [i + Ni*m] (input of the multi-kernel path)
   int freg;     // 1: forcecoeff in registers during the force stage, its LDS shared with the tile
   int *pai, *ptype;    // sdt: atom index of the first pair slot [i*cap], element of atom i
+
+  // pairs beyond cap (stages 0-6 in one kernel, pairs in LDS): an atom with more than cap pairs
+  // stores all of them in a per-step pool, pool_n pairs (rhat stride pool_n), at an offset
+  // claimed from *pool_ctr (zeroed before each launch).  if the pool is full, the windows of
+  // cap pairs are found again from the neighbor list instead.  spill == 0: pairs beyond cap
+  // are dropped and flag[0] reports them (the run then stops)
+  T *gpr, *gprh;
+  int *gpaj, *pool_ctr;
+  int pool_n, spill;
+  int *hist;    // nullptr, or the number of atoms with n pairs (n < 64) and with >= 64
 };
 
 // byte offsets of the LDS regions of mega_kernel<S0, S1>
@@ -198,6 +217,78 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 
   int np = 0;
 
+  // the pairs beyond cap (see MegaArgs::spill): poff = offset of the pairs of atom i in the
+  // pool or -1, curw = first pair held in the LDS cache.  the stages that read the pairs walk
+  // them in windows of cap pairs; with at most cap pairs there is a single window
+  constexpr bool SPILL = (S0 == 0) && (S1 == MS_N - 1) && !PG && (LMP_POD_MEGA_SPILLV > 0);
+  int poff = -1, curw = 0;
+
+  // the pairs n of the neighbor list inside the cutoff with lo <= n < hi, to (pr, prh,
+  // paj)[n - lo] (rhat stride ps), in the order of the list; returns the number of pairs
+  auto scan = [&](const int lo, const int hi, T *pr, T *prh, int *paj, const int ps) -> int {
+    const T xi0 = a.x[gi * a.na.xs0];
+    const T xi1 = a.x[gi * a.na.xs0 + a.na.xs1];
+    const T xi2 = a.x[gi * a.na.xs0 + 2 * a.na.xs1];
+    const int jnum = a.na.numneigh[gi];
+    const unsigned long long below = (1ull << lane) - 1ull;
+    int cnt = 0;
+    for (int j0 = 0; j0 < jnum; j0 += 64) {
+      const int jj = j0 + lane;
+      bool in = false;
+      int gj = 0, jtype = 0;
+      T dx = T(0), dy = T(0), dz = T(0);
+      if (jj < jnum)
+        in = pod_neigh_test<T>(a.na, a.x, a.rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx,
+                               dy, dz);
+      const unsigned long long mask = __ballot(in);
+      if (in) {
+        const int n = cnt + __popcll(mask & below);
+        if ((n >= lo) && (n < hi)) {
+          // as in neighbor_fused_kernel
+          const T r = sqrt(dx * dx + dy * dy + dz * dz);
+          const T sinv = static_cast<T>(1.0) / r;
+          const int q = n - lo;
+          pr[q] = r;
+          prh[q] = dx * sinv;
+          prh[q + ps] = dy * sinv;
+          prh[q + 2 * ps] = dz * sinv;
+          paj[q] = gj;
+        }
+      }
+      cnt += __popcll(mask);
+    }
+    return cnt;
+  };
+
+  // the LDS cache holds the window of pairs that starts at wb
+  auto ensure = [&](const int wb) {
+    if constexpr (SPILL) {
+      if (wb == curw) return;
+      __syncthreads();
+      const int nw = min(cap, np - wb);
+      if (poff >= 0) {
+        const int pn = a.pool_n;
+        const T *gr = a.gpr + poff + wb;
+        const T *gh = a.gprh + poff + wb;
+        const int *ga = a.gpaj + poff + wb;
+        for (int t = lane; t < nw; t += 64) {
+          r_s[t] = gr[t];
+          rh_s[t] = gh[t];
+          rh_s[t + cap] = gh[t + pn];
+          rh_s[t + 2 * cap] = gh[t + 2 * pn];
+          aj_s[t] = ga[t];
+        }
+      }
+#if LMP_POD_MEGA_SPILLV > 1
+      else
+        scan(wb, wb + cap, r_s, rh_s, aj_s, cap);
+#endif
+      __syncthreads();
+      curw = __builtin_amdgcn_readfirstlane(wb);
+    } else
+      (void) wb;
+  };
+
   // ---- inputs of a range that does not start at stage 0
   if constexpr (S0 > 0) {
     np = a.pnp[i];
@@ -225,40 +316,33 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 
   // ---- stage 0: the pairs of atom i inside the cutoff, in the order of the neighbor list
   if constexpr (mega_has(S0, S1, MS_NEIGH)) {
-    const T xi0 = a.x[gi * a.na.xs0];
-    const T xi1 = a.x[gi * a.na.xs0 + a.na.xs1];
-    const T xi2 = a.x[gi * a.na.xs0 + 2 * a.na.xs1];
-    const int jnum = a.na.numneigh[gi];
-    const unsigned long long below = (1ull << lane) - 1ull;
-    int cnt = 0;
-    for (int j0 = 0; j0 < jnum; j0 += 64) {
-      const int jj = j0 + lane;
-      bool in = false;
-      int gj = 0, jtype = 0;
-      T dx = T(0), dy = T(0), dz = T(0);
-      if (jj < jnum)
-        in = pod_neigh_test<T>(a.na, a.x, a.rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx,
-                               dy, dz);
-      const unsigned long long mask = __ballot(in);
-      if (in) {
-        const int n = cnt + __popcll(mask & below);
-        if (n < cap) {
-          // as in neighbor_fused_kernel
-          const T r = sqrt(dx * dx + dy * dy + dz * dz);
-          const T sinv = static_cast<T>(1.0) / r;
-          r_s[n] = r;
-          rh_s[n] = dx * sinv;
-          rh_s[n + PN] = dy * sinv;
-          rh_s[n + 2 * PN] = dz * sinv;
-          aj_s[n] = gj;
+    const int cnt = scan(0, cap, r_s, rh_s, aj_s, PN);
+    if (a.hist && (lane == 0)) atomicAdd(a.hist + min(cnt, 64), 1);
+    bool spilled = false;
+    if constexpr (SPILL) {
+      if (a.spill && (cnt > cap)) {
+        int off = -1;
+        if (lane == 0) {
+          const int o = atomicAdd(a.pool_ctr, cnt);
+          off = (o + cnt <= a.pool_n) ? o : -1;
+          atomicAdd(a.flag + 5, 1);                 // atoms with pairs beyond cap
+          if (off < 0) atomicAdd(a.flag + 6, 1);    // of which found again (pool full)
+          if (cnt > __hip_atomic_load(a.flag + 7, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
+            atomicMax(a.flag + 7, cnt);
         }
+        poff = __builtin_amdgcn_readfirstlane(__shfl(off, 0));    // wave-uniform: SGPR
+        if (poff >= 0) scan(0, cnt, a.gpr + poff, a.gprh + poff, a.gpaj + poff, a.pool_n);
+        // pool full: found again window by window (2), or dropped and reported (1)
+        spilled = (poff >= 0) || (LMP_POD_MEGA_SPILLV > 1);
+        if (spilled) np = cnt;
       }
-      cnt += __popcll(mask);
     }
-    if ((cnt > cap) && (lane == 0) &&
-        (cnt > __hip_atomic_load(a.flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)))
-      atomicMax(a.flag, cnt);
-    np = min(cnt, cap);
+    if (!spilled) {
+      if ((cnt > cap) && (lane == 0) &&
+          (cnt > __hip_atomic_load(a.flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)))
+        atomicMax(a.flag, cnt);
+      np = min(cnt, cap);
+    }
     if (lane == 0) a.pnp[i] = np;
     __syncthreads();
   }
@@ -272,11 +356,23 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     bs.tj = z_s;
     for (int t = lane; t < a.nrbf2; t += 64) s_s[t] = TA(0);
     __syncthreads();
-    for (int n = lane; n < np; n += 64) {
-      T Bq[4], dBq[4];
-      TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq);
+    // the pairs of the LDS window (nw of them); the first window is the only one unless the
+    // atom has more than cap pairs, then the others follow (same below)
+    auto win1 = [&](const int nw) {
+      for (int n = lane; n < nw; n += 64) {
+        T Bq[4], dBq[4];
+        TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq);
 #pragma unroll
-      for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
+        for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
+      }
+    };
+    win1(min(np, cap));
+    if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 2)) {
+      if (np > cap)
+        for (int wb = cap; wb < np; wb += cap) {
+          ensure(wb);
+          win1(min(cap, np - wb));
+        }
     }
     __syncthreads();
     for (int t = lane; t < a.nrbf2; t += 64) d_s[t] = static_cast<T>(s_s[t]);
@@ -288,7 +384,6 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     if (MS_RAS > a.stop) return;
     constexpr int RTM = MEGA_RTM, CTM = 1;
     const int jtile = a.jtile;
-    const int nj = np;
     const int NC = nelements * nrbf3;
     const int RT = (K3 + 15) / 16, CT = (NC + 15) / 16;
     T *pow_s = reinterpret_cast<T *>(w_s);    // [jtile][3][L1]
@@ -325,6 +420,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 #pragma unroll
       for (int ct = 0; ct < CTM; ct++) acc[rt][ct] = acc_t{0, 0, 0, 0};
 
+    if constexpr (LMP_POD_MEGA_SPILLS & 4) ensure(0);
+    auto win2 = [&](const int nj) {
     for (int j0 = 0; j0 < nj; j0 += jtile) {
       const int nt = min(jtile, nj - j0);
       const int nt4 = (nt + 3) & ~3;
@@ -374,6 +471,15 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
             for (int ct = 0; ct < CTM; ct++)
               if (ct < CT) acc[rt][ct] = Mfma<TA>::mma(av[rt], b[ct], acc[rt][ct]);
       }
+    }
+    };
+    win2(min(np, cap));
+    if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 4)) {
+      if (np > cap)
+        for (int wb = cap; wb < np; wb += cap) {
+          ensure(wb);
+          win2(min(cap, np - wb));
+        }
     }
     __syncthreads();    // u_s overlaps the tile
 #pragma unroll
@@ -641,7 +747,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     int *tj_s = reinterpret_cast<int *>(pd_s + JT * PD);                       // [JT]
     int *ex_s = tj_s + JT;                                                     // [K3]
     const T *fc_s = f_s;
-    const int nj = np;
+    int nj = 0;
 
     ForceTally<T, TA> ft = a.ft;
     ft.ai = z_s + cap;    // ai[0] = gi
@@ -676,19 +782,30 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     typedef typename Mfma<TA>::acc_t acc_t;
     T xh = T(0);
     int tjh = -1;
+    // pair jbase + jj is at jbase + jj - curw in the LDS window
     auto fetch = [&](const int jbase) {
       if (lane < 3 * JT) {
         const int jj = lane % JT, d = lane / JT;
         if (jbase + jj < nj) {
-          xh = pg.rhat[jbase + jj + d * pg.N];
+          xh = pg.rhat[jbase - curw + jj + d * pg.N];
           tjh = 0;
         }
       }
     };
+    nj = np;
+    if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 64)) ensure(0);
     fetch(0);
-
+    // with more than cap pairs, a tile that does not fit in the LDS window starts a new window
+    // (and is fetched again); otherwise the window holds all pairs
     for (int j0 = 0; j0 < nj; j0 += JT) {
       const int nt = min(JT, nj - j0);
+      if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 64)) {
+        if (j0 - curw + nt > cap) {
+          ensure(j0);
+          fetch(j0);
+        }
+      }
+      const int jl0 = __builtin_amdgcn_readfirstlane(j0 - curw);
       __syncthreads();
       if (lane < 3 * JT) {
         const int jj = lane % JT, d = lane / JT;
@@ -701,14 +818,14 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         }
         if (d == 0) tj_s[jj] = in ? tjh : -1;
       }
-      if (j0 + JT < nj) fetch(j0 + JT);
+      if ((j0 + JT < nj) && (j0 + JT - curw < cap)) fetch(j0 + JT);
       __syncthreads();
 
       for (int s0 = 0; s0 < nt; s0 += 16) {
         TA SA = TA(0), SU = TA(0), SV = TA(0), SW = TA(0);
         const int jb = s0 + lr;
         const int tjb = tj_s[jb];
-        const PairRadial<T> prad(rs, pg, j0 + min(jb, nt - 1));
+        const PairRadial<T> prad(rs, pg, jl0 + min(jb, nt - 1));
         const T *pd = pd_s + jb * PD;
         TA br[CSM], bdr[CSM];
 #pragma unroll
@@ -754,8 +871,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         }
         if ((lq == 0) && (jb < nt)) {
           T g[9];
-          pod_pair_gradients<T>(g, pg, j0 + jb);
-          pod_pair_finish<T, TA>(ft, pg, nullptr, 0, j0 + jb, tjb, g, SA, SU, SV, SW, acc_s);
+          pod_pair_gradients<T>(g, pg, jl0 + jb);
+          pod_pair_finish<T, TA>(ft, pg, nullptr, 0, jl0 + jb, tjb, g, SA, SU, SV, SW, acc_s);
         }
       }
     }
@@ -763,11 +880,11 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     if constexpr (PERSIST) {
       ForceTally<T, TA> fa = ft;
       fa.vir = nullptr;
-      pod_atom_finish<T, TA>(fa, i, 0, nj, acc_s);
+      pod_atom_finish<T, TA>(fa, i, 0, np, acc_s);
       if ((lane == 0) && ft.vir)
         for (int d = 0; d < 6; d++) vacc[d] += acc_s[3 + d];
     } else
-      pod_atom_finish<T, TA>(ft, i, 0, nj, acc_s);
+      pod_atom_finish<T, TA>(ft, i, 0, np, acc_s);
   }
 
   // ---- live outputs of a range that does not end at stage 6
@@ -802,8 +919,18 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 }
 
 // one block (wavefront) per atom
+// register budget of the mega kernel (amdgpu_num_vgpr(N) caps VGPR+AGPR at 2N on gfx942)
+#ifndef LMP_POD_MEGA_VGPR
+#define LMP_POD_MEGA_VGPR LMP_POD_ALLBODY_VGPR
+#endif
+#if LMP_POD_MEGA_VGPR > 0
+#define LMP_POD_MEGA_ATTR __attribute__((amdgpu_num_vgpr(LMP_POD_MEGA_VGPR)))
+#else
+#define LMP_POD_MEGA_ATTR
+#endif
+
 template <typename T, typename TA, int S0, int S1, bool PG>
-__global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR mega_kernel(const MegaArgs<T, TA> a)
+__global__ void __launch_bounds__(64) LMP_POD_MEGA_ATTR mega_kernel(const MegaArgs<T, TA> a)
 {
   extern __shared__ char lds_raw[];
   TA e = TA(0), v[6];

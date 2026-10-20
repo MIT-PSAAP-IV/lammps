@@ -322,6 +322,16 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   mega_freg = 1;
   env = getenv("LAMMPS_POD_MEGA_FREG");
   if (env) mega_freg = atoi(env);
+  mega_spill = 1;    // 0: stop if an atom has more than mega_cap pairs
+  env = getenv("LAMMPS_POD_MEGA_SPILL");
+  if (env) mega_spill = atoi(env);
+  mega_pool = 0;     // atoms with pairs beyond mega_cap held in the pool; 0: max(256, Ni/32)
+  env = getenv("LAMMPS_POD_MEGA_POOL");
+  if (env) mega_pool = atoi(env);
+  mega_stats = 0;    // > 0: print the pair statistics every mega_stats calls
+  env = getenv("LAMMPS_POD_MEGA_STATS");
+  if (env) mega_stats = atoi(env);
+  mega_ncall = 0;
   mega_logged = false;
 }
 
@@ -657,7 +667,8 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
           (hipStreamSynchronize(Kokkos::HIP().hip_stream()) != hipSuccess))
         error->one(FLERR, "pair pod/kk: reading the energy and virial from the GPU failed");
       if (h_flag > mega_cap)
-        error->one(FLERR, "pair pod/kk mega study: an atom has {} pairs, more than LAMMPS_POD_MEGA_CAP={}",
+        error->one(FLERR, "pair pod/kk mega study: an atom has {} pairs, more than LAMMPS_POD_MEGA_CAP={}"
+                   " (with LAMMPS_POD_MEGA_SPILL=1: the pair pool was full, raise LAMMPS_POD_MEGA_POOL)",
                    h_flag, mega_cap);
       if (eflag_global) eng_vdwl += static_cast<double>(h_acc[0]);
       if (vflag_global)
@@ -2785,6 +2796,41 @@ void PairPODKokkos<DeviceType>::blockatom_environment_descriptors(t_pod_1d ei, t
    for anything else, which then runs the normal path
 ------------------------------------------------------------------------- */
 
+// study: every mega_stats calls, the cumulative pair statistics of the mega kernel
+template<class DeviceType>
+void PairPODKokkos<DeviceType>::mega_print_stats(int Ni)
+{
+  mega_ncall++;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if ((mega_stats <= 0) || (mega_ncall % mega_stats) || (comm->me != 0)) return;
+    int fl[8], hs[65];
+    if ((hipMemcpy(fl, mega_flag.data(), sizeof(fl), hipMemcpyDeviceToHost) != hipSuccess) ||
+        (hipMemcpy(hs, mega_hist.data(), sizeof(hs), hipMemcpyDeviceToHost) != hipSuccess))
+      error->one(FLERR, "pair pod/kk mega study: reading the statistics failed");
+    double tot = 0.0, above[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    const int lim[5] = {24, 28, 32, 36, 40};
+    int mx = 0;
+    for (int n = 0; n <= 64; n++) {
+      tot += hs[n];
+      if (hs[n]) mx = n;
+      for (int k = 0; k < 5; k++)
+        if (n > lim[k]) above[k] += hs[n];
+    }
+    utils::logmesg(lmp, "pod mega stats: calls {} atom-steps {:.0f} max pairs {}{} | above 24 {:.3e} "
+                   "28 {:.3e} 32 {:.3e} 36 {:.3e} 40 {:.3e} | spilled atoms {} ({:.3e} per atom-step), "
+                   "found again (pool full) {}, max spilled pairs {}\n", mega_ncall, tot, mx,
+                   (mx == 64) ? "+" : "", above[0] / tot, above[1] / tot, above[2] / tot,
+                   above[3] / tot, above[4] / tot, fl[5], fl[5] / tot, fl[6], fl[7]);
+    std::string s = "pod mega hist:";
+    for (int n = 0; n <= mx; n++)
+      if (hs[n]) s += fmt::format(" {}:{}", n, hs[n]);
+    utils::logmesg(lmp, s + "\n");
+  }
+#endif
+  (void) Ni;
+}
+
 template<class DeviceType>
 bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
 {
@@ -2813,7 +2859,19 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       MemKK::realloc_kokkos(mega_su, "pair_pod:mega_su", Ni * nout);
       MemKK::realloc_kokkos(mega_sf, "pair_pod:mega_sf", Ni * nout);
     }
-    if ((int) mega_flag.extent(0) < 4) MemKK::realloc_kokkos(mega_flag, "pair_pod:mega_flag", 4);
+    if ((int) mega_flag.extent(0) < 8) MemKK::realloc_kokkos(mega_flag, "pair_pod:mega_flag", 8);
+    const int pool_atoms = (mega_pool > 0) ? mega_pool : std::max(256, Ni / 32);
+    const int pool_n = pool_atoms * std::max(maxneigh, 1);
+    if (mega_spill && ((int) mega_gpaj.extent(0) < pool_n)) {
+      MemKK::realloc_kokkos(mega_gpr, "pair_pod:mega_gpr", pool_n);
+      MemKK::realloc_kokkos(mega_gprh, "pair_pod:mega_gprh", 3 * pool_n);
+      MemKK::realloc_kokkos(mega_gpaj, "pair_pod:mega_gpaj", pool_n);
+    }
+    if (mega_stats && ((int) mega_hist.extent(0) < 65))
+      MemKK::realloc_kokkos(mega_hist, "pair_pod:mega_hist", 65);
+    // the pool is claimed anew in each step
+    if (hipMemsetAsync(mega_flag.data() + 4, 0, sizeof(int), stream) != hipSuccess)
+      error->one(FLERR, "pair pod/kk mega study: resetting the pair pool failed");
     if (mega_hybrid && ((int) mega_zero.extent(0) < Ni * cap)) {
       MemKK::realloc_kokkos(mega_pai, "pair_pod:mega_pai", Ni * cap);
       MemKK::realloc_kokkos(mega_zero, "pair_pod:mega_zero", Ni * cap);    // zero-initialized
@@ -2882,6 +2940,13 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.stop = mega_stop;
     a.pad = mega_pad;
     a.lenv = mega_lenv;
+    a.spill = mega_spill;
+    a.gpr = mega_spill ? mega_gpr.data() : nullptr;
+    a.gprh = mega_spill ? mega_gprh.data() : nullptr;
+    a.gpaj = mega_spill ? mega_gpaj.data() : nullptr;
+    a.pool_ctr = mega_flag.data() + 4;
+    a.pool_n = mega_spill ? (int) mega_gpaj.extent(0) : 0;
+    a.hist = mega_stats ? mega_hist.data() : nullptr;
     a.freg = mega_freg;
     a.sdt = 0;
     a.pai = nullptr;
@@ -2891,9 +2956,9 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       mega_logged = true;
       utils::logmesg(lmp, "pod mega study: ranges");
       for (int r = 0; r < mega_nr; r++) utils::logmesg(lmp, " {}-{}", mega_r0[r], mega_r1[r]);
-      utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {} freg {}\n",
-                     cap, mega_pglobal, mega_stop, mega_pad, a.jtile, mega_lenv, mega_hybrid,
-                     mega_freg);
+      utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {} freg {} "
+                     "spill {} pool {} pairs ({} atoms)\n", cap, mega_pglobal, mega_stop, mega_pad,
+                     a.jtile, mega_lenv, mega_hybrid, mega_freg, mega_spill, a.pool_n, pool_atoms);
       utils::logmesg(lmp, "pod mega study: Mdesc {} nl2 {} nl3 {} nl4 {} K3 {} L {} nrbf3 {} "
                      "nrbf4 {} nabf3_active {} nabf4 {} Q4 {} nClusters {} nActMax {} nCoeff {} "
                      "maxneigh {} Ni {}\n", Mdesc, nl2, nl3, nl4, K3, L, nrbf3, nrbf4, nabf3_active,
@@ -2955,6 +3020,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
         utils::logmesg(lmp, "pod mega study: persistent kernel, barrier after stage {}, {} blocks\n",
                        mega_persist, nb);
       }
+      mega_print_stats(Ni);
       forces_in_fij = false;
       pairs_fused = false;
       return true;
@@ -2966,6 +3032,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     if (vflag_global &&
         !PODHIP::virial_reduce<KK_ACC_FLOAT>(stream, hip_acc.data(), hip_vir.data(), Ni))
       error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");
+    mega_print_stats(Ni);
     forces_in_fij = false;
     pairs_fused = false;
     return true;
