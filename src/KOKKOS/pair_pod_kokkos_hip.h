@@ -1178,7 +1178,7 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #define LMP_POD_ALLBODY_ATTR
 #endif
 
-template <typename T, typename TA, int CSM, int JT>
+template <typename T, typename TA, int CSM, int JT, bool GROUP>
 __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft,
                                const T *__restrict__ forcecoeff, const FcArgs<T> fca,
@@ -1216,10 +1216,13 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   if (lane < 9) acc_s[lane] = TA(0);
   pod_exponents<T>(ex_s, pq_m, pq_d, K3);
 
-  // (m, e) of the inner index c = 4*cs + lq owned by this lane
-  int cm[CSM], ce[CSM];
+  // (m, e) of the inner index c = 4*cs + lq owned by this lane.  with GROUP the slices are
+  // processed in groups of CG = 4 (see below), which recompute (m, e)
+  constexpr int CG = (CSM < 4) ? CSM : 4;
+  constexpr int CN = GROUP ? CG : CSM;
+  int cm[CN], ce[CN];
 #pragma unroll
-  for (int cs = 0; cs < CSM; cs++) {
+  for (int cs = 0; cs < CN; cs++) {
     const int c = 4 * cs + lq;
     cm[cs] = (c < NC) ? c % nrbf3 : 0;
     ce[cs] = (c < NC) ? c / nrbf3 : -1;
@@ -1261,42 +1264,93 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       // evaluates the radial functions of its own entries
       const int jb = s0 + lr;
       const int tjb = tj_s[jb];
-      TA br[CSM], bdr[CSM];
       const PairRadial<T> prad(rs, pg, start + j0 + min(jb, nt - 1));
-#pragma unroll
-      for (int cs = 0; cs < CSM; cs++) {
-        br[cs] = bdr[cs] = TA(0);
-        if ((cs < CS) && (jb < nt) && (ce[cs] == tjb)) {
-          T f, df;
-          prad(cm[cs], f, df);
-          br[cs] = static_cast<TA>(f);
-          bdr[cs] = static_cast<TA>(df);
-        }
-      }
       const T *pd = pd_s + jb * PD;
-
-      for (int kt = 0; kt < KT; kt++) {
-        const int k = 16 * kt + lr;
-        acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
+      if constexpr (!GROUP) {
+        TA br[CSM], bdr[CSM];
 #pragma unroll
-        for (int cs = 0; cs < CSM; cs++)
-          if (cs < CS) {
-            const TA a = ((k < K3) && (ce[cs] >= 0))
-                ? static_cast<TA>(fc_s[ce[cs] + nelements * k + NeK3 * cm[cs]])
-                : TA(0);
-            accG = Mfma<TA>::mma(a, br[cs], accG);
-            accH = Mfma<TA>::mma(a, bdr[cs], accH);
+        for (int cs = 0; cs < CSM; cs++) {
+          br[cs] = bdr[cs] = TA(0);
+          if ((cs < CS) && (jb < nt) && (ce[cs] == tjb)) {
+            T f, df;
+            prad(cm[cs], f, df);
+            br[cs] = static_cast<TA>(f);
+            bdr[cs] = static_cast<TA>(df);
           }
+        }
+
+        for (int kt = 0; kt < KT; kt++) {
+          const int k = 16 * kt + lr;
+          acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
 #pragma unroll
-        for (int v = 0; v < 4; v++) {
-          const int kv = 16 * kt + Mfma<TA>::row(lane, v);
-          if (kv < K3) {
-            T P, Pu, Pv, Pw;
-            pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
-            SA += accH[v] * static_cast<TA>(P);
-            SU += accG[v] * static_cast<TA>(Pu);
-            SV += accG[v] * static_cast<TA>(Pv);
-            SW += accG[v] * static_cast<TA>(Pw);
+          for (int cs = 0; cs < CSM; cs++)
+            if (cs < CS) {
+              const TA a = ((k < K3) && (ce[cs] >= 0))
+                  ? static_cast<TA>(fc_s[ce[cs] + nelements * k + NeK3 * cm[cs]])
+                  : TA(0);
+              accG = Mfma<TA>::mma(a, br[cs], accG);
+              accH = Mfma<TA>::mma(a, bdr[cs], accH);
+            }
+#pragma unroll
+          for (int v = 0; v < 4; v++) {
+            const int kv = 16 * kt + Mfma<TA>::row(lane, v);
+            if (kv < K3) {
+              T P, Pu, Pv, Pw;
+              pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+              SA += accH[v] * static_cast<TA>(P);
+              SU += accG[v] * static_cast<TA>(Pu);
+              SV += accG[v] * static_cast<TA>(Pv);
+              SW += accG[v] * static_cast<TA>(Pw);
+            }
+          }
+        }
+
+      } else {
+        // only the B operands of one group of 4 slices are live (all 8 need about 200
+        // registers, 2 waves/SIMD), and each group adds its own products with the
+        // monomials
+#pragma unroll 1
+        for (int g0 = 0; g0 < CS; g0 += CG) {
+          int gm[CG], ge[CG];
+          TA br[CG], bdr[CG];
+#pragma unroll
+          for (int q = 0; q < CG; q++) {
+            const int c = 4 * (g0 + q) + lq;
+            gm[q] = (c < NC) ? c % nrbf3 : 0;
+            ge[q] = (c < NC) ? c / nrbf3 : -1;
+            br[q] = bdr[q] = TA(0);
+            if ((g0 + q < CS) && (jb < nt) && (ge[q] == tjb)) {
+              T f, df;
+              prad(gm[q], f, df);
+              br[q] = static_cast<TA>(f);
+              bdr[q] = static_cast<TA>(df);
+            }
+          }
+
+          for (int kt = 0; kt < KT; kt++) {
+            const int k = 16 * kt + lr;
+            acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
+#pragma unroll
+            for (int q = 0; q < CG; q++)
+              if (g0 + q < CS) {
+                const TA a = ((k < K3) && (ge[q] >= 0))
+                    ? static_cast<TA>(fc_s[ge[q] + nelements * k + NeK3 * gm[q]])
+                    : TA(0);
+                accG = Mfma<TA>::mma(a, br[q], accG);
+                accH = Mfma<TA>::mma(a, bdr[q], accH);
+              }
+#pragma unroll
+            for (int v = 0; v < 4; v++) {
+              const int kv = 16 * kt + Mfma<TA>::row(lane, v);
+              if (kv < K3) {
+                T P, Pu, Pv, Pw;
+                pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+                SA += accH[v] * static_cast<TA>(P);
+                SU += accG[v] * static_cast<TA>(Pu);
+                SV += accG[v] * static_cast<TA>(Pv);
+                SW += accG[v] * static_cast<TA>(Pw);
+              }
+            }
           }
         }
       }
@@ -1351,16 +1405,20 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
     const size_t lds = nfc * sizeof(T) + tile;
     const FcArgs<T> g = fuse ? *fca : FcArgs<T>{};
     if (lds <= 65536) {
-#define LMP_POD_ALLBODY_MFMA(CSM)                                                                 \
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT>), dim3(Ni),       \
-                     dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij, pq_m,      \
-                     pq_d, nelements, nrbf3, K3, L, Nij)
+#define LMP_POD_ALLBODY_MFMA(CSM, GROUP)                                                           \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP>),           \
+                     dim3(Ni), dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,   \
+                     pq_m, pq_d, nelements, nrbf3, K3, L, Nij)
+      // 5 or 6 slices: two groups (90 instead of 208 registers) is faster; with 7 or 8 the
+      // second pass over the monomials costs more than the occupancy gains
       if (CS <= 2)
-        LMP_POD_ALLBODY_MFMA(2);
+        LMP_POD_ALLBODY_MFMA(2, false);
       else if (CS <= 4)
-        LMP_POD_ALLBODY_MFMA(4);
+        LMP_POD_ALLBODY_MFMA(4, false);
+      else if (CS <= 6)
+        LMP_POD_ALLBODY_MFMA(8, true);
       else
-        LMP_POD_ALLBODY_MFMA(8);
+        LMP_POD_ALLBODY_MFMA(8, false);
 #undef LMP_POD_ALLBODY_MFMA
       return hipGetLastError() == hipSuccess;
     }
