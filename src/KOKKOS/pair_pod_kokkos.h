@@ -115,6 +115,14 @@ class PairPODKokkos : public PairPOD {
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_vir;    // virial of each atom of a block [6*ni]
 
+  // study: whole step in one kernel (HIP_MEGA), see pair_pod_kokkos_hip_mega.h
+  int mega_nr, mega_r0[8], mega_r1[8];   // stage ranges launched in order
+  int mega_cap, mega_pglobal, mega_stop, mega_pad, mega_persist, mega_nblk, mega_hybrid, mega_lenv;
+  bool mega_logged;
+  t_pod_1d mega_pr, mega_prh, mega_sd, mega_su, mega_sf;
+  t_pod_1i mega_paj, mega_pnp, mega_flag, mega_pai, mega_zero;
+  bool mega_block(int gi1, int Ni);
+
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block
   int nimax;         // maximum number of atoms i

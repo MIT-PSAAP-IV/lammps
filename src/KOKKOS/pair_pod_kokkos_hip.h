@@ -31,6 +31,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace LAMMPS_NS {
@@ -41,12 +42,39 @@ static constexpr int MAX_RADIAL = 16;       // radial functions kept in register
 static constexpr int MAX_THREADS = 1024;    // HIP block size limit
 static constexpr int LDS_BUDGET = 32768;    // bytes of LDS used for neighbor tiles
 
+// study: LAMMPS_POD_OCC_WAVES = W > 0 adds LDS to the blocks of the native kernels launched
+// through launch() and the matrix core launch macros, so that about W waves per SIMD fit
+// (LDS is allocated in 512-byte granules, so the result is the nearest count above W)
+inline int occ_target()
+{
+  static int w = -1;
+  if (w < 0) {
+    const char *e = getenv("LAMMPS_POD_OCC_WAVES");
+    w = e ? atoi(e) : 0;
+  }
+  return w;
+}
+
+inline size_t occ_lds(const void *kernel, int nthreads, size_t lds)
+{
+  const int W = occ_target();
+  if (W <= 0) return lds;
+  hipFuncAttributes at;
+  if (hipFuncGetAttributes(&at, kernel) != hipSuccess) return lds;
+  const int wpb = (nthreads + 63) / 64;
+  const int bpc = std::max(1, 4 * W / wpb);
+  const size_t want = ((size_t) 65536 / bpc) & ~(size_t) 511;
+  const size_t have = at.sharedSizeBytes + lds;
+  return (want > have) ? lds + (want - have) : lds;
+}
+
 // launch helper: returns false if the launch failed; nothing to launch is success
 template <typename... P, typename... A>
 inline bool launch(void (*kernel)(P...), int nblocks, int nthreads, size_t lds, hipStream_t stream,
                    A... args)
 {
   if (nblocks <= 0) return true;
+  lds = occ_lds(reinterpret_cast<const void *>(kernel), nthreads, lds);
   hipLaunchKernelGGL(kernel, dim3(nblocks), dim3(nthreads), lds, stream, static_cast<P>(args)...);
   return hipGetLastError() == hipSuccess;
 }
@@ -819,7 +847,11 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C>), dim3(Ni),      \
-                     dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,        \
+                     dim3(threads),                                                            \
+                     occ_lds(reinterpret_cast<const void *>(                                   \
+                                 radialangularsum_mfma_kernel<T, TA, R, C>),                   \
+                             threads, lds2),                                                   \
+                     stream, sumU, rs, pg, tj, numij, pq_m, pq_d,                              \
                      nelements, nrbf3, K3, L, Nij, jtile)
     if (CT == 1) {
       if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
@@ -1201,8 +1233,9 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   int *ex_s = tj_s + JT;                                     // [K3]
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  // study (mega hybrid): Nij < 0 means -Nij pair slots per atom and numij[i] = number of pairs
+  const int start = (Nij >= 0) ? numij[i] : i * (-Nij);
+  const int nj = (Nij >= 0) ? numij[i + 1] - start : numij[i];
   const int lane = threadIdx.x;
   const int lr = lane & 15, lq = lane >> 4;
 
@@ -1439,7 +1472,11 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
     if (lds <= 65536) {
 #define LMP_POD_ALLBODY_MFMA(CSM, GROUP)                                                           \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP>),           \
-                     dim3(Ni), dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,   \
+                     dim3(Ni), dim3(64),                                                           \
+                     occ_lds(reinterpret_cast<const void *>(                                       \
+                                 allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP>),               \
+                             64, lds),                                                             \
+                     stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,                            \
                      pq_m, pq_d, nelements, nrbf3, K3, L, Nij)
       // 5 or 6 slices: two groups (90 instead of 208 registers) is faster; with 7 or 8 the
       // second pass over the monomials costs more than the occupancy gains

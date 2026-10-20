@@ -29,6 +29,7 @@
 #include "neighbor_kokkos.h"
 #include "neigh_request.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -38,6 +39,7 @@
 
 #include "eapod.h"
 #include "pair_pod_kokkos_hip.h"
+#include "pair_pod_kokkos_hip_mega.h"
 
 using namespace LAMMPS_NS;
 using namespace MathConst;
@@ -72,7 +74,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_FUSE = 128,          // radial Hermite spline evaluated inside its consumers
        HIP_FTALLY = 256,        // 2-body forces and force/virial tally inside the force kernel
        HIP_FUSE_FC = 512,       // 3- and 4-body force coefficients inside the force kernel
-       HIP_FUSE_NEIGH = 1024 }; // pair list in one pass, without reading its size back
+       HIP_FUSE_NEIGH = 1024,   // pair list in one pass, without reading its size back
+       HIP_MEGA = 2048 };       // study: the whole step in one kernel (one-element Hf-type models)
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -273,6 +276,50 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   env = getenv("LAMMPS_POD_HIP_JTILE");
   if (env) hip_jtile = atoi(env);
   abf_degree = -1;
+
+  // study: LAMMPS_POD_MEGA = stage ranges, e.g. "0-6" (default) or "0-3,4-6"
+  mega_nr = 1;
+  mega_r0[0] = 0;
+  mega_r1[0] = 6;
+  env = getenv("LAMMPS_POD_MEGA");
+  if (env) {
+    mega_nr = 0;
+    const char *s = env;
+    while (*s && (mega_nr < 8)) {
+      int a = -1, b = -1, n = 0;
+      if (sscanf(s, "%d-%d%n", &a, &b, &n) != 2) break;
+      mega_r0[mega_nr] = a;
+      mega_r1[mega_nr] = b;
+      mega_nr++;
+      s += n;
+      if (*s == ',') s++;
+    }
+  }
+  mega_cap = 48;
+  env = getenv("LAMMPS_POD_MEGA_CAP");
+  if (env) mega_cap = atoi(env);
+  mega_pglobal = 0;
+  env = getenv("LAMMPS_POD_MEGA_PGLOBAL");
+  if (env) mega_pglobal = atoi(env);
+  mega_stop = 6;
+  env = getenv("LAMMPS_POD_MEGA_STOP");
+  if (env) mega_stop = atoi(env);
+  mega_pad = 0;
+  env = getenv("LAMMPS_POD_MEGA_PAD");
+  if (env) mega_pad = atoi(env);
+  mega_persist = -1;    // >= 0: persistent kernel, grid barrier after this stage (6: none)
+  env = getenv("LAMMPS_POD_MEGA_PERSIST");
+  if (env) mega_persist = atoi(env);
+  mega_nblk = 0;
+  env = getenv("LAMMPS_POD_MEGA_NBLK");
+  if (env) mega_nblk = atoi(env);
+  mega_hybrid = 0;    // 1: stages 0-3 fused, then the multi-kernel local EA-POD and force kernels
+  env = getenv("LAMMPS_POD_MEGA_HYBRID");
+  if (env) mega_hybrid = atoi(env);
+  mega_lenv = 1;
+  env = getenv("LAMMPS_POD_MEGA_LENV");
+  if (env) mega_lenv = atoi(env);
+  mega_logged = false;
 }
 
 /* ----------------------------------------------------------------------
@@ -551,6 +598,12 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     int gi2 = atomBlocks[block+1]-1;
     ni = gi2 - gi1; // total number of atoms in the current atom block
 
+    // study: the whole block in the mega-kernel
+    if (mega_block(gi1, ni)) {
+      if (mega_persist < 0) tallyenergy(ei, gi1, ni);
+      continue;
+    }
+
     // the neighbors within rcut, in one pass if every stage reads them atom by atom
     // (nij is then an upper bound of the number of pairs), otherwise counted first
     nij = FusedNeighborList(gi1, ni);
@@ -591,10 +644,18 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if (hip_acc_used && (eflag_global || vflag_global)) {
       KK_ACC_FLOAT h_acc[8];
+      int h_flag = 0;
+      const bool mflag = (hip_flags & HIP_MEGA) && ((int) mega_flag.extent(0) > 0);
+      if (mflag && (hipMemcpyAsync(&h_flag, mega_flag.data(), sizeof(int), hipMemcpyDeviceToHost,
+                                   Kokkos::HIP().hip_stream()) != hipSuccess))
+        error->one(FLERR, "pair pod/kk: reading the mega study flag failed");
       if ((hipMemcpyAsync(h_acc, hip_acc.data(), 8 * sizeof(KK_ACC_FLOAT), hipMemcpyDeviceToHost,
                           Kokkos::HIP().hip_stream()) != hipSuccess) ||
           (hipStreamSynchronize(Kokkos::HIP().hip_stream()) != hipSuccess))
         error->one(FLERR, "pair pod/kk: reading the energy and virial from the GPU failed");
+      if (h_flag > mega_cap)
+        error->one(FLERR, "pair pod/kk mega study: an atom has {} pairs, more than LAMMPS_POD_MEGA_CAP={}",
+                   h_flag, mega_cap);
       if (eflag_global) eng_vdwl += static_cast<double>(h_acc[0]);
       if (vflag_global)
         for (int d = 0; d < 6; ++d) virial[d] -= static_cast<double>(h_acc[1 + d]);
@@ -2711,6 +2772,203 @@ void PairPODKokkos<DeviceType>::blockatom_environment_descriptors(t_pod_1d ei, t
     }
     cb[i + Ni*m] += sum;
   });
+}
+
+/* ----------------------------------------------------------------------
+   study (HIP_MEGA): neighbors, descriptors, local EA-POD, force coefficients and
+   forces of the block in one kernel (or the stage ranges in mega_r0/mega_r1).
+   only one-element models with Hermite many-body and B-spline 2-body radial
+   functions, local EA-POD and 3+4-body terms (the Hf benchmark); returns false
+   for anything else, which then runs the normal path
+------------------------------------------------------------------------- */
+
+template<class DeviceType>
+bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
+{
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    int L = 0;
+    while ((L + 1) * (L + 2) * (L + 3) / 6 < K3) L++;
+    const bool ok = native_hip && (hip_flags & HIP_MEGA) && (hip_flags & HIP_PORT) &&
+        hip_acc_used && use_hermite && use_bspline && localeapod && (nelements == 1) &&
+        (nl3 > 0) && (nl4 > 0) && (nl33 == 0) && (nl34 == 0) && (nl44 == 0) && !eflag_atom &&
+        !vflag_atom && (K3 <= 16 * PODHIP::MEGA_RTM) && (nrbf3 <= 4 * PODHIP::MEGA_CSM) &&
+        ((L + 1) * (L + 2) * (L + 3) / 6 == K3) && (Mdesc <= 128) && (nrbf2 >= 4) &&
+        (nMaxActiveClusters <= PODHIP::LP_KMAX) && (Ni > 0) && PODHIP::device_has_mfma();
+    if (!ok) return false;
+    const hipStream_t stream = Kokkos::HIP().hip_stream();
+    const int cap = mega_cap;
+    const int nout = nrbf3 * K3;
+    if ((int) mega_pr.extent(0) < Ni * cap) {
+      MemKK::realloc_kokkos(mega_pr, "pair_pod:mega_pr", Ni * cap);
+      MemKK::realloc_kokkos(mega_prh, "pair_pod:mega_prh", 3 * Ni * cap);
+      MemKK::realloc_kokkos(mega_paj, "pair_pod:mega_paj", Ni * cap);
+    }
+    if ((int) mega_pnp.extent(0) < Ni) {
+      MemKK::realloc_kokkos(mega_pnp, "pair_pod:mega_pnp", Ni);
+      MemKK::realloc_kokkos(mega_sd, "pair_pod:mega_sd", Ni * Mdesc);
+      MemKK::realloc_kokkos(mega_su, "pair_pod:mega_su", Ni * nout);
+      MemKK::realloc_kokkos(mega_sf, "pair_pod:mega_sf", Ni * nout);
+    }
+    if ((int) mega_flag.extent(0) < 4) MemKK::realloc_kokkos(mega_flag, "pair_pod:mega_flag", 4);
+    if (mega_hybrid && ((int) mega_zero.extent(0) < Ni * cap)) {
+      MemKK::realloc_kokkos(mega_pai, "pair_pod:mega_pai", Ni * cap);
+      MemKK::realloc_kokkos(mega_zero, "pair_pod:mega_zero", Ni * cap);    // zero-initialized
+    }
+    if (vflag_global && ((int) hip_vir.extent(0) < 6 * Ni))
+      MemKK::realloc_kokkos(hip_vir, "pair_pod:hip_vir", 6 * Ni);
+
+    PODHIP::MegaArgs<KK_FLOAT, KK_ACC_FLOAT> a{};
+    a.na = pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq);
+    a.x = x.data();
+    a.rcutsq = rcutsq.data();
+    a.gi1 = gi1;
+    a.Ni = Ni;
+    a.cap = cap;
+    a.pglobal = mega_pglobal;
+    a.pr = mega_pr.data();
+    a.prh = mega_prh.data();
+    a.paj = mega_paj.data();
+    a.pnp = mega_pnp.data();
+    a.sd = mega_sd.data();
+    a.su = mega_su.data();
+    a.sf = mega_sf.data();
+    a.rs = pod_radial_src(true, rbf, drbf, rbf_hermite_coeffs, hermite_r0, hermite_invdr, ti, tj,
+                          nelements, nhermite_bins, nrbfmax, 0);
+    a.bs = pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2, bs_ileft);
+    a.nrbf2 = nrbf2;
+    a.pq_m = pq_m.data();
+    a.pq_d = pq_d.data();
+    a.nrbf3 = nrbf3;
+    a.K3 = K3;
+    a.L = L;
+    a.jtile = std::min(std::max(hip_jtile & ~3, 4), 64);
+    a.dg = pod_desc_args(bd, bd, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4, nelements, nrbf3,
+                         nabf3_active, nrbf4, nabf4, K3, Q4, 1, true);
+    a.fc = PODHIP::FcArgs<KK_FLOAT>{nullptr, nullptr, nullptr, pc3.data(), pn3.data(),
+                                    p3_active.data(), pa4.data(), pb4.data(), pc4.data(),
+                                    nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, 1, 1};
+    a.proj = Proj.data();
+    a.ledges = leftClusterEdges.data();
+    a.redges = rightClusterEdges.data();
+    a.cent = Centroids.data();
+    a.cefs = coefficients.data();
+    a.invlcut2 = invLeftClusterRcut2.data();
+    a.invrcut2 = invRightClusterRcut2.data();
+    a.nCls = nClusters;
+    a.nDes = Mdesc;
+    a.nCoeff = nCoeffPerElement;
+    a.nActMax = nMaxActiveClusters;
+    a.nl2 = nl2;
+    a.nl3 = nl3;
+    a.nl4 = nl4;
+    a.ei = ei.data();
+    a.ft.f = f.data();
+    a.ft.fs0 = f.stride(0);
+    a.ft.fs1 = f.stride(1);
+    a.ft.vir = vflag_global ? hip_vir.data() : nullptr;
+    a.ft.vatom = nullptr;
+    a.ft.cb2 = nullptr;    // set in the kernel
+    a.ft.drbf2 = nullptr;
+    a.ft.base2 = nullptr;
+    a.ft.bs = a.bs;
+    a.ft.nrbf2 = nrbf2;
+    a.ft.nm2 = 4;
+    a.ft.Ni = 1;
+    a.flag = mega_flag.data();
+    a.stop = mega_stop;
+    a.pad = mega_pad;
+    a.lenv = mega_lenv;
+    a.sdt = 0;
+    a.pai = nullptr;
+    a.ptype = nullptr;
+
+    if (!mega_logged && (comm->me == 0)) {
+      mega_logged = true;
+      utils::logmesg(lmp, "pod mega study: ranges");
+      for (int r = 0; r < mega_nr; r++) utils::logmesg(lmp, " {}-{}", mega_r0[r], mega_r1[r]);
+      utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {}\n", cap,
+                     mega_pglobal, mega_stop, mega_pad, a.jtile, mega_lenv, mega_hybrid);
+      utils::logmesg(lmp, "pod mega study: Mdesc {} nl2 {} nl3 {} nl4 {} K3 {} L {} nrbf3 {} "
+                     "nrbf4 {} nabf3_active {} nabf4 {} Q4 {} nClusters {} nActMax {} nCoeff {} "
+                     "maxneigh {} Ni {}\n", Mdesc, nl2, nl3, nl4, K3, L, nrbf3, nrbf4, nabf3_active,
+                     nabf4, Q4, nClusters, nMaxActiveClusters, nCoeffPerElement, maxneigh, Ni);
+      for (int r = 0; r < mega_nr; r++) {
+        int q[2] = {0, 0};
+        if (PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, mega_r0[r], mega_r1[r], q))
+          utils::logmesg(lmp, "pod mega study: range {}-{} LDS {} bytes/block, {} blocks/CU "
+                         "({:.2f} waves/SIMD)\n", mega_r0[r], mega_r1[r], q[0], q[1], q[1] / 4.0);
+      }
+    }
+    if (mega_hybrid) {
+      // stages 0-3 fused, writing the descriptors, sumU, the types and the pairs (cap slots per
+      // atom) in the layouts of the multi-kernel path, then its local EA-POD and force kernels
+      a.sdt = 1;
+      a.sd = bd.data();
+      a.su = sumU.data();
+      a.pai = mega_pai.data();
+      a.ptype = typeai.data();
+      if (!PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, 0, 3))
+        error->one(FLERR, "pair pod/kk mega study: hybrid front kernel failed");
+      blockatom_local_environment_descriptors(ei, cb, bd, Ni);
+      auto cb3 = Kokkos::subview(cb, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
+      auto cb4 = Kokkos::subview(cb, std::make_pair(Ni * (nl2 + nl3), Ni * (nl2 + nl3 + nl4)));
+      PODHIP::FcArgs<KK_FLOAT> fca{cb3.data(), cb4.data(), sumU.data(), pc3.data(), pn3.data(),
+                                   p3_active.data(), pa4.data(), pb4.data(), pc4.data(),
+                                   nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, 1};
+      PODHIP::ForceTally<KK_FLOAT, KK_ACC_FLOAT> ft = a.ft;
+      ft.ai = mega_pai.data();
+      ft.aj = mega_paj.data();
+      ft.cb2 = cb.data();
+      ft.Ni = Ni;
+      ft.bs.ti = mega_zero.data();
+      ft.bs.tj = mega_zero.data();
+      PODHIP::RadialSrc<KK_FLOAT> rsrc = a.rs;
+      rsrc.ti = mega_zero.data();
+      rsrc.tj = mega_zero.data();
+      rsrc.Nij = Ni * cap;
+      PODHIP::PairGeom<KK_FLOAT> pg{mega_pr.data(), mega_prh.data(), Ni * cap};
+      if (!PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
+              stream, nullptr, ft, forcecoeff.data(), &fca, rsrc, pg, mega_zero.data(),
+              mega_pnp.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, -cap, true))
+        error->one(FLERR, "pair pod/kk mega study: hybrid force kernel failed");
+      if (vflag_global &&
+          !PODHIP::virial_reduce<KK_ACC_FLOAT>(stream, hip_acc.data(), hip_vir.data(), Ni))
+        error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");
+      forces_in_fij = false;
+      pairs_fused = false;
+      return true;
+    }
+    if (mega_persist >= 0) {
+      const int nb = PODHIP::mega_persist<KK_FLOAT, KK_ACC_FLOAT>(
+          stream, a, hip_acc.data(), reinterpret_cast<unsigned *>(mega_flag.data() + 1),
+          eflag_global ? 1 : 0, vflag_global ? 1 : 0, mega_nblk, mega_persist);
+      if (nb <= 0) error->one(FLERR, "pair pod/kk mega study: persistent launch failed");
+      static bool plogged = false;
+      if (!plogged && (comm->me == 0)) {
+        plogged = true;
+        utils::logmesg(lmp, "pod mega study: persistent kernel, barrier after stage {}, {} blocks\n",
+                       mega_persist, nb);
+      }
+      forces_in_fij = false;
+      pairs_fused = false;
+      return true;
+    }
+    for (int r = 0; r < mega_nr; r++)
+      if (!PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, mega_r0[r], mega_r1[r]))
+        error->one(FLERR, "pair pod/kk mega study: stage range {}-{} failed or not available",
+                   mega_r0[r], mega_r1[r]);
+    if (vflag_global &&
+        !PODHIP::virial_reduce<KK_ACC_FLOAT>(stream, hip_acc.data(), hip_vir.data(), Ni))
+      error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");
+    forces_in_fij = false;
+    pairs_fused = false;
+    return true;
+  }
+#endif
+  (void) gi1;
+  (void) Ni;
+  return false;
 }
 
 template<class DeviceType>
