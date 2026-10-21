@@ -78,7 +78,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_RAS_PREFETCH = 16384,    // next pair tile loaded during the radial-angular sums
        HIP_LENV_ATOM = 32768,       // 3/4-body descriptors and local EA-POD in one kernel per
                                     // atom, descriptors and their coefficients stored per atom
-       HIP_LENV_PRE = 65536 };        // ... with the cluster tables loaded ahead into registers
+       HIP_LENV_PRE = 65536,        // ... with the cluster tables loaded ahead into registers
+       HIP_NEIGH_D2 = 131072 };       // B-spline 2-body descriptors summed with the pair list
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -264,7 +265,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
-      HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE;
+      HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -275,6 +276,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   desc_in_lenv = false;
   lenv_nij = 0;
   desc_atom = false;
+  d2_in_neigh = false;
   fused_abort = false;
   fuse_neigh_off = false;
   mn_value = -1;
@@ -1132,6 +1134,7 @@ int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
 {
   pairs_fused = false;
   pair_stride = 0;
+  d2_in_neigh = false;
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     // the radial bases must be deferred to their consumers or computed atom by atom
@@ -1148,17 +1151,23 @@ int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
       MemKK::realloc_kokkos(hip_lookback, "pair_pod:hip_lookback", nint);
     const int N = Ni * maxneigh;
     // fixed stride: the pairs of atom i at i*ps (maxneigh, rounded up to a multiple of
-    // hip_palign with HIP_PAIR_ALIGN), written without a scan
+    // hip_palign with HIP_PAIR_ALIGN), written without a scan.  with B-splines (HIP_NEIGH_D2)
+    // the 2-body descriptors are summed in the same pass, in the layout of desc_layout()
     if ((hip_flags & HIP_FIXED_PAIRS) && (maxneigh > 0)) {
       const int ps = (hip_flags & HIP_PAIR_ALIGN)
           ? ((maxneigh + hip_palign - 1) / hip_palign) * hip_palign : maxneigh;
       const int Nf = Ni * ps;
-      if (PODHIP::neighbor_fixed<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
-              typeai.data(), aj.data(), ti.data(), tj.data(), numij.data(), x.data(),
+      const bool d2n = use_bspline && (hip_flags & HIP_NEIGH_D2) && (hip_flags & HIP_FUSE);
+      if (d2n) desc_layout(Nf);
+      if (PODHIP::neighbor_fixed<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(),
+              rhat.data(), typeai.data(), aj.data(), ti.data(), tj.data(), numij.data(), x.data(),
               rcutsq.data(), pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x,
-              rcutsq), gi1, Ni, Nf, ps, nelements)) {
+              rcutsq), gi1, Ni, Nf, ps, nelements, d2n ? bd.data() : nullptr,
+              pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2, bs_ileft),
+              nrbf2, desc_atom ? Mdesc : 1, desc_atom ? 1 : Ni)) {
         pairs_fused = true;
         pair_stride = ps;
+        d2_in_neigh = d2n;
         return Nf;
       }
     }
@@ -1181,6 +1190,7 @@ int PairPODKokkos<DeviceType>::exact_pairs(int gi1)
 {
   pairs_fused = false;
   pair_stride = 0;
+  d2_in_neigh = false;
   const int n = NeighborCount(numij, gi1, ni);
   NeighborList(rr, rhat, numij, typeai, idxi, ai, aj, ti, tj, gi1, ni, n);
   return n;
@@ -2276,7 +2286,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   auto d44 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
 
   desc_layout(Nij);
-  d2_fused = false;
+  d2_fused = d2_in_neigh;
 
   rbf_deferred = false;
   if (use_hermite) {

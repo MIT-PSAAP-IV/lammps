@@ -1004,11 +1004,9 @@ template <typename T> struct BsplineArgs {
 // the 4 nonzero B-splines of pair n and their derivatives (times 1/r), in the slots
 // of the window that starts at the returned base index, as in PairPODKokkos::bspline4()
 template <typename T>
-__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
-                                       const int n, T (&Bq)[4], T (&dBq)[4])
+__device__ inline int pod_bspline_eval(const BsplineArgs<T> &g, const int pair, const T r,
+                                       T (&Bq)[4], T (&dBq)[4])
 {
-  const int pair = (g.ne > 1) ? g.ti[n] * g.ne + g.tj[n] : 0;
-  const T r = pg.r(n);
   const T invh = g.invhv[pair];
   T tg = (r - g.r0v[pair]) * invh;
   const bool inside = (tg >= T(0));
@@ -1041,6 +1039,13 @@ __device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T
     dBq[q] = pod_sel4(sh + q, dB0, dB1, dB2, dB3);
   }
   return gb;
+}
+
+template <typename T>
+__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
+                                       const int n, T (&Bq)[4], T (&dBq)[4])
+{
+  return pod_bspline_eval(g, (g.ne > 1) ? g.ti[n] * g.ne + g.tj[n] : 0, pg.r(n), Bq, dBq);
 }
 
 
@@ -2128,18 +2133,31 @@ bool neighbor_fused(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, 
    pairs without waiting for the counts of the other atoms.  one wavefront per
    atom, four atoms per block.  idxi, ai and ti are not written (the consumers
    know the atom of a pair); tj is written only with more than one element.
+   with d2 != nullptr the B-spline 2-body descriptors of the atom are also
+   summed (as twobodydesc_bspline_kernel) and written to d2[i*da + dm*t].
 ------------------------------------------------------------------------- */
 
-template <typename T>
+template <typename T, typename TA>
 __global__ void __launch_bounds__(256)
     neighbor_fixed_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
                           int *__restrict__ aj, int *__restrict__ ti, int *__restrict__ tj,
                           int *__restrict__ numij, const T *__restrict__ x,
                           const T *__restrict__ rcutsq, const NeighArgs a, const int gi1,
-                          const int Ni, const int N, const int ps, const int ne)
+                          const int Ni, const int N, const int ps, const int ne,
+                          T *__restrict__ d2, const BsplineArgs<T> bs, const int nrbf2,
+                          const int da, const int dm)
 {
+  extern __shared__ char lds_raw[];
   const int i = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
   const int lane = threadIdx.x & 63;
+  const int nd = ne * nrbf2;
+  TA *s_s = reinterpret_cast<TA *>(lds_raw) + (threadIdx.x >> 6) * nd;    // [e][m] of atom i
+  if (d2) {
+    for (int t = lane; t < nd; t += 64) s_s[t] = TA(0);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+  }
   if (i >= Ni) return;
   const int gi = a.ilist[gi1 + i];
   const int itype = a.map[a.type[gi]];
@@ -2171,6 +2189,13 @@ __global__ void __launch_bounds__(256)
         ti[n] = itype;
         tj[n] = jtype;
       }
+      if (d2) {
+        T Bq[4], dBq[4];
+        TA *se = s_s + pod_bspline_eval(bs, (ne > 1) ? itype * ne + jtype : 0, r, Bq, dBq) +
+            nrbf2 * ((ne > 1) ? jtype : 0);
+#pragma unroll
+        for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
+      }
     }
     offset += __popcll(mask);
   }
@@ -2178,16 +2203,27 @@ __global__ void __launch_bounds__(256)
     numij[i + 1] = offset - i * ps;
     typeai[i] = itype;
   }
+  if (d2) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+    for (int t = lane; t < nd; t += 64)
+      d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
+  }
 }
 
-template <typename T>
+template <typename T, typename TA>
 bool neighbor_fixed(hipStream_t stream, T *rr, T *rhat, int *typeai, int *aj, int *ti, int *tj,
                     int *numij, const T *x, const T *rcutsq, const NeighArgs &a, int gi1, int Ni,
-                    int N, int ps, int ne)
+                    int N, int ps, int ne, T *d2 = nullptr, const BsplineArgs<T> &bs = {},
+                    int nrbf2 = 0, int da = 0, int dm = 0)
 {
   if (Ni <= 0) return false;
-  return launch(neighbor_fixed_kernel<T>, nblocks_for(Ni, 4), 256, 0, stream, rr, rhat, typeai,
-                aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne);
+  const size_t lds = d2 ? (size_t) 4 * ne * nrbf2 * sizeof(TA) : 0;
+  if (lds > 32768) return false;
+  return launch(neighbor_fixed_kernel<T, TA>, nblocks_for(Ni, 4), 256, lds, stream, rr, rhat,
+                typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2, da,
+                dm);
 }
 
 // maximum number of neighbors of the atoms in ilist, or -1 on failure
