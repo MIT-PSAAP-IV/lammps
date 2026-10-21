@@ -2940,7 +2940,9 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.flag = mega_flag.data();
     a.stop = mega_stop;
     a.pad = mega_pad;
-    a.lenv = mega_lenv;
+    // the wave-wide local EA-POD keeps at most MEGA_KM active clusters and 64 cluster tables
+    // in registers; otherwise the multi-kernel decomposition (lenv 0)
+    a.lenv = (mega_lenv && (nMaxActiveClusters <= PODHIP::MEGA_KM) && (nClusters <= 64)) ? 1 : 0;
     a.spill = mega_spill;
     a.gpr = mega_spill ? mega_gpr.data() : nullptr;
     a.gprh = mega_spill ? mega_gprh.data() : nullptr;
