@@ -74,7 +74,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_FUSE_FC = 512,       // 3- and 4-body force coefficients inside the force kernel
        HIP_FUSE_NEIGH = 1024,   // pair list in one pass, without reading its size back
        HIP_FIXED_PAIRS = 4096,  // ... with a fixed stride per atom, without a scan
-       HIP_PAIR_ALIGN = 8192 };   // ... rounded up to a multiple of hip_palign pairs
+       HIP_PAIR_ALIGN = 8192,   // ... rounded up to a multiple of hip_palign pairs
+       HIP_RAS_PREFETCH = 16384 };    // next pair tile loaded during the radial-angular sums
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -259,7 +260,8 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
-      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN;
+      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
+      HIP_RAS_PREFETCH;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2327,7 +2329,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
         angular_otf = PODHIP::radialangularsum_otf<KK_FLOAT, KK_ACC_FLOAT>(
             Kokkos::HIP().hip_stream(), sumU.data(), rsrc, pod_geom(rr, rhat, Nij, pair_stride), tj.data(),
             numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
-            (hip_flags & HIP_MFMA) != 0, hip_jtile);
+            (hip_flags & HIP_MFMA) != 0, hip_jtile, (hip_flags & HIP_RAS_PREFETCH) != 0);
       }
     }
 #endif

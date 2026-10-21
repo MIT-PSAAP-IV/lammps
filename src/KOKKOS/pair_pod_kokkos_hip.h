@@ -455,9 +455,10 @@ template <typename T> struct RadialSrc {
 
 // calls emit(m, rbf(j, m), drbf(j, m)) for m < nrbf3; MAXR > 0 unrolls the
 // loop to MAXR (nrbf3 <= MAXR) so that emit may index register arrays
+// as pair_radial() below, with the distance r of pair j given (used with the Hermite table)
 template <int MAXR, typename T, typename F>
-__device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg, const int j,
-                                   const int nrbf3, F &&emit)
+__device__ inline void pair_radial_r(const RadialSrc<T> &s, const T r, const int j,
+                                     const int nrbf3, F &&emit)
 {
   constexpr int MR = (MAXR > 0) ? MAXR : 1;
   if (s.coef == nullptr) {
@@ -472,7 +473,6 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg,
     return;
   }
   const int pair = (s.ne > 1) ? s.ti[j] * s.ne + s.tj[j] : 0;
-  const T r = pg.r(j);
   const T r0 = s.r0v[pair];
   const T invdr = s.invdrv[pair];
   const T invdrr = invdr / r;
@@ -495,6 +495,13 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg,
   } else {
     for (int m = 0; m < nrbf3; m++) one(m);
   }
+}
+
+template <int MAXR, typename T, typename F>
+__device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg, const int j,
+                                   const int nrbf3, F &&emit)
+{
+  pair_radial_r<MAXR>(s, s.coef ? pg.r(j) : T(0), j, nrbf3, emit);
 }
 
 // the radial functions of one pair, evaluated one m at a time: the Hermite bin of the
@@ -681,7 +688,9 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
 ------------------------------------------------------------------------- */
 
 // RTM x CTM output tiles (RTM >= ceil(K3/16), CTM >= ceil(Ne*nrbf3/16)) are kept in registers
-template <typename T, typename TA, int RTM, int CTM>
+// PF: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
+// loaded while the current tile is on the matrix cores, and all lanes fill the tile
+template <typename T, typename TA, int RTM, int CTM, bool PF>
 __global__ void __launch_bounds__(64)
     radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
                                  const PairGeom<T> pg, const int *__restrict__ tj,
@@ -739,10 +748,45 @@ __global__ void __launch_bounds__(64)
 #pragma unroll
     for (int ct = 0; ct < CTM; ct++) acc[rt][ct] = acc_t{0, 0, 0, 0};
 
+  T xh = T(0);
+  int tjh = 0;
+  const int pjj = lane % jtile, pd = lane / jtile;    // PF: pair and component of this lane
+  auto fetch = [&](const int jbase) {
+    if ((pd < 4) && (jbase + pjj < nj)) {
+      const int j = start + jbase + pjj;
+      if (pd < 3) xh = pg.rhat[j + pd * pg.N];
+      else {
+        xh = pg.r(j);
+        tjh = (nelements > 1) ? tj[j] : 0;
+      }
+    }
+  };
+  if constexpr (PF) fetch(0);
+
   for (int j0 = 0; j0 < nj; j0 += jtile) {
     const int nt = min(jtile, nj - j0);
     const int nt4 = (nt + 3) & ~3;
     __syncthreads();
+    if constexpr (PF) {
+      if ((pd < 4) && (pjj < nt4)) {
+        T *pw = pow_s + pjj * 3 * L1;
+        if (pd < 3) {
+          T p = (pjj < nt) ? static_cast<T>(1.0) : T(0);
+          for (int n = 0; n < L1; n++) {
+            pw[pd * L1 + n] = p;
+            p *= xh;
+          }
+        } else if (pjj < nt) {
+          pair_radial_r<0>(rs, xh, start + j0 + pjj, nrbf3,
+                           [&](int m, T f, T) { rbf_s[m * ldr + pjj] = f; });
+          tj_s[pjj] = tjh;
+        } else {
+          for (int m = 0; m < nrbf3; m++) rbf_s[m * ldr + pjj] = T(0);
+          tj_s[pjj] = -1;
+        }
+      }
+      if (j0 + jtile < nj) fetch(j0 + jtile);
+    } else
     for (int jj = lane; jj < nt4; jj += 64) {
       T *pw = pow_s + jj * 3 * L1;
       if (jj < nt) {
@@ -806,7 +850,8 @@ template <typename T, typename TA>
 bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, const PairGeom<T> &pg,
                           const int *tj,
                           const int *numij, const int *pq_m, const int *pq_d, int nelements,
-                          int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile)
+                          int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile,
+                          bool prefetch = false)
 {
   const int nout = nrbf3 * K3;
   if ((Ni <= 0) || (nelements > MAX_ELEMENTS) || (K3 < 1)) return false;
@@ -831,10 +876,18 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     const size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
         ((size_t) jtile + K3) * sizeof(int);
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
+    const bool pf = prefetch && (4 * jtile <= 64);
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C>), dim3(Ni),      \
-                     dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,        \
-                     nelements, nrbf3, K3, L, Nij, jtile)
+  do {                                                                                           \
+    if (pf)                                                                                      \
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, true>),      \
+                         dim3(Ni), dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m,  \
+                         pq_d, nelements, nrbf3, K3, L, Nij, jtile);                            \
+    else                                                                                         \
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, false>),     \
+                         dim3(Ni), dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m,  \
+                         pq_d, nelements, nrbf3, K3, L, Nij, jtile);                            \
+  } while (0)
     if (CT == 1) {
       if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
       else if (RT == 2) LMP_POD_RAS_MFMA(2, 1);
