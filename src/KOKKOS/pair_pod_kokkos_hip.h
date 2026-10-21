@@ -104,6 +104,8 @@ template <typename T> struct FcArgs {
   const int *pc3, *pn3, *p3_active, *pa4, *pb4, *pc4;
   int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
   int ca, cm;    // coefficient k of atom i: cb3[i*ca + cm*k] (likewise cb4)
+  const int *qa, *qp;    // or nullptr: tables of the active index a of each 3-body term q
+                         // (or -1) and of the 4-body channel p of each 4-body term q
 };
 
 // force coefficients of atom i into f_s, with u_s (nelements * K3 * nrbf3 values), qa_s (K3)
@@ -122,15 +124,20 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
     u_s[t] = g.sumU[base + t];
     f_s[t] = T(0);
   }
-  for (int q = threadIdx.x; q < K3; q += blockDim.x) qa_s[q] = -1;
-  __syncthreads();
-  for (int a = threadIdx.x; a < nabf3_active; a += blockDim.x) {
-    const int p = g.p3_active[a];
-    for (int q = g.pn3[p]; q < g.pn3[p + 1]; q++) qa_s[q] = a;
+  // the index tables: precomputed (g.qa), or built here
+  const int *qa = g.qa ? g.qa : qa_s;
+  const int *qp = g.qp ? g.qp : qp_s;
+  if (!g.qa) {
+    for (int q = threadIdx.x; q < K3; q += blockDim.x) qa_s[q] = -1;
+    __syncthreads();
+    for (int a = threadIdx.x; a < nabf3_active; a += blockDim.x) {
+      const int p = g.p3_active[a];
+      for (int q = g.pn3[p]; q < g.pn3[p + 1]; q++) qa_s[q] = a;
+    }
+    if (g.do4)
+      for (int p = threadIdx.x; p < g.nabf4; p += blockDim.x)
+        for (int q = g.pa4[p]; q < g.pa4[p + 1]; q++) qp_s[q] = p;
   }
-  if (g.do4)
-    for (int p = threadIdx.x; p < g.nabf4; p += blockDim.x)
-      for (int q = g.pa4[p]; q < g.pa4[p + 1]; q++) qp_s[q] = p;
   __syncthreads();
 
   // three-body: cb3 index i*ca + cm*(a + nabf3_active*m) + N3*(element pair)
@@ -139,7 +146,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
   for (int item = threadIdx.x; item < nrbf3 * K3; item += blockDim.x) {
     const int q = item % K3;
     const int m = item / K3;
-    const int a = qa_s[q];
+    const int a = qa[q];
     if (a < 0) continue;
     const T pk = static_cast<T>(g.pc3[q]);
     const int iu = NeK3 * m + nelements * q;
@@ -162,7 +169,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
     for (int item = threadIdx.x; item < g.nrbf4 * Q4; item += blockDim.x) {
       const int q = item % Q4;
       const int m = item / Q4;
-      const int p = qp_s[q];
+      const int p = qp[q];
       const T c = static_cast<T>(g.pc4[q]);
       const int iu = NeK3 * m;
       const int idx1 = iu + nelements * g.pb4[q];

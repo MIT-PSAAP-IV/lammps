@@ -84,7 +84,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_NEIGH_HALF = 524288,       // ... with two atoms per wavefront
        HIP_LENV_DPP = 1048576,        // wave sums of the local EA-POD kernel with DPP
        HIP_RAS_FILL = 2097152,        // radial-angular tile filled by (pair, function) lanes
-       HIP_DESC_SPLIT = 4194304 };    // 3/4-body descriptor sums split over up to 8 threads
+       HIP_DESC_SPLIT = 4194304,      // 3/4-body descriptor sums split over up to 8 threads
+       HIP_FC_TABLE = 8388608 };      // index tables of the force coefficients built on the host
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -272,7 +273,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
       HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2 | HIP_NEIGH_ONE |
-      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL | HIP_DESC_SPLIT;
+      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL | HIP_DESC_SPLIT | HIP_FC_TABLE;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -884,6 +885,25 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
     h_p3_qrange[2 * a + 1] = podptr->pn3[podptr->p3_active[a] + 1];
   }
   Kokkos::deep_copy(p3_qrange, h_p3_qrange);
+
+  // active 3-body index of each monomial (or -1) and 4-body channel of each 4-body term, for
+  // the native force coefficients (HIP_FC_TABLE)
+  MemKK::realloc_kokkos(fc_qa, "pair_pod:fc_qa", K3);
+  MemKK::realloc_kokkos(fc_qp, "pair_pod:fc_qp", podptr->Q4 > 0 ? podptr->Q4 : 1);
+  {
+    auto h_qa = Kokkos::create_mirror_view(fc_qa);
+    auto h_qp = Kokkos::create_mirror_view(fc_qp);
+    for (int q = 0; q < K3; q++) h_qa[q] = -1;
+    for (int a = 0; a < nabf3_active; a++) {
+      const int p = podptr->p3_active[a];
+      for (int q = podptr->pn3[p]; q < podptr->pn3[p + 1]; q++) h_qa[q] = a;
+    }
+    for (int q = 0; q < (int) h_qp.extent(0); q++) h_qp[q] = 0;
+    for (int p = 0; p < podptr->nabf4; p++)
+      for (int q = podptr->pa4[p]; q < podptr->pa4[p + 1]; q++) h_qp[q] = p;
+    Kokkos::deep_copy(fc_qa, h_qa);
+    Kokkos::deep_copy(fc_qp, h_qp);
+  }
   build_monomial_factors(pq_m, pq_d, K3);
 
   if (nl4 > 0) {
@@ -2917,7 +2937,11 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
                                      p3_active.data(), pa4.data(), pb4.data(), pc4.data(),
                                      nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
                                      ((nl4 > 0) && (Nij > 2)) ? 1 : 0, desc_atom ? Mdesc : 1,
-                                     desc_atom ? 1 : Ni};
+                                     desc_atom ? 1 : Ni, nullptr, nullptr};
+      if ((hip_flags & HIP_FC_TABLE) && (fc_qa.extent(0) > 0)) {
+        fca.qa = fc_qa.data();
+        fca.qp = fc_qp.data();
+      }
       fc_deferred = angular_otf && (hip_flags & HIP_FUSE_FC);
       if (!fc_deferred)
         fc_done =
