@@ -98,7 +98,7 @@ static constexpr int MEGA_KM = 4;
 #define LMP_POD_MEGA_DPP 1
 #endif
 #ifndef LMP_POD_MEGA_D34L
-#define LMP_POD_MEGA_D34L 0
+#define LMP_POD_MEGA_D34L 1
 #endif
 #ifndef LMP_POD_MEGA_SWZ
 #define LMP_POD_MEGA_SWZ 1
