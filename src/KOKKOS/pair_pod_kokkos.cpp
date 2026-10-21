@@ -2951,6 +2951,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.pool_n = mega_spill ? (int) mega_gpaj.extent(0) : 0;
     a.hist = mega_stats ? mega_hist.data() : nullptr;
     a.freg = mega_freg;
+    a.n_pn3 = nabf3 + 1;
     if (mega_freg >= 2) {
       // recipe of the per-lane force coefficients (see MegaArgs::frec_i), built once
       if (mega_frec_ok < 0) {
@@ -3020,13 +3021,15 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.pai = nullptr;
     a.ptype = nullptr;
 
+    a.hf = PODHIP::mega_is_hf(a) ? 1 : 0;
+    { const char *e = getenv("LAMMPS_POD_MEGA_HFOFF"); if (e && atoi(e)) a.hf = 0; }
     if (!mega_logged && (comm->me == 0)) {
       mega_logged = true;
       utils::logmesg(lmp, "pod mega study: ranges");
       for (int r = 0; r < mega_nr; r++) utils::logmesg(lmp, " {}-{}", mega_r0[r], mega_r1[r]);
       utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {} freg {} "
-                     "spill {} pool {} pairs ({} atoms)\n", cap, mega_pglobal, mega_stop, mega_pad,
-                     a.jtile, mega_lenv, mega_hybrid, mega_freg, mega_spill, a.pool_n, pool_atoms);
+                     "spill {} pool {} pairs ({} atoms) hf {}\n", cap, mega_pglobal, mega_stop, mega_pad,
+                     a.jtile, mega_lenv, mega_hybrid, mega_freg, mega_spill, a.pool_n, pool_atoms, a.hf);
       utils::logmesg(lmp, "pod mega study: Mdesc {} nl2 {} nl3 {} nl4 {} K3 {} L {} nrbf3 {} "
                      "nrbf4 {} nabf3_active {} nabf4 {} Q4 {} nClusters {} nActMax {} nCoeff {} "
                      "maxneigh {} Ni {}\n", Mdesc, nl2, nl3, nl4, K3, L, nrbf3, nrbf4, nabf3_active,

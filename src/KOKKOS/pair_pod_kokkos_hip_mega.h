@@ -87,6 +87,66 @@ static constexpr int MEGA_KM = 4;
 #define LMP_POD_MEGA_S6OVL 0
 #endif
 
+// round 4: DPP 1 = wave sums of the local EA-POD stage with DPP row operations (old path
+// 26b3ec2f3d); D34L 1 = the index tables of the 3/4-body descriptors staged in LDS at the start
+// of stage 3; SWZ 1 = the xor-16 step of the force stage reduction with ds_swizzle
+// HF 1 = a kernel specialized to the sizes of the Hf model (mega_hf_sizes), used when they match
+#ifndef LMP_POD_MEGA_HF
+#define LMP_POD_MEGA_HF 0
+#endif
+#ifndef LMP_POD_MEGA_DPP
+#define LMP_POD_MEGA_DPP 1
+#endif
+#ifndef LMP_POD_MEGA_D34L
+#define LMP_POD_MEGA_D34L 0
+#endif
+#ifndef LMP_POD_MEGA_SWZ
+#define LMP_POD_MEGA_SWZ 1
+#endif
+
+// DPP move of a double (CTRL: DPP control, ROWMASK: rows written)
+template <int CTRL, int ROWMASK> __device__ inline double mega_dpp(const double v)
+{
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_update_dpp(0, (int) (b & 0xffffffffll), CTRL, ROWMASK, 0xf, false);
+  const int hi = __builtin_amdgcn_update_dpp(0, (int) (b >> 32), CTRL, ROWMASK, 0xf, false);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+}
+__device__ inline double mega_lane63(const double v)
+{
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_readlane((int) (b & 0xffffffffll), 63);
+  const int hi = __builtin_amdgcn_readlane((int) (b >> 32), 63);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+}
+// sum over the 64 lanes, in every lane (as wave_sum_dpp of the multi-kernel path)
+__device__ inline double mega_wave_sum(double v)
+{
+#if LMP_POD_MEGA_DPP
+  v += mega_dpp<0xb1, 0xf>(v);     // quad_perm [1,0,3,2]
+  v += mega_dpp<0x4e, 0xf>(v);     // quad_perm [2,3,0,1]
+  v += mega_dpp<0x141, 0xf>(v);    // row_half_mirror
+  v += mega_dpp<0x140, 0xf>(v);    // row_mirror
+  v += mega_dpp<0x142, 0xa>(v);    // row_bcast15 to rows 1 and 3
+  v += mega_dpp<0x143, 0xc>(v);    // row_bcast31 to rows 2 and 3
+  return mega_lane63(v);
+#else
+  return wave_sum(v);
+#endif
+}
+// v of lane ^ 16 (within each half of the wave)
+__device__ inline double mega_xor16(const double v)
+{
+#if LMP_POD_MEGA_SWZ
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_ds_swizzle((int) (b & 0xffffffffll), 0x401f);
+  const int hi = __builtin_amdgcn_ds_swizzle((int) (b >> 32), 0x401f);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+#else
+  return __shfl_xor(v, 16);
+#endif
+}
+
 // copy nw pairs of a window from the pool to the LDS cache (rhat strides cap and pn)
 template <typename T>
 __device__ __attribute__((noinline)) void mega_reload(T *r_s, T *rh_s, int *aj_s, const T *gr,
@@ -186,6 +246,8 @@ template <typename T, typename TA> struct MegaArgs {
   int stop;     // last stage to run (stage timing); MS_N - 1 normally
   int pad;      // extra LDS bytes per block (occupancy experiments)
   int lenv;     // 1: local EA-POD with all lanes of the wave, 0: as the multi-kernel path
+  int n_pn3;    // entries of pn3 (D34L)
+  int hf;       // 1: the sizes are those of the Hf model (mega_hf_sizes), compile-time kernel
   // freg == 2: per monomial k the terms of forcecoeff34_atom() for one element, built on the
   // host: frec_i[MEGA_FRI k] = active 3-body index or -1, number of 4-body terms, then per
   // term (p4, iA, iB); frec_d[MEGA_FRD k] = pc3[k], then pc4 of each term
@@ -256,6 +318,9 @@ __host__ __device__ inline MegaLayout mega_layout(const MegaArgs<T, TA> &a)
     w = mega_max(w, ((np2 + a.nrbf3) * jt + a.nrbf3) * (int) sizeof(T) +
                 (jt + a.K3) * (int) sizeof(int));
   }
+  if (mega_has(S0, S1, 3) && LMP_POD_MEGA_D34L)
+    w = mega_max(w, mega_round(nout * (int) sizeof(T)) +
+                (a.dg.nabf3_active + a.n_pn3 + a.K3 + a.dg.nabf4 + 1 + 4 * a.dg.Q4) * (int) sizeof(int));
   if (mega_has(S0, S1, 4) && !a.lenv)
     w = mega_max(w, mega_round(nout * (int) sizeof(T)) + (4 + 4 * LP_KMAX + 3 * LP_KMAX + 2) * (int) sizeof(TA));
   if (mega_has(S0, S1, 5) && !flane)
@@ -708,6 +773,30 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     g.d3 = d_s + a.nl2;
     g.d4 = d_s + a.nl2 + a.nl3;
     g.Ni = 1;
+    if (LMP_POD_MEGA_D34L) {
+      // index tables in LDS after sumU: p3_active, pn3, pc3, pa4, pb4, pc4
+      int *t_s = reinterpret_cast<int *>(w_s + mega_round(nout * (int) sizeof(T)));
+      const int n1 = g.nabf3_active, n2 = a.n_pn3, n3 = K3, n4 = g.nabf4 + 1, n5 = 3 * g.Q4,
+                n6 = g.Q4;
+      int *s1 = t_s, *s2 = s1 + n1, *s3 = s2 + n2, *s4 = s3 + n3, *s5 = s4 + n4, *s6 = s5 + n5;
+      for (int t = lane; t < n1 + n2 + n3 + n4 + n5 + n6; t += 64) {
+        int v;
+        if (t < n1) v = g.p3_active[t];
+        else if (t < n1 + n2) v = g.pn3[t - n1];
+        else if (t < n1 + n2 + n3) v = g.pc3[t - n1 - n2];
+        else if (t < n1 + n2 + n3 + n4) v = g.pa4[t - n1 - n2 - n3];
+        else if (t < n1 + n2 + n3 + n4 + n5) v = g.pb4[t - n1 - n2 - n3 - n4];
+        else v = g.pc4[t - n1 - n2 - n3 - n4 - n5];
+        t_s[t] = v;
+      }
+      g.p3_active = s1;
+      g.pn3 = s2;
+      g.pc3 = s3;
+      g.pa4 = s4;
+      g.pb4 = s5;
+      g.pc4 = s6;
+      __syncthreads();
+    }
     desc34_atom<T, TA>(g, u_s, 0);
     __syncthreads();
   }
@@ -733,7 +822,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         if (lane + 64 < nDes) p += static_cast<TA>(lpv1 * B[lane + 64]);
       } else
         for (int m = lane; m < nDes; m += 64) p += static_cast<TA>(pr[m] * B[m]);
-      const TA pcai = wave_sum(p);
+      const TA pcai = mega_wave_sum(p);
       // number of right edges below pcai (lower bound), then of the left edges of the next
       // clusters at or below it, as the binary searches of localenv_pca_kernel
       int kl = 0, kni = 1;
@@ -774,7 +863,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       }
 #pragma unroll
       for (int k = 0; k < KM; k++)
-        if (k < kni) sumE[k] = wave_sum(sumE[k]);
+        if (k < kni) sumE[k] = mega_wave_sum(sumE[k]);
       const T pcaiT = static_cast<T>(pcai);
       const int kncct = kl + ncct;
       TA sumfDi = 0.0, S = 0.0;
@@ -1170,13 +1259,14 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
           }
         }
 #undef LMP_POD_MEGA_MONO
-#pragma unroll
-        for (int off = 16; off < 64; off <<= 1) {
-          SA += __shfl_xor(SA, off);
-          SU += __shfl_xor(SU, off);
-          SV += __shfl_xor(SV, off);
-          SW += __shfl_xor(SW, off);
-        }
+        SA += mega_xor16(SA);
+        SU += mega_xor16(SU);
+        SV += mega_xor16(SV);
+        SW += mega_xor16(SW);
+        SA += __shfl_xor(SA, 32);
+        SU += __shfl_xor(SU, 32);
+        SV += __shfl_xor(SV, 32);
+        SW += __shfl_xor(SW, 32);
         if ((lq == 0) && (jb < nt)) {
           T g[9];
           pod_pair_gradients<T>(g, pg, jl0 + jb);
@@ -1237,12 +1327,60 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 #define LMP_POD_MEGA_ATTR
 #endif
 
-template <typename T, typename TA, int S0, int S1, bool PG>
+// round 4 (HF): the sizes of the Hf model as constants, so that loops and index arithmetic
+// of the specialized kernel are resolved at compile time; the host checks that they hold
+template <typename T, typename TA> __host__ __device__ inline void mega_hf_sizes(MegaArgs<T, TA> &b)
+{
+  b.K3 = 20;
+  b.L = 3;
+  b.nrbf3 = 5;
+  b.nrbf2 = 40;
+  b.nDes = 66;
+  b.nl2 = 40;
+  b.nl3 = 20;
+  b.nl4 = 6;
+  b.nCls = 50;
+  b.nActMax = 3;
+  b.nCoeff = 3301;
+  b.jtile = 8;
+  b.n_pn3 = 5;
+  b.dg.nelements = b.fc.nelements = 1;
+  b.dg.nrbf3 = b.fc.nrbf3 = 5;
+  b.dg.nabf3_active = b.fc.nabf3_active = 4;
+  b.dg.nrbf4 = b.fc.nrbf4 = 3;
+  b.dg.nabf4 = b.fc.nabf4 = 2;
+  b.dg.K3 = b.fc.K3 = 20;
+  b.dg.Q4 = b.fc.Q4 = 4;
+  b.dg.do4 = b.fc.do4 = 1;
+  b.ft.nrbf2 = 40;
+  b.ft.nm2 = 4;
+}
+
+template <typename T, typename TA> inline bool mega_is_hf(const MegaArgs<T, TA> &a)
+{
+  MegaArgs<T, TA> b = a;
+  mega_hf_sizes(b);
+  return (a.K3 == b.K3) && (a.L == b.L) && (a.nrbf3 == b.nrbf3) && (a.nrbf2 == b.nrbf2) &&
+      (a.nDes == b.nDes) && (a.nl2 == b.nl2) && (a.nl3 == b.nl3) && (a.nl4 == b.nl4) &&
+      (a.nCls == b.nCls) && (a.nActMax == b.nActMax) && (a.nCoeff == b.nCoeff) &&
+      (a.jtile == b.jtile) && (a.n_pn3 == b.n_pn3) && (a.dg.nelements == 1) &&
+      (a.dg.nrbf3 == 5) && (a.dg.nabf3_active == 4) && (a.dg.nrbf4 == 3) && (a.dg.nabf4 == 2) &&
+      (a.dg.K3 == 20) && (a.dg.Q4 == 4) && (a.dg.do4 == 1) && (a.fc.nrbf4 == 3) &&
+      (a.fc.nabf4 == 2) && (a.fc.Q4 == 4) && (a.fc.nabf3_active == 4) && (a.ft.nrbf2 == 40) &&
+      (a.ft.nm2 == 4);
+}
+
+template <typename T, typename TA, int S0, int S1, bool PG, bool HF = false>
 __global__ void __launch_bounds__(64) LMP_POD_MEGA_ATTR mega_kernel(const MegaArgs<T, TA> a)
 {
   extern __shared__ char lds_raw[];
   TA e = TA(0), v[6];
-  mega_atom<T, TA, S0, S1, false, PG>(a, lds_raw, blockIdx.x, e, v);
+  if constexpr (HF) {
+    MegaArgs<T, TA> b = a;
+    mega_hf_sizes(b);
+    mega_atom<T, TA, S0, S1, false, PG>(b, lds_raw, blockIdx.x, e, v);
+  } else
+    mega_atom<T, TA, S0, S1, false, PG>(a, lds_raw, blockIdx.x, e, v);
 }
 
 // persistent version: each block loops over the atoms blockIdx.x + k*gridDim.x and adds the
@@ -1305,15 +1443,28 @@ bool mega_launch(hipStream_t stream, const MegaArgs<T, TA> &a, int *query = null
     query[1] = 0;
     const void *k = a.pglobal ? reinterpret_cast<const void *>(mega_kernel<T, TA, S0, S1, true>)
                               : reinterpret_cast<const void *>(mega_kernel<T, TA, S0, S1, false>);
+    if constexpr ((S0 == 0) && (S1 == MS_N - 1) && LMP_POD_MEGA_HF)
+      if (a.hf && !a.pglobal)
+        k = reinterpret_cast<const void *>(mega_kernel<T, TA, S0, S1, false, true>);
     return hipOccupancyMaxActiveBlocksPerMultiprocessor(&query[1], k, 64, (size_t) lo.total) ==
         hipSuccess;
   }
   if (a.pglobal)
     hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_kernel<T, TA, S0, S1, true>), dim3(a.Ni), dim3(64),
                        (size_t) lo.total, stream, a);
-  else
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_kernel<T, TA, S0, S1, false>), dim3(a.Ni), dim3(64),
-                       (size_t) lo.total, stream, a);
+  else {
+    bool done = false;
+    if constexpr ((S0 == 0) && (S1 == MS_N - 1) && LMP_POD_MEGA_HF) {
+      if (a.hf) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_kernel<T, TA, S0, S1, false, true>), dim3(a.Ni),
+                           dim3(64), (size_t) lo.total, stream, a);
+        done = true;
+      }
+    }
+    if (!done)
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_kernel<T, TA, S0, S1, false>), dim3(a.Ni), dim3(64),
+                         (size_t) lo.total, stream, a);
+  }
   return hipGetLastError() == hipSuccess;
 }
 
