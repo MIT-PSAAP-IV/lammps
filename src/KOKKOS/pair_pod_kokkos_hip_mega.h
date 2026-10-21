@@ -1329,31 +1329,45 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 
 // round 4 (HF): the sizes of the Hf model as constants, so that loops and index arithmetic
 // of the specialized kernel are resolved at compile time; the host checks that they hold
+// HFSET: which groups of sizes are made constant (study of their register cost): 1 tile,
+// 2 descriptor and cluster counts, 4 3/4-body sizes, 8 angular sizes (K3, L), 16 many-body
+// radial functions (nrbf3), 32 2-body radial functions (nrbf2)
+#ifndef LMP_POD_MEGA_HFSET
+#define LMP_POD_MEGA_HFSET 47
+#endif
 template <typename T, typename TA> __host__ __device__ inline void mega_hf_sizes(MegaArgs<T, TA> &b)
 {
-  b.K3 = 20;
-  b.L = 3;
-  b.nrbf3 = 5;
-  b.nrbf2 = 40;
-  b.nDes = 66;
-  b.nl2 = 40;
-  b.nl3 = 20;
-  b.nl4 = 6;
-  b.nCls = 50;
-  b.nActMax = 3;
-  b.nCoeff = 3301;
-  b.jtile = 8;
-  b.n_pn3 = 5;
-  b.dg.nelements = b.fc.nelements = 1;
-  b.dg.nrbf3 = b.fc.nrbf3 = 5;
-  b.dg.nabf3_active = b.fc.nabf3_active = 4;
-  b.dg.nrbf4 = b.fc.nrbf4 = 3;
-  b.dg.nabf4 = b.fc.nabf4 = 2;
-  b.dg.K3 = b.fc.K3 = 20;
-  b.dg.Q4 = b.fc.Q4 = 4;
-  b.dg.do4 = b.fc.do4 = 1;
-  b.ft.nrbf2 = 40;
-  b.ft.nm2 = 4;
+  if (LMP_POD_MEGA_HFSET & 8) {
+    b.K3 = 20;
+    b.L = 3;
+  }
+  if (LMP_POD_MEGA_HFSET & 16) b.nrbf3 = 5;
+  if (LMP_POD_MEGA_HFSET & 32) {
+    b.nrbf2 = 40;
+    b.ft.nrbf2 = 40;
+    b.ft.nm2 = 4;
+  }
+  if (LMP_POD_MEGA_HFSET & 2) {
+    b.nDes = 66;
+    b.nl2 = 40;
+    b.nl3 = 20;
+    b.nl4 = 6;
+    b.nCls = 50;
+    b.nActMax = 3;
+    b.nCoeff = 3301;
+    b.n_pn3 = 5;
+  }
+  if (LMP_POD_MEGA_HFSET & 1) b.jtile = 8;
+  if (LMP_POD_MEGA_HFSET & 4) {
+    b.dg.nelements = b.fc.nelements = 1;
+    b.dg.nrbf3 = b.fc.nrbf3 = 5;
+    b.dg.nabf3_active = b.fc.nabf3_active = 4;
+    b.dg.nrbf4 = b.fc.nrbf4 = 3;
+    b.dg.nabf4 = b.fc.nabf4 = 2;
+    b.dg.K3 = b.fc.K3 = 20;
+    b.dg.Q4 = b.fc.Q4 = 4;
+    b.dg.do4 = b.fc.do4 = 1;
+  }
 }
 
 template <typename T, typename TA> inline bool mega_is_hf(const MegaArgs<T, TA> &a)
