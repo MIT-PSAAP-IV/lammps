@@ -3032,7 +3032,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
           Kokkos::HIP().hip_stream(), l_fij.data(), ft, forcecoeff.data(),
           fc_deferred ? &fca : nullptr, rsrc,
           pod_geom(rr, rhat, Nij, pair_stride), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements,
-          nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0, hf_sizes(Nij));
+          nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0, hf_sizes(Nij), pq_ex.data());
       if (done) fc_deferred = false;
       if (done && ftally) {
         tallied = true;

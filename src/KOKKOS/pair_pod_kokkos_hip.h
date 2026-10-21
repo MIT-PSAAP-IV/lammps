@@ -1345,7 +1345,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
                                const int *__restrict__ tj, const int *__restrict__ numij,
                                const int *__restrict__ pq_m, const int *__restrict__ pq_d,
                                const int nelements_in, const int nrbf3, const int K3_in,
-                               const int L_in, const int Nij)
+                               const int L_in, const int Nij, const int *__restrict__ pq_ex)
 {
   ForceTally<T, TA> ft = ft_in;
   FcArgs<T> fca = fca_in;
@@ -1397,7 +1397,12 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     for (int t = lane; t < nfc; t += 64) fc_s[t] = forcecoeff[t + nfc * i];
   }
   if (lane < 9) acc_s[lane] = TA(0);
-  pod_exponents<T>(ex_s, pq_m, pq_d, K3);
+  // the HF instance copies the table built on the host (the generic one would need 2 more
+  // VGPRs for it, one occupancy step)
+  if constexpr (HF)
+    pod_exponents_table(ex_s, pq_ex, K3);
+  else
+    pod_exponents<T>(ex_s, pq_m, pq_d, K3);
 
   // (m, e) of the inner index c = 4*cs + lq owned by this lane.  with GROUP the slices are
   // processed in groups of CG = 4 (see below), which recompute (m, e)
@@ -1596,7 +1601,8 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
                         T *forcecoeff, const FcArgs<T> *fca, const RadialSrc<T> &rs,
                         const PairGeom<T> &pg, const int *tj, const int *numij,
                         const int *pq_m, const int *pq_d, int nelements, int nrbf3, int K3,
-                        int Ni, int Nij, bool use_mfma, bool hf = false)
+                        int Ni, int Nij, bool use_mfma, bool hf = false,
+                        const int *pq_ex = nullptr)
 {
   if ((Ni <= 0) || (nrbf3 > MAX_RADIAL) || (nelements > MAX_ELEMENTS)) return false;
   int L = 0;
@@ -1623,11 +1629,11 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
 #define LMP_POD_ALLBODY_MFMA1(CSM, GROUP, H)                                                       \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP, H>),        \
                      dim3(Ni), dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,   \
-                     pq_m, pq_d, nelements, nrbf3, K3, L, Nij)
+                     pq_m, pq_d, nelements, nrbf3, K3, L, Nij, pq_ex)
 #define LMP_POD_ALLBODY_MFMA(CSM, GROUP) LMP_POD_ALLBODY_MFMA1(CSM, GROUP, false)
       // 5 or 6 slices: two groups (90 instead of 208 registers) is faster; with 7 or 8 the
       // second pass over the monomials costs more than the occupancy gains
-      if (hf && (CS <= 2))
+      if (hf && pq_ex && (CS <= 2))
         LMP_POD_ALLBODY_MFMA1(2, false, true);
       else if (CS <= 2)
         LMP_POD_ALLBODY_MFMA(2, false);
@@ -3056,7 +3062,7 @@ __global__ void __launch_bounds__(64)
   const int i = blockIdx.x;
   const int lane = threadIdx.x;
   const long ib = (long) i * sa;
-  const int typei = typeai[i];
+  const int typei = HF ? 0 : typeai[i];    // one element in the Hf model
   const int ncct = typei * nCls;
   const T *pr = proj + typei * nDes;
 
