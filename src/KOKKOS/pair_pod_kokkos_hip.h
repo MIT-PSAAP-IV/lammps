@@ -2859,7 +2859,7 @@ __global__ void __launch_bounds__(256)
    at most KM <= LP_KMAX active clusters.
 ------------------------------------------------------------------------- */
 
-// PRE (nDes <= 128, nCls <= 64): the cluster tables of the element and the projection are
+// PRE (nDes <= 128, nCls <= 64, used with KM = 4): the cluster tables of the element and the projection are
 // loaded into registers at the start, independent of the descriptors, and the coefficients of
 // the active clusters are loaded once for the sums and the force coefficients
 template <typename T, typename TA, int KM, bool PRE>
@@ -3062,12 +3062,12 @@ bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<
 #define LMP_POD_LENV_WAVE(KMV, PREV)                                                            \
   return launch(localenv_wave_kernel<T, TA, KMV, PREV>, Ni, 64, lds, stream, ei, cb, B, g, sumU, \
                 proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm)
-  const bool pre_ok = pre && (a.nDes <= 128) && (a.nCls <= 64);
+  // the preloaded tables only with up to 4 active clusters: with 8 the kernel needs 110
+  // VGPRs (4 waves) instead of 78 (6 waves)
   if (a.nActMax <= 4) {
-    if (pre_ok) LMP_POD_LENV_WAVE(4, true);
+    if (pre && (a.nDes <= 128) && (a.nCls <= 64)) LMP_POD_LENV_WAVE(4, true);
     LMP_POD_LENV_WAVE(4, false);
   }
-  if (pre_ok) LMP_POD_LENV_WAVE(LP_KMAX, true);
   LMP_POD_LENV_WAVE(LP_KMAX, false);
 #undef LMP_POD_LENV_WAVE
 }
