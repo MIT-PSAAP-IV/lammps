@@ -131,7 +131,7 @@ static constexpr int MEGA_KM = 4;
 // over the lanes (2 rounds with the Hf sizes instead of 4 MFMA operand slots), then moved to
 // the operand layout with lane shuffles
 #ifndef LMP_POD_MEGA_FAPK
-#define LMP_POD_MEGA_FAPK 0
+#define LMP_POD_MEGA_FAPK 1
 #endif
 // WBAR: the blocks are one wavefront, so the barriers of the tile loops only order LDS
 // accesses; bit 1 (force stage) and 2 (stage 2) replace them by wavefront-scope fences (no
