@@ -707,6 +707,22 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
    powers.
 ------------------------------------------------------------------------- */
 
+// packed exponents a | b << 8 | c << 16 of the monomials k < K3 into ex_s, from the pq recursion
+template <typename T>
+__device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d, const int K3)
+{
+  if (threadIdx.x == 0) {
+    ex_s[0] = 0;
+    for (int k = 1; k < K3; k++) ex_s[k] = ex_s[pq_m[k]] + (1 << (8 * (pq_d[k] - 1)));
+  }
+}
+
+// the same, from the table pq_ex built on the host, copied by all threads
+__device__ inline void pod_exponents_table(int *ex_s, const int *pq_ex, const int K3)
+{
+  for (int k = threadIdx.x; k < K3; k += blockDim.x) ex_s[k] = pq_ex[k];
+}
+
 // RTM x CTM output tiles (RTM >= ceil(K3/16), CTM >= ceil(Ne*nrbf3/16)) are kept in registers
 // PF 1: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
 // loaded while the current tile is on the matrix cores, and all lanes fill the tile.
@@ -718,7 +734,7 @@ __global__ void __launch_bounds__(64)
                                  const int *__restrict__ numij, const int *__restrict__ pq_m,
                                  const int *__restrict__ pq_d, const int nelements,
                                  const int nrbf3, const int K3, const int L, const int Nij,
-                                 const int jtile)
+                                 const int jtile, const int *__restrict__ pq_ex)
 {
   extern __shared__ char lds_raw[];
   const int L1 = L + 1;
@@ -737,10 +753,7 @@ __global__ void __launch_bounds__(64)
   const int lr = lane & 15, lq = lane >> 4;
   const int RT = (K3 + 15) / 16, CT = (NC + 15) / 16;
 
-  if (lane == 0) {
-    ex_s[0] = 0;
-    for (int k = 1; k < K3; k++) ex_s[k] = ex_s[pq_m[k]] + (1 << (8 * (pq_d[k] - 1)));
-  }
+  pod_exponents_table(ex_s, pq_ex, K3);
   __syncthreads();
 
   // exponents of the A rows owned by this lane (offsets into pow_s), and the
@@ -898,8 +911,10 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
                           const int *tj,
                           const int *numij, const int *pq_m, const int *pq_d, int nelements,
                           int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile,
-                          bool prefetch = false, bool spread = false)
+                          bool prefetch = false, bool spread = false, const int *pq_ex = nullptr)
 {
+  // pq_ex: packed exponents of the monomials (pod_exponents()), needed by the matrix cores
+  if (!pq_ex) use_mfma = false;
   const int nout = nrbf3 * K3;
   if ((Ni <= 0) || (nelements > MAX_ELEMENTS) || (K3 < 1)) return false;
   if (use_mfma) {
@@ -927,7 +942,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
 #define LMP_POD_RAS_MFMA1(R, C, P)                                                               \
   hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, P>), dim3(Ni),   \
                      dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,         \
-                     nelements, nrbf3, K3, L, Nij, jtile)
+                     nelements, nrbf3, K3, L, Nij, jtile, pq_ex)
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
   do {                                                                                           \
     if (pf == 2) LMP_POD_RAS_MFMA1(R, C, 2);                                                     \
@@ -1019,15 +1034,6 @@ __device__ inline void pod_monomial(const T *pd, const int ex, const int L1, T &
   Pu = static_cast<T>(a) * pd[a > 0 ? a - 1 : 0] * pbc;
   Pv = static_cast<T>(b) * pa * pd[L1 + (b > 0 ? b - 1 : 0)] * pc;
   Pw = static_cast<T>(c) * pa * pb * pd[2 * L1 + (c > 0 ? c - 1 : 0)];
-}
-
-template <typename T>
-__device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d, const int K3)
-{
-  if (threadIdx.x == 0) {
-    ex_s[0] = 0;
-    for (int k = 1; k < K3; k++) ex_s[k] = ex_s[pq_m[k]] + (1 << (8 * (pq_d[k] - 1)));
-  }
 }
 
 template <typename T> __device__ inline T pod_sel4(int i, T v0, T v1, T v2, T v3)

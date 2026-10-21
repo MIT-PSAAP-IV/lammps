@@ -857,6 +857,19 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
       if ((a + b + c > abf_degree) || seen[(a * L1 + b) * L1 + c]++) { abf_degree = -1; break; }
     }
   }
+  // packed exponents ex[k] = ex[pq_m[k]] + (1 << 8*(pq_d[k] - 1)) (a | b << 8 | c << 16) for
+  // the matrix core radial-angular sums, which read them instead of running the recursion
+  MemKK::realloc_kokkos(pq_ex, "pair_pod:pq_ex", K3);
+  {
+    auto h_pq_ex = Kokkos::create_mirror_view(pq_ex);
+    h_pq_ex[0] = 0;
+    for (int k = 1; k < K3; k++) {
+      const int m = h_pq_m[k], d = h_pq_d[k];
+      h_pq_ex[k] = ((m >= 0) && (m < k) && (d >= 1) && (d <= 3))
+          ? h_pq_ex[m] + (1 << (8 * (d - 1))) : 0;
+    }
+    Kokkos::deep_copy(pq_ex, h_pq_ex);
+  }
 
   MemKK::realloc_kokkos(p3_active, "p3_active", nabf3_active);
   auto h_p3_active = Kokkos::create_mirror_view(p3_active);
@@ -2365,7 +2378,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
             Kokkos::HIP().hip_stream(), sumU.data(), rsrc, pod_geom(rr, rhat, Nij, pair_stride), tj.data(),
             numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
             (hip_flags & HIP_MFMA) != 0, hip_jtile, (hip_flags & HIP_RAS_PREFETCH) != 0,
-            (hip_flags & HIP_RAS_FILL) != 0);
+            (hip_flags & HIP_RAS_FILL) != 0, pq_ex.data());
       }
     }
 #endif
