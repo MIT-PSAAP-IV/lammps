@@ -310,6 +310,7 @@ class PairPODKokkos : public PairPOD {
   bool lenv_wave_ok(int Nij) const;
   void cb_strided(int Ni);
   void desc_layout(int Nij);
+  bool hf_sizes(int Nij) const;
   void blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);

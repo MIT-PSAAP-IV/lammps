@@ -85,7 +85,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_LENV_DPP = 1048576,        // wave sums of the local EA-POD kernel with DPP
        HIP_RAS_FILL = 2097152,        // radial-angular tile filled by (pair, function) lanes
        HIP_DESC_SPLIT = 4194304,      // 3/4-body descriptor sums split over up to 8 threads
-       HIP_FC_TABLE = 8388608 };      // index tables of the force coefficients built on the host
+       HIP_FC_TABLE = 8388608,        // index tables of the force coefficients built on the host
+       HIP_HF = 16777216 };           // kernel instances with the sizes of the Hf model
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -273,7 +274,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
       HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2 | HIP_NEIGH_ONE |
-      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL | HIP_DESC_SPLIT | HIP_FC_TABLE;
+      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL | HIP_DESC_SPLIT | HIP_FC_TABLE | HIP_HF;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2398,7 +2399,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
             Kokkos::HIP().hip_stream(), sumU.data(), rsrc, pod_geom(rr, rhat, Nij, pair_stride), tj.data(),
             numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
             (hip_flags & HIP_MFMA) != 0, hip_jtile, (hip_flags & HIP_RAS_PREFETCH) != 0,
-            (hip_flags & HIP_RAS_FILL) != 0, pq_ex.data());
+            (hip_flags & HIP_RAS_FILL) != 0, pq_ex.data(), hf_sizes(Nij));
       }
     }
 #endif
@@ -2468,6 +2469,26 @@ void PairPODKokkos<DeviceType>::desc_layout(int Nij)
     desc_atom = desc_in_lenv;
   }
 #endif
+}
+
+// true if the model has the sizes of the Hf benchmark (PODHIP::PodHf) and the block uses the
+// per-atom descriptors, B-splines and both 3- and 4-body terms: the HF kernel instances apply
+template<class DeviceType>
+bool PairPODKokkos<DeviceType>::hf_sizes(int Nij) const
+{
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    using H = PODHIP::PodHf;
+    return (hip_flags & HIP_HF) && desc_atom && use_bspline && (nelements == 1) &&
+        (K3 == H::K3) && (abf_degree == H::L) && (nrbf2 == H::nrbf2) && (Mdesc == H::nDes) &&
+        (nl2 == H::nl2) && (nl3 == H::nl3) && (nl4 == H::nl4) && (nClusters == H::nCls) &&
+        (nMaxActiveClusters == H::nActMax) && (nCoeffPerElement == H::nCoeff) &&
+        (nabf3_active == H::nabf3_active) && (nrbf4 == H::nrbf4) && (nabf4 == H::nabf4) &&
+        (Q4 == H::Q4) && (hip_jtile == H::jtile) && (Nij > 2);
+  }
+#endif
+  (void) Nij;
+  return false;
 }
 
 // cb from the per-atom layout (desc_atom) to the layout [i + Ni*m] read by the other kernels
@@ -2614,7 +2635,7 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       if (!PODHIP::localenv_wave<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), ei.data(),
               cb.data(), B.data(), g, sumU.data(), proj.data(), ledges.data(), redges.data(),
               cent.data(), cefs.data(), invlcut2.data(), invrcut2.data(), tyai.data(), la, nl2,
-              nl3, Ni, nDes, 1, (hip_flags & HIP_LENV_PRE) != 0))
+              nl3, Ni, nDes, 1, (hip_flags & HIP_LENV_PRE) != 0, hf_sizes(lenv_nij)))
         error->one(FLERR, "pair pod/kk: the native local EA-POD kernel failed");
       return;
     }
@@ -3011,7 +3032,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
           Kokkos::HIP().hip_stream(), l_fij.data(), ft, forcecoeff.data(),
           fc_deferred ? &fca : nullptr, rsrc,
           pod_geom(rr, rhat, Nij, pair_stride), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements,
-          nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0);
+          nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0, hf_sizes(Nij));
       if (done) fc_deferred = false;
       if (done && ftally) {
         tallied = true;

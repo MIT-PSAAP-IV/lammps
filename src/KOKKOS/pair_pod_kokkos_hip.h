@@ -445,6 +445,16 @@ bool radialbasis_phi(hipStream_t stream, T *rbf, T *drbf, const PairGeom<T> &pg,
 ------------------------------------------------------------------------- */
 
 static constexpr int MFMA_MAX_RT = 4;    // K3 <= 64 (angular degree <= 5)
+
+// sizes of the Hf benchmark model (one element), compile-time constants in the HF instances of
+// the matrix core and local EA-POD kernels; the host checks that the model has them.  the
+// number of many-body radial functions stays a run-time value (as a constant it costs
+// registers)
+struct PodHf {
+  static constexpr int K3 = 20, L = 3, nrbf2 = 40, nDes = 66, nl2 = 40, nl3 = 20, nl4 = 6;
+  static constexpr int nCls = 50, nActMax = 3, nCoeff = 3301, nabf3_active = 4, nrbf4 = 3;
+  static constexpr int nabf4 = 2, Q4 = 4, jtile = 16;
+};
 static constexpr int MFMA_MAX_CT = 2;    // nelements * nrbf3 <= 32
 
 /* ----------------------------------------------------------------------
@@ -734,15 +744,22 @@ __device__ inline void pod_exponents_table(int *ex_s, const int *pq_ex, const in
 // PF 1: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
 // loaded while the current tile is on the matrix cores, and all lanes fill the tile.
 // PF 2: the tile is filled by all lanes, one (pair, radial function) or (pair, direction) each
-template <typename T, typename TA, int RTM, int CTM, int PF>
+// HF: the sizes of the Hf model (PodHf) as constants
+template <typename T, typename TA, int RTM, int CTM, int PF, bool HF>
 __global__ void __launch_bounds__(64)
-    radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
+    radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs_in,
                                  const PairGeom<T> pg, const int *__restrict__ tj,
                                  const int *__restrict__ numij, const int *__restrict__ pq_m,
-                                 const int *__restrict__ pq_d, const int nelements,
-                                 const int nrbf3, const int K3, const int L, const int Nij,
-                                 const int jtile, const int *__restrict__ pq_ex)
+                                 const int *__restrict__ pq_d, const int nelements_in,
+                                 const int nrbf3, const int K3_in, const int L_in, const int Nij,
+                                 const int jtile_in, const int *__restrict__ pq_ex)
 {
+  RadialSrc<T> rs = rs_in;
+  if constexpr (HF) rs.ne = 1;
+  const int nelements = HF ? 1 : nelements_in;
+  const int K3 = HF ? PodHf::K3 : K3_in;
+  const int L = HF ? PodHf::L : L_in;
+  const int jtile = HF ? PodHf::jtile : jtile_in;
   extern __shared__ char lds_raw[];
   const int L1 = L + 1;
   T *pow_s = reinterpret_cast<T *>(lds_raw);      // [jtile][3][L1]
@@ -918,7 +935,8 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
                           const int *tj,
                           const int *numij, const int *pq_m, const int *pq_d, int nelements,
                           int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile,
-                          bool prefetch = false, bool spread = false, const int *pq_ex = nullptr)
+                          bool prefetch = false, bool spread = false, const int *pq_ex = nullptr,
+                          bool hf = false)
 {
   // pq_ex: packed exponents of the monomials (pod_exponents()), needed by the matrix cores
   if (!pq_ex) use_mfma = false;
@@ -946,17 +964,21 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
         ((size_t) jtile + K3) * sizeof(int);
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
     const int pf = spread ? 2 : ((prefetch && (4 * jtile <= 64)) ? 1 : 0);
-#define LMP_POD_RAS_MFMA1(R, C, P)                                                               \
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, P>), dim3(Ni),   \
+#define LMP_POD_RAS_MFMA1(R, C, P, H)                                                            \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, P, H>), dim3(Ni), \
                      dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,         \
                      nelements, nrbf3, K3, L, Nij, jtile, pq_ex)
+    // the Hf instance: one element, K3 20, the spread fill with a tile of 16 pairs
+    const bool hfi = hf && (nelements == 1) && (K3 == PodHf::K3) && (L == PodHf::L) &&
+        (jtile == PodHf::jtile) && (pf == 2);
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
   do {                                                                                           \
-    if (pf == 2) LMP_POD_RAS_MFMA1(R, C, 2);                                                     \
-    else if (pf == 1) LMP_POD_RAS_MFMA1(R, C, 1);                                                \
-    else LMP_POD_RAS_MFMA1(R, C, 0);                                                             \
+    if (pf == 2) LMP_POD_RAS_MFMA1(R, C, 2, false);                                              \
+    else if (pf == 1) LMP_POD_RAS_MFMA1(R, C, 1, false);                                         \
+    else LMP_POD_RAS_MFMA1(R, C, 0, false);                                                      \
   } while (0)
-    if (CT == 1) {
+    if (hfi) LMP_POD_RAS_MFMA1(2, 1, 2, true);
+    else if (CT == 1) {
       if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
       else if (RT == 2) LMP_POD_RAS_MFMA(2, 1);
       else if (RT == 3) LMP_POD_RAS_MFMA(3, 1);
@@ -1314,15 +1336,40 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #define LMP_POD_ALLBODY_ATTR
 #endif
 
-template <typename T, typename TA, int CSM, int JT, bool GROUP>
+// HF: the sizes of the Hf model (PodHf) as constants (descriptors stored per atom)
+template <typename T, typename TA, int CSM, int JT, bool GROUP, bool HF>
 __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
-    allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft,
-                               const T *__restrict__ forcecoeff, const FcArgs<T> fca,
-                               const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
-                               const int *__restrict__ numij, const int *__restrict__ pq_m,
-                               const int *__restrict__ pq_d, const int nelements,
-                               const int nrbf3, const int K3, const int L, const int Nij)
+    allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft_in,
+                               const T *__restrict__ forcecoeff, const FcArgs<T> fca_in,
+                               const RadialSrc<T> rs_in, const PairGeom<T> pg,
+                               const int *__restrict__ tj, const int *__restrict__ numij,
+                               const int *__restrict__ pq_m, const int *__restrict__ pq_d,
+                               const int nelements_in, const int nrbf3, const int K3_in,
+                               const int L_in, const int Nij)
 {
+  ForceTally<T, TA> ft = ft_in;
+  FcArgs<T> fca = fca_in;
+  RadialSrc<T> rs = rs_in;
+  if constexpr (HF) {
+    ft.nrbf2 = PodHf::nrbf2;
+    ft.nm2 = 4;
+    ft.ca = PodHf::nDes;
+    ft.cm = 1;
+    ft.bs.ne = 1;
+    rs.ne = 1;
+    fca.nelements = 1;
+    fca.nabf3_active = PodHf::nabf3_active;
+    fca.nrbf4 = PodHf::nrbf4;
+    fca.nabf4 = PodHf::nabf4;
+    fca.K3 = PodHf::K3;
+    fca.Q4 = PodHf::Q4;
+    fca.do4 = 1;
+    fca.ca = PodHf::nDes;
+    fca.cm = 1;
+  }
+  const int nelements = HF ? 1 : nelements_in;
+  const int K3 = HF ? PodHf::K3 : K3_in;
+  const int L = HF ? PodHf::L : L_in;
   const int L1 = L + 1;
   const int PD = 3 * L1;    // only the powers; the gradients are recomputed per pair
   const int NeK3 = nelements * K3;
@@ -1549,7 +1596,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
                         T *forcecoeff, const FcArgs<T> *fca, const RadialSrc<T> &rs,
                         const PairGeom<T> &pg, const int *tj, const int *numij,
                         const int *pq_m, const int *pq_d, int nelements, int nrbf3, int K3,
-                        int Ni, int Nij, bool use_mfma)
+                        int Ni, int Nij, bool use_mfma, bool hf = false)
 {
   if ((Ni <= 0) || (nrbf3 > MAX_RADIAL) || (nelements > MAX_ELEMENTS)) return false;
   int L = 0;
@@ -1573,13 +1620,16 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
     const size_t lds = nfc * sizeof(T) + tile;
     const FcArgs<T> g = fuse ? *fca : FcArgs<T>{};
     if (lds <= 65536) {
-#define LMP_POD_ALLBODY_MFMA(CSM, GROUP)                                                           \
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP>),           \
+#define LMP_POD_ALLBODY_MFMA1(CSM, GROUP, H)                                                       \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP, H>),        \
                      dim3(Ni), dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,   \
                      pq_m, pq_d, nelements, nrbf3, K3, L, Nij)
+#define LMP_POD_ALLBODY_MFMA(CSM, GROUP) LMP_POD_ALLBODY_MFMA1(CSM, GROUP, false)
       // 5 or 6 slices: two groups (90 instead of 208 registers) is faster; with 7 or 8 the
       // second pass over the monomials costs more than the occupancy gains
-      if (CS <= 2)
+      if (hf && (CS <= 2))
+        LMP_POD_ALLBODY_MFMA1(2, false, true);
+      else if (CS <= 2)
         LMP_POD_ALLBODY_MFMA(2, false);
       else if (CS <= 4)
         LMP_POD_ALLBODY_MFMA(4, false);
@@ -1588,6 +1638,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
       else
         LMP_POD_ALLBODY_MFMA(8, false);
 #undef LMP_POD_ALLBODY_MFMA
+#undef LMP_POD_ALLBODY_MFMA1
       return hipGetLastError() == hipSuccess;
     }
   }
@@ -2969,17 +3020,35 @@ __global__ void __launch_bounds__(256)
 // PRE (nDes <= 128, nCls <= 64, used with KM = 4): the cluster tables of the element and the projection are
 // loaded into registers at the start, independent of the descriptors, and the coefficients of
 // the active clusters are loaded once for the sums and the force coefficients
-template <typename T, typename TA, int KM, bool PRE>
+// HF: the sizes of the Hf model (PodHf) as constants (descriptors stored per atom)
+template <typename T, typename TA, int KM, bool PRE, bool HF>
 __global__ void __launch_bounds__(64)
     localenv_wave_kernel(T *__restrict__ ei, T *__restrict__ cb, const T *__restrict__ B,
-                         const DescArgs<T> g, const T *__restrict__ sumU,
+                         const DescArgs<T> g_in, const T *__restrict__ sumU,
                          const T *__restrict__ proj, const T *__restrict__ ledges,
                          const T *__restrict__ redges, const T *__restrict__ cent,
                          const T *__restrict__ cefs, const T *__restrict__ invlcut2,
                          const T *__restrict__ invrcut2, const int *__restrict__ typeai,
-                         const LocalEnvArgs a, const int nl2, const int nl3, const int sa,
-                         const int sm)
+                         const LocalEnvArgs a_in, const int nl2_in, const int nl3_in,
+                         const int sa_in, const int sm_in)
 {
+  DescArgs<T> g = g_in;
+  LocalEnvArgs a = a_in;
+  if constexpr (HF) {
+    g.nelements = 1;
+    g.nabf3_active = PodHf::nabf3_active;
+    g.nrbf4 = PodHf::nrbf4;
+    g.nabf4 = PodHf::nabf4;
+    g.K3 = PodHf::K3;
+    g.Q4 = PodHf::Q4;
+    g.do4 = 1;
+    a.nCls = PodHf::nCls;
+    a.nDes = PodHf::nDes;
+    a.nCoeff = PodHf::nCoeff;
+    a.nActMax = PodHf::nActMax;
+  }
+  const int nl2 = HF ? PodHf::nl2 : nl2_in, nl3 = HF ? PodHf::nl3 : nl3_in;
+  const int sa = HF ? PodHf::nDes : sa_in, sm = HF ? 1 : sm_in;
   extern __shared__ char lds_raw[];
   const int nDes = a.nDes, nCls = a.nCls;
   T *d_s = reinterpret_cast<T *>(lds_raw);    // descriptors of atom i
@@ -3160,23 +3229,27 @@ bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<
                    const T *sumU, const T *proj, const T *ledges, const T *redges, const T *cent,
                    const T *cefs, const T *invlcut2, const T *invrcut2, const int *typeai,
                    const LocalEnvArgs &a, int nl2, int nl3, int Ni, int sa, int sm,
-                   bool pre = false)
+                   bool pre = false, bool hf = false)
 {
   if ((Ni <= 0) || (a.nActMax > LP_KMAX) || (a.nActMax < 1)) return false;
   size_t lds = (size_t) a.nDes * sizeof(T);
   if (g.d3) lds += (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T);
   if (lds > 65536) return false;
-#define LMP_POD_LENV_WAVE(KMV, PREV)                                                            \
-  return launch(localenv_wave_kernel<T, TA, KMV, PREV>, Ni, 64, lds, stream, ei, cb, B, g, sumU, \
-                proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm)
+#define LMP_POD_LENV_WAVE1(KMV, PREV, H)                                                        \
+  return launch(localenv_wave_kernel<T, TA, KMV, PREV, H>, Ni, 64, lds, stream, ei, cb, B, g,    \
+                sumU, proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, \
+                sa, sm)
+#define LMP_POD_LENV_WAVE(KMV, PREV) LMP_POD_LENV_WAVE1(KMV, PREV, false)
   // the preloaded tables only with up to 4 active clusters: with 8 the kernel needs 110
   // VGPRs (4 waves) instead of 78 (6 waves)
   if (a.nActMax <= 4) {
+    if (hf && pre && g.d3) LMP_POD_LENV_WAVE1(4, true, true);
     if (pre && (a.nDes <= 128) && (a.nCls <= 64)) LMP_POD_LENV_WAVE(4, true);
     LMP_POD_LENV_WAVE(4, false);
   }
   LMP_POD_LENV_WAVE(LP_KMAX, false);
 #undef LMP_POD_LENV_WAVE
+#undef LMP_POD_LENV_WAVE1
 }
 
 /* ----------------------------------------------------------------------
