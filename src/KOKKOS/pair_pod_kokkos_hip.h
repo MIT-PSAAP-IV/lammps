@@ -2813,7 +2813,10 @@ __global__ void __launch_bounds__(256)
    at most KM <= LP_KMAX active clusters.
 ------------------------------------------------------------------------- */
 
-template <typename T, typename TA, int KM>
+// PRE (nDes <= 128, nCls <= 64): the cluster tables of the element and the projection are
+// loaded into registers at the start, independent of the descriptors, and the coefficients of
+// the active clusters are loaded once for the sums and the force coefficients
+template <typename T, typename TA, int KM, bool PRE>
 __global__ void __launch_bounds__(64)
     localenv_wave_kernel(T *__restrict__ ei, T *__restrict__ cb, const T *__restrict__ B,
                          const DescArgs<T> g, const T *__restrict__ sumU,
@@ -2835,6 +2838,22 @@ __global__ void __launch_bounds__(64)
   const int ncct = typei * nCls;
   const T *pr = proj + typei * nDes;
 
+  // PRE: lane c holds the edges, centroid and cutoffs of cluster c; lane m (and m + 64) the
+  // projection of descriptor m
+  T re = T(0), le = T(0), ce = T(0), irc = T(0), ilc = T(0), pv[2] = {T(0), T(0)};
+  if (PRE) {
+    if (lane < nCls) {
+      re = redges[ncct + lane];
+      le = ledges[ncct + lane];
+      ce = cent[ncct + lane];
+      irc = invrcut2[ncct + lane];
+      ilc = invlcut2[ncct + lane];
+    }
+#pragma unroll
+    for (int q = 0; q < 2; q++)
+      if (lane + 64 * q < nDes) pv[q] = pr[lane + 64 * q];
+  }
+
   if (g.d3) {
     const int S = g.nelements * g.K3 * g.nrbf3;
     for (int t = lane; t < S; t += 64) u_s[t] = sumU[(long) S * i + t];
@@ -2852,31 +2871,60 @@ __global__ void __launch_bounds__(64)
 
   // projection and active clusters, as localenv_pca_split_kernel
   TA p = TA(0);
-  for (int m = lane; m < nDes; m += 64) p += static_cast<TA>(pr[m] * d_s[m]);
+  if (PRE) {
+#pragma unroll
+    for (int q = 0; q < 2; q++)
+      if (lane + 64 * q < nDes) p += static_cast<TA>(pv[q] * d_s[lane + 64 * q]);
+  } else
+    for (int m = lane; m < nDes; m += 64) p += static_cast<TA>(pr[m] * d_s[m]);
   const TA pcai = wave_sum(p);
   int kl = 0, kni = 1;
-  for (int c0 = 0; c0 < nCls; c0 += 64) {
-    const int cc = c0 + lane;
-    kl += __popcll(__ballot((cc < nCls) && (static_cast<TA>(redges[ncct + cc]) < pcai)));
-  }
-  const int hi = min(kl + a.nActMax, nCls);
-  for (int c0 = kl + 1; c0 < hi; c0 += 64) {
-    const int cc = c0 + lane;
-    kni += __popcll(__ballot((cc < hi) && (static_cast<TA>(ledges[ncct + cc]) <= pcai)));
+  if (PRE) {
+    kl = __popcll(__ballot((lane < nCls) && (static_cast<TA>(re) < pcai)));
+    const int hi = min(kl + a.nActMax, nCls);
+    kni += __popcll(__ballot((lane > kl) && (lane < hi) && (static_cast<TA>(le) <= pcai)));
+  } else {
+    for (int c0 = 0; c0 < nCls; c0 += 64) {
+      const int cc = c0 + lane;
+      kl += __popcll(__ballot((cc < nCls) && (static_cast<TA>(redges[ncct + cc]) < pcai)));
+    }
+    const int hi = min(kl + a.nActMax, nCls);
+    for (int c0 = kl + 1; c0 < hi; c0 += 64) {
+      const int cc = c0 + lane;
+      kni += __popcll(__ballot((cc < hi) && (static_cast<TA>(ledges[ncct + cc]) <= pcai)));
+    }
   }
 
   // sumE(k) = sum_m cefs(m, k) B(m), as localenv_atom_split_kernel
   const int nc = a.nCoeff * typei;
   const int knc = 1 + nc + kl * nDes;
   TA sumE[KM];
+  T cf[PRE ? KM : 1][2];
 #pragma unroll
   for (int k = 0; k < KM; k++) sumE[k] = TA(0);
-  for (int m = lane; m < nDes; m += 64) {
-    const T b = d_s[m];
+  if (PRE) {
 #pragma unroll
     for (int k = 0; k < KM; k++)
-      if (k < kni) sumE[k] += static_cast<TA>(cefs[knc + k * nDes + m] * b);
-  }
+#pragma unroll
+      for (int q = 0; q < 2; q++) {
+        const int m = lane + 64 * q;
+        cf[PRE ? k : 0][q] = ((k < kni) && (m < nDes)) ? cefs[knc + k * nDes + m] : T(0);
+      }
+#pragma unroll
+    for (int q = 0; q < 2; q++) {
+      const int m = lane + 64 * q;
+      const T b = (m < nDes) ? d_s[m] : T(0);
+#pragma unroll
+      for (int k = 0; k < KM; k++)
+        if (k < kni) sumE[k] += static_cast<TA>(cf[PRE ? k : 0][q] * b);
+    }
+  } else
+    for (int m = lane; m < nDes; m += 64) {
+      const T b = d_s[m];
+#pragma unroll
+      for (int k = 0; k < KM; k++)
+        if (k < kni) sumE[k] += static_cast<TA>(cefs[knc + k * nDes + m] * b);
+    }
 #pragma unroll
   for (int k = 0; k < KM; k++)
     if (k < kni) sumE[k] = wave_sum(sumE[k]);
@@ -2890,8 +2938,18 @@ __global__ void __launch_bounds__(64)
     Dk[k] = dDk[k] = Pk[k] = T(0);
     if (k < kni) {
       const int kg = k + kncct;
-      const T pc = pcaiT - cent[kg];
-      const T inv_rcut2 = (pc >= static_cast<T>(0.0)) ? invrcut2[kg] : invlcut2[kg];
+      T ck, irk, ilk;
+      if (PRE && (kl + k < nCls)) {
+        ck = __shfl(ce, kl + k);
+        irk = __shfl(irc, kl + k);
+        ilk = __shfl(ilc, kl + k);
+      } else {
+        ck = cent[kg];
+        irk = invrcut2[kg];
+        ilk = invlcut2[kg];
+      }
+      const T pc = pcaiT - ck;
+      const T inv_rcut2 = (pc >= static_cast<T>(0.0)) ? irk : ilk;
       const T y2 = (pc * pc) * inv_rcut2;
       const T omy = static_cast<T>(1.0) - y2 * y2;
       const T omy2 = omy * omy;
@@ -2921,31 +2979,51 @@ __global__ void __launch_bounds__(64)
 
   // force coefficients of the descriptors, as localenv_cb_kernel
   const T Ui = static_cast<T>(A - S * Tt);
-  for (int m = lane; m < nDes; m += 64) {
-    const int kncm = 1 + m + kl * nDes + nc;
-    TA sum = static_cast<TA>(Ui * pr[m]);
+  if (PRE) {
 #pragma unroll
-    for (int k = 0; k < KM; k++)
-      if (k < kni) sum += static_cast<TA>(cefs[kncm + k * nDes] * Pk[k]);
-    cb[ib + (long) sm * m] = static_cast<T>(sum);
-  }
+    for (int q = 0; q < 2; q++) {
+      const int m = lane + 64 * q;
+      if (m < nDes) {
+        TA sum = static_cast<TA>(Ui * pv[q]);
+#pragma unroll
+        for (int k = 0; k < KM; k++)
+          if (k < kni) sum += static_cast<TA>(cf[PRE ? k : 0][q] * Pk[k]);
+        cb[ib + (long) sm * m] = static_cast<T>(sum);
+      }
+    }
+  } else
+    for (int m = lane; m < nDes; m += 64) {
+      const int kncm = 1 + m + kl * nDes + nc;
+      TA sum = static_cast<TA>(Ui * pr[m]);
+#pragma unroll
+      for (int k = 0; k < KM; k++)
+        if (k < kni) sum += static_cast<TA>(cefs[kncm + k * nDes] * Pk[k]);
+      cb[ib + (long) sm * m] = static_cast<T>(sum);
+    }
 }
 
 template <typename T, typename TA>
 bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<T> &g,
                    const T *sumU, const T *proj, const T *ledges, const T *redges, const T *cent,
                    const T *cefs, const T *invlcut2, const T *invrcut2, const int *typeai,
-                   const LocalEnvArgs &a, int nl2, int nl3, int Ni, int sa, int sm)
+                   const LocalEnvArgs &a, int nl2, int nl3, int Ni, int sa, int sm,
+                   bool pre = false)
 {
   if ((Ni <= 0) || (a.nActMax > LP_KMAX) || (a.nActMax < 1)) return false;
   size_t lds = (size_t) a.nDes * sizeof(T);
   if (g.d3) lds += (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T);
   if (lds > 65536) return false;
-  if (a.nActMax <= 4)
-    return launch(localenv_wave_kernel<T, TA, 4>, Ni, 64, lds, stream, ei, cb, B, g, sumU, proj,
-                  ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm);
-  return launch(localenv_wave_kernel<T, TA, LP_KMAX>, Ni, 64, lds, stream, ei, cb, B, g, sumU,
-                proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm);
+#define LMP_POD_LENV_WAVE(KMV, PREV)                                                            \
+  return launch(localenv_wave_kernel<T, TA, KMV, PREV>, Ni, 64, lds, stream, ei, cb, B, g, sumU, \
+                proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm)
+  const bool pre_ok = pre && (a.nDes <= 128) && (a.nCls <= 64);
+  if (a.nActMax <= 4) {
+    if (pre_ok) LMP_POD_LENV_WAVE(4, true);
+    LMP_POD_LENV_WAVE(4, false);
+  }
+  if (pre_ok) LMP_POD_LENV_WAVE(LP_KMAX, true);
+  LMP_POD_LENV_WAVE(LP_KMAX, false);
+#undef LMP_POD_LENV_WAVE
 }
 
 /* ----------------------------------------------------------------------

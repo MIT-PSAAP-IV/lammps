@@ -76,8 +76,9 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_FIXED_PAIRS = 4096,  // ... with a fixed stride per atom, without a scan
        HIP_PAIR_ALIGN = 8192,   // ... rounded up to a multiple of hip_palign pairs
        HIP_RAS_PREFETCH = 16384,    // next pair tile loaded during the radial-angular sums
-       HIP_LENV_ATOM = 32768 };       // 3/4-body descriptors and local EA-POD in one kernel per
+       HIP_LENV_ATOM = 32768,       // 3/4-body descriptors and local EA-POD in one kernel per
                                     // atom, descriptors and their coefficients stored per atom
+       HIP_LENV_PRE = 65536 };        // ... with the cluster tables loaded ahead into registers
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -263,7 +264,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
-      HIP_RAS_PREFETCH | HIP_LENV_ATOM;
+      HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2552,7 +2553,7 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       if (!PODHIP::localenv_wave<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), ei.data(),
               cb.data(), B.data(), g, sumU.data(), proj.data(), ledges.data(), redges.data(),
               cent.data(), cefs.data(), invlcut2.data(), invrcut2.data(), tyai.data(), la, nl2,
-              nl3, Ni, nDes, 1))
+              nl3, Ni, nDes, 1, (hip_flags & HIP_LENV_PRE) != 0))
         error->one(FLERR, "pair pod/kk: the native local EA-POD kernel failed");
       return;
     }
