@@ -485,7 +485,7 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg,
     }
     return;
   }
-  const int pair = s.ti[j] * s.ne + s.tj[j];
+  const int pair = s.ti ? s.ti[j] * s.ne + s.tj[j] : 0;    // ti == nullptr: one element
   const T r = pg.r(j);
   const T r0 = s.r0v[pair];
   const T invdr = s.invdrv[pair];
@@ -523,7 +523,7 @@ template <typename T> struct PairRadial {
       c(nullptr), t(T(0)), s(T(0)), rbf(rs.rbf), drbf(rs.drbf), j(jj), Nij(rs.Nij)
   {
     if (rs.coef == nullptr) return;
-    const int pair = rs.ti[j] * rs.ne + rs.tj[j];
+    const int pair = rs.ti ? rs.ti[j] * rs.ne + rs.tj[j] : 0;
     const T r = pg.r(j);
     const T invdr = rs.invdrv[pair];
     const T tg = (r - rs.r0v[pair]) * invdr;
@@ -971,7 +971,7 @@ template <typename T>
 __device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
                                        const int n, T (&Bq)[4], T (&dBq)[4])
 {
-  const int pair = g.ti[n] * g.ne + g.tj[n];
+  const int pair = g.ti ? g.ti[n] * g.ne + g.tj[n] : 0;    // ti == nullptr: one element
   const T r = pg.r(n);
   const T invh = g.invhv[pair];
   T tg = (r - g.r0v[pair]) * invh;
