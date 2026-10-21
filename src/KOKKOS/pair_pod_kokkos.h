@@ -127,6 +127,7 @@ class PairPODKokkos : public PairPOD {
   t_pod_1i mega_frec_i;
   t_pod_1d mega_frec_d;
   int mega_frec_ok;    // -1 not built, 0 not possible, 1 built
+  t_pod_1i mega_extab, mega_mono;    // round 5 exponent tables (built once)
   bool mega_block(int gi1, int Ni);
   void mega_print_stats(int Ni);
 

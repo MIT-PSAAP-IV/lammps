@@ -2952,6 +2952,30 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.hist = mega_stats ? mega_hist.data() : nullptr;
     a.freg = mega_freg;
     a.n_pn3 = nabf3 + 1;
+    if ((int) mega_extab.extent(0) != K3) {
+      // exponents a | b<<8 | c<<16 of the monomials (as pod_exponents) and, for the force
+      // stage power row [1][x^1..x^L] x 3, the table offsets of x^a and x^(a-1) per direction
+      auto h_pqm = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pq_m);
+      auto h_pqd = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pq_d);
+      MemKK::realloc_kokkos(mega_extab, "pair_pod:mega_extab", K3);
+      MemKK::realloc_kokkos(mega_mono, "pair_pod:mega_mono", 2 * K3);
+      auto h_ex = Kokkos::create_mirror_view(mega_extab);
+      auto h_mo = Kokkos::create_mirror_view(mega_mono);
+      h_ex(0) = 0;
+      for (int k = 1; k < K3; k++) h_ex(k) = h_ex(h_pqm(k)) + (1 << (8 * (h_pqd(k) - 1)));
+      auto off = [&](int d, int n) { return (n == 0) ? 0 : 1 + d * L + (n - 1); };
+      for (int k = 0; k < K3; k++) {
+        const int ea = h_ex(k) & 255, eb = (h_ex(k) >> 8) & 255, ec = (h_ex(k) >> 16) & 255;
+        h_mo(2 * k) = off(0, ea) | (off(1, eb) << 5) | (off(2, ec) << 10) |
+            (off(0, ea > 0 ? ea - 1 : 0) << 15) | (off(1, eb > 0 ? eb - 1 : 0) << 20) |
+            (off(2, ec > 0 ? ec - 1 : 0) << 25);
+        h_mo(2 * k + 1) = ea | (eb << 4) | (ec << 8);
+      }
+      Kokkos::deep_copy(mega_extab, h_ex);
+      Kokkos::deep_copy(mega_mono, h_mo);
+    }
+    a.extab = mega_extab.data();
+    a.mono = reinterpret_cast<const int2 *>(mega_mono.data());
     if (mega_freg >= 2) {
       // recipe of the per-lane force coefficients (see MegaArgs::frec_i), built once
       if (mega_frec_ok < 0) {

@@ -59,7 +59,7 @@ static constexpr int MEGA_FRD = 1 + MEGA_FT;      // doubles per monomial in the
 #define LMP_POD_MEGA_NOZ 1
 #endif
 #ifndef LMP_POD_MEGA_S6POW
-#define LMP_POD_MEGA_S6POW 2
+#define LMP_POD_MEGA_S6POW 3
 #endif
 #ifndef LMP_POD_MEGA_S2POW
 #define LMP_POD_MEGA_S2POW 1
@@ -84,7 +84,7 @@ static constexpr int MEGA_KM = 4;
 #define LMP_POD_MEGA_COLD 1
 #endif
 #ifndef LMP_POD_MEGA_S6OVL
-#define LMP_POD_MEGA_S6OVL 0
+#define LMP_POD_MEGA_S6OVL 1
 #endif
 
 // round 4: DPP 1 = wave sums of the local EA-POD stage with DPP row operations (old path
@@ -93,6 +93,24 @@ static constexpr int MEGA_KM = 4;
 // HF 1 = a kernel specialized to the sizes of the Hf model (mega_hf_sizes), used when they match
 #ifndef LMP_POD_MEGA_HF
 #define LMP_POD_MEGA_HF 1
+#endif
+// round 5: EXT 1 = monomial exponents from host-built tables (extab, mono) loaded in parallel
+// instead of the serial per-atom pod_exponents loop; S6POW 3 = force power table with one
+// shared x^0 = 1 entry per pair and per-monomial table offsets (no selects); N3C = stages in
+// which nrbf3 is a constant of the Hf kernel (4: stage 2, 64: stage 6)
+#ifndef LMP_POD_MEGA_EXT
+#define LMP_POD_MEGA_EXT 1
+#endif
+#ifndef LMP_POD_MEGA_N3C
+#define LMP_POD_MEGA_N3C 68
+#endif
+// RPF 1 = the radial functions (B operands) of the next pair tile of the force stage are
+// evaluated during the current tile (power-table variants)
+#ifndef LMP_POD_MEGA_RPF
+#define LMP_POD_MEGA_RPF 0
+#endif
+#ifndef LMP_POD_MEGA_S6PAD
+#define LMP_POD_MEGA_S6PAD 1    // S6POW 3: padding doubles per power row
 #endif
 #ifndef LMP_POD_MEGA_DPP
 #define LMP_POD_MEGA_DPP 1
@@ -210,6 +228,21 @@ __device__ inline void pod_monomial1(const T *pd, const int ex, const int L, T &
   Pw = static_cast<T>(c) * pa * pb * pod_pw1(pd + 2 * L, c > 0 ? c - 1 : 0);
 }
 
+// pod_monomial() from a power row [1][u^1..u^L][v^1..v^L][w^1..w^L] and the table offsets of
+// x^a, x^(a-1) (0, i.e. the 1, for a = 0) of the three directions, packed in mo.x (5 bits
+// each: a b c a-1 b-1 c-1) with the exponents in mo.y (4 bits each); same products as pod_monomial
+template <typename T>
+__device__ inline void pod_monomial_tab(const T *pd, const int2 mo, T &P, T &Pu, T &Pv, T &Pw)
+{
+  const T pa = pd[mo.x & 31], pb = pd[(mo.x >> 5) & 31], pc = pd[(mo.x >> 10) & 31];
+  const T pa1 = pd[(mo.x >> 15) & 31], pb1 = pd[(mo.x >> 20) & 31], pc1 = pd[(mo.x >> 25) & 31];
+  const T pbc = pb * pc;
+  P = pa * pbc;
+  Pu = static_cast<T>(mo.y & 15) * pa1 * pbc;
+  Pv = static_cast<T>((mo.y >> 4) & 15) * pa * pb1 * pc;
+  Pw = static_cast<T>((mo.y >> 8) & 15) * pa * pb * pc1;
+}
+
 template <typename T, typename TA> struct MegaArgs {
   // neighbors
   NeighArgs na;
@@ -247,6 +280,8 @@ template <typename T, typename TA> struct MegaArgs {
   int pad;      // extra LDS bytes per block (occupancy experiments)
   int lenv;     // 1: local EA-POD with all lanes of the wave, 0: as the multi-kernel path
   int n_pn3;    // entries of pn3 (D34L)
+  const int *extab;    // EXT: exponents a | b<<8 | c<<16 of the monomials k < K3
+  const int2 *mono;    // EXT, S6POW 3: per monomial the 6 table offsets (5 bits each) and a|b<<4|c<<8
   int hf;       // 1: the sizes are those of the Hf model (mega_hf_sizes), compile-time kernel
   // freg == 2: per monomial k the terms of forcecoeff34_atom() for one element, built on the
   // host: frec_i[MEGA_FRI k] = active 3-body index or -1, number of 4-body terms, then per
@@ -330,11 +365,13 @@ __host__ __device__ inline MegaLayout mega_layout(const MegaArgs<T, TA> &a)
   lo.w6 = lo.w;
   if (mega_has(S0, S1, 6)) {
     const int t6 = mega_round(9 * (int) sizeof(TA)) +
-        (LMP_POD_MEGA_S6POW ? MFMA_PAIR_TILE * 3 * (LMP_POD_MEGA_S6POW == 2 ? a.L : L1) *
+        (LMP_POD_MEGA_S6POW ? MFMA_PAIR_TILE *
+                                  (3 * (LMP_POD_MEGA_S6POW >= 2 ? a.L : L1) +
+                                   (LMP_POD_MEGA_S6POW == 3 ? 1 + LMP_POD_MEGA_S6PAD : 0)) *
                                   (int) sizeof(T) +
                               MFMA_PAIR_TILE * (int) sizeof(int)
                             : 0) +
-        a.K3 * (int) sizeof(int);
+        a.K3 * 2 * (int) sizeof(int);
     if (LMP_POD_MEGA_S6OVL && lo.needD) {
       lo.w6 = lo.d + mega_round(a.nl2 * (int) sizeof(T));
       end6 = lo.w6 + mega_round(t6);
@@ -348,7 +385,7 @@ __host__ __device__ inline MegaLayout mega_layout(const MegaArgs<T, TA> &a)
 
 // stages S0..S1 of atom i.  PERSIST: the energy and virial of the atom are added to eacc and
 // vacc (valid in lane 0) instead of being written per atom
-template <typename T, typename TA, int S0, int S1, bool PERSIST, bool PG>
+template <typename T, typename TA, int S0, int S1, bool PERSIST, bool PG, bool HF = false>
 __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const int i, TA &eacc,
                                  TA (&vacc)[6])
 {
@@ -595,6 +632,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     if constexpr (LPRE_AT == MS_RAS) lpre_load();
     constexpr int RTM = MEGA_RTM, CTM = 1;
     const int jtile = a.jtile;
+    const int nrbf3 = (HF && (LMP_POD_MEGA_N3C & 4)) ? 5 : a.nrbf3;
     const int NC = nelements * nrbf3;
     const int RT = (K3 + 15) / 16, CT = (NC + 15) / 16;
     // power table [jtile][3][PL]: x^0..x^L (S2POW 1) or x^1..x^L (S2POW 2)
@@ -605,17 +643,19 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     int *tj_s = reinterpret_cast<int *>(rbf_s + nrbf3 * ldr);    // [jtile]
     int *ex_s = tj_s + jtile;                                    // [K3]
 
-    if (lane == 0) {
-      ex_s[0] = 0;
-      for (int k = 1; k < K3; k++) ex_s[k] = ex_s[a.pq_m[k]] + (1 << (8 * (a.pq_d[k] - 1)));
+    if (!LMP_POD_MEGA_EXT) {
+      if (lane == 0) {
+        ex_s[0] = 0;
+        for (int k = 1; k < K3; k++) ex_s[k] = ex_s[a.pq_m[k]] + (1 << (8 * (a.pq_d[k] - 1)));
+      }
+      __syncthreads();
     }
-    __syncthreads();
     // table offsets of the powers (S2POW), or the exponents
     int oa[RTM], ob[RTM], oc[RTM];
 #pragma unroll
     for (int rt = 0; rt < RTM; rt++) {
       const int k = rt * 16 + lr;
-      const int ex = (k < K3) ? ex_s[k] : 0;
+      const int ex = (k < K3) ? (LMP_POD_MEGA_EXT ? a.extab[k] : ex_s[k]) : 0;
       const int o = LMP_POD_MEGA_S2POW ? PL : 0;
       oa[rt] = ex & 255;
       ob[rt] = o + ((ex >> 8) & 255);
@@ -641,7 +681,9 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       const int nt = min(jtile, nj - j0);
       const int nt4 = (nt + 3) & ~3;
       __syncthreads();
-      if (LMP_POD_MEGA_S2FILL && LMP_POD_MEGA_S2POW && (nt4 * (nrbf3 + 3) <= 64)) {
+      // (with the Hf sizes the test is on the tile size and resolved at compile time)
+      if (LMP_POD_MEGA_S2FILL && LMP_POD_MEGA_S2POW &&
+          (HF ? (jtile * (nrbf3 + 3) <= 64) : (nt4 * (nrbf3 + 3) <= 64))) {
         // lanes [0, nt4*nrbf3): radial function m of pair jj; then direction d of pair jj
         const int nr = nt4 * nrbf3;
         if (lane < nr) {
@@ -1064,8 +1106,12 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
   if constexpr (mega_has(S0, S1, MS_FORCE)) {
     if (MS_FORCE > a.stop) return;
     constexpr int CSM = MEGA_CSM, JT = MFMA_PAIR_TILE;
-    const int PL = (LMP_POD_MEGA_S6POW == 2) ? L1 - 1 : L1;    // powers per direction
-    const int PD = 3 * PL;
+    const int nrbf3 = (HF && (LMP_POD_MEGA_N3C & 64)) ? 5 : a.nrbf3;
+    const int PL = (LMP_POD_MEGA_S6POW >= 2) ? L1 - 1 : L1;    // powers per direction
+    const int PO = (LMP_POD_MEGA_S6POW == 3) ? 1 : 0;           // S6POW 3: row[0] = 1
+    // S6POW 3: row of 3L+1 doubles padded to an odd count (no LDS bank conflicts between the
+    // 16 pair rows read by a row group)
+    const int PD = 3 * PL + PO + ((LMP_POD_MEGA_S6POW == 3) ? LMP_POD_MEGA_S6PAD : 0);
     const int NeK3 = nelements * K3;
     const int NC = nelements * nrbf3;
     const int CS = (NC + 3) / 4;
@@ -1075,6 +1121,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     T *pd_s = reinterpret_cast<T *>(w6_s + mega_round(9 * (int) sizeof(TA)));    // [JT][PD] (S6POW)
     int *tj_s = reinterpret_cast<int *>(pd_s + (LMP_POD_MEGA_S6POW ? JT * PD : 0));    // [JT]
     int *ex_s = tj_s + (LMP_POD_MEGA_S6POW ? JT : 0);                              // [K3]
+    int2 *mo_s = reinterpret_cast<int2 *>(ex_s);    // S6POW 3: [K3] offsets and exponents
     const T *fc_s = f_s;
     int nj = 0;
 
@@ -1145,7 +1192,12 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       }
     __syncthreads();
     if (lane < 9) acc_s[lane] = TA(0);
-    pod_exponents<T>(ex_s, a.pq_m, a.pq_d, K3);
+    if (LMP_POD_MEGA_S6POW == 3) {
+      if (lane < K3) mo_s[lane] = a.mono[lane];
+    } else if (LMP_POD_MEGA_EXT) {
+      if (lane < K3) ex_s[lane] = a.extab[lane];
+    } else
+      pod_exponents<T>(ex_s, a.pq_m, a.pq_d, K3);
     typedef typename Mfma<TA>::acc_t acc_t;
 #if LMP_POD_MEGA_S6POW
     T xh = T(0);
@@ -1163,6 +1215,27 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     nj = np;
     if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 64)) ensure(0);
     fetch(0);
+    // RPF: radial B operands of the tile starting at jbase (column lr), from the LDS window
+    TA brn[CSM], bdrn[CSM];
+    bool rpf_have = false;
+    auto radial_of = [&](const int jbase) {
+      const int ntn = min(JT, nj - jbase);
+      const PairRadial<T> pr(rs, pg, jbase - curw + min(lr, ntn - 1));
+#pragma unroll
+      for (int cs = 0; cs < CSM; cs++) {
+        brn[cs] = bdrn[cs] = TA(0);
+        if ((cs < CS) && (lr < ntn) && (ce[cs] == 0)) {
+          T f, df;
+          pr(cm[cs], f, df);
+          brn[cs] = static_cast<TA>(f);
+          bdrn[cs] = static_cast<TA>(df);
+        }
+      }
+    };
+    if (LMP_POD_MEGA_RPF && (nj > 0) && (min(JT, nj) <= cap)) {
+      radial_of(0);
+      rpf_have = true;
+    }
     // with more than cap pairs, a tile that does not fit in the LDS window starts a new window
     // (and is fetched again); otherwise the window holds all pairs
     for (int j0 = 0; j0 < nj; j0 += JT) {
@@ -1177,10 +1250,11 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       __syncthreads();
       if (lane < 3 * JT) {
         const int jj = lane % JT, d = lane / JT;
-        T *pd = pd_s + jj * PD + d * PL;
+        T *pd = pd_s + jj * PD + PO + d * PL;
         const bool in = (jj < nt);
         T p = in ? static_cast<T>(1.0) : T(0);
-        if (LMP_POD_MEGA_S6POW == 2) p *= xh;
+        if (LMP_POD_MEGA_S6POW >= 2) p *= xh;
+        if (PO && (d == 0)) pd_s[jj * PD] = static_cast<T>(1.0);
         for (int n = 0; n < PL; n++) {
           pd[n] = p;
           p *= xh;
@@ -1196,10 +1270,12 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         const int tjb = tj_s[jb];
         const PairRadial<T> prad(rs, pg, jl0 + min(jb, nt - 1));
         const T *pd = pd_s + jb * PD;
-#if LMP_POD_MEGA_S6POW == 2
-#define LMP_POD_MEGA_MONO(EX, P, Pu, Pv, Pw) pod_monomial1<T>(pd, EX, PL, P, Pu, Pv, Pw)
+#if LMP_POD_MEGA_S6POW == 3
+#define LMP_POD_MEGA_MONO(KV, P, Pu, Pv, Pw) pod_monomial_tab<T>(pd, mo_s[KV], P, Pu, Pv, Pw)
+#elif LMP_POD_MEGA_S6POW == 2
+#define LMP_POD_MEGA_MONO(KV, P, Pu, Pv, Pw) pod_monomial1<T>(pd, ex_s[KV], PL, P, Pu, Pv, Pw)
 #else
-#define LMP_POD_MEGA_MONO(EX, P, Pu, Pv, Pw) pod_monomial<T>(pd, EX, L1, P, Pu, Pv, Pw)
+#define LMP_POD_MEGA_MONO(KV, P, Pu, Pv, Pw) pod_monomial<T>(pd, ex_s[KV], L1, P, Pu, Pv, Pw)
 #endif
 #else
     // no power table: each lane forms the monomials of its pair column from the pair cache
@@ -1221,9 +1297,19 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         const PairRadial<T> prad(rs, pg, jc);
         T ux, vx, wx;
         pg.uvw(jc, ux, vx, wx);
-#define LMP_POD_MEGA_MONO(EX, P, Pu, Pv, Pw) pod_monomial_uvw<T>(ux, vx, wx, EX, P, Pu, Pv, Pw)
+#define LMP_POD_MEGA_MONO(KV, P, Pu, Pv, Pw) pod_monomial_uvw<T>(ux, vx, wx, ex_s[KV], P, Pu, Pv, Pw)
 #endif
         TA br[CSM], bdr[CSM];
+#if LMP_POD_MEGA_S6POW
+        if (LMP_POD_MEGA_RPF && rpf_have && (s0 == 0)) {
+          // evaluated during the previous tile (or before the first)
+#pragma unroll
+          for (int cs = 0; cs < CSM; cs++) {
+            br[cs] = brn[cs];
+            bdr[cs] = bdrn[cs];
+          }
+        } else
+#endif
 #pragma unroll
         for (int cs = 0; cs < CSM; cs++) {
           br[cs] = bdr[cs] = TA(0);
@@ -1234,6 +1320,14 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
             bdr[cs] = static_cast<TA>(df);
           }
         }
+#if LMP_POD_MEGA_S6POW
+        // the next tile, if it lies in the current LDS window
+        if (LMP_POD_MEGA_RPF && (s0 == 0)) {
+          const int jn = j0 + JT;
+          rpf_have = (jn < nj) && (jn - curw + min(JT, nj - jn) <= cap);
+          if (rpf_have) radial_of(jn);
+        }
+#endif
 #pragma unroll
         for (int kt = 0; kt < MEGA_RTM; kt++) {
           if (kt >= KT) break;
@@ -1250,7 +1344,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
             const int kv = 16 * kt + Mfma<TA>::row(lane, v);
             if (kv < K3) {
               T P, Pu, Pv, Pw;
-              LMP_POD_MEGA_MONO(ex_s[kv], P, Pu, Pv, Pw);
+              LMP_POD_MEGA_MONO(kv, P, Pu, Pv, Pw);
               SA += accH[v] * static_cast<TA>(P);
               SU += accG[v] * static_cast<TA>(Pu);
               SV += accG[v] * static_cast<TA>(Pv);
@@ -1392,7 +1486,7 @@ __global__ void __launch_bounds__(64) LMP_POD_MEGA_ATTR mega_kernel(const MegaAr
   if constexpr (HF) {
     MegaArgs<T, TA> b = a;
     mega_hf_sizes(b);
-    mega_atom<T, TA, S0, S1, false, PG>(b, lds_raw, blockIdx.x, e, v);
+    mega_atom<T, TA, S0, S1, false, PG, true>(b, lds_raw, blockIdx.x, e, v);
   } else
     mega_atom<T, TA, S0, S1, false, PG>(a, lds_raw, blockIdx.x, e, v);
 }
