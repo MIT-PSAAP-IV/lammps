@@ -81,7 +81,7 @@ static constexpr int MEGA_KM = 4;
 // S6OVL 1 = the force stage scratch starts after the 2-body coefficients cb2, over cb3/cb4
 // (dead once the force coefficients are in registers) and the stage scratch
 #ifndef LMP_POD_MEGA_COLD
-#define LMP_POD_MEGA_COLD 0
+#define LMP_POD_MEGA_COLD 1
 #endif
 #ifndef LMP_POD_MEGA_S6OVL
 #define LMP_POD_MEGA_S6OVL 0
