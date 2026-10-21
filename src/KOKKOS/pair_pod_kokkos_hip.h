@@ -2135,9 +2135,10 @@ bool neighbor_fused(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, 
    know the atom of a pair); tj is written only with more than one element.
    with d2 != nullptr the B-spline 2-body descriptors of the atom are also
    summed (as twobodydesc_bspline_kernel) and written to d2[i*da + dm*t].
+   HALF: two atoms per wavefront, 32 lanes each (most lists are shorter than 64).
 ------------------------------------------------------------------------- */
 
-template <typename T, typename TA>
+template <typename T, typename TA, bool HALF>
 __global__ void __launch_bounds__(256)
     neighbor_fixed_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
                           int *__restrict__ aj, int *__restrict__ ti, int *__restrict__ tj,
@@ -2148,12 +2149,15 @@ __global__ void __launch_bounds__(256)
                           const int da, const int dm, const int one)
 {
   extern __shared__ char lds_raw[];
-  const int i = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
-  const int lane = threadIdx.x & 63;
+  constexpr int LPA = HALF ? 32 : 64;    // lanes per atom
+  const int slot = threadIdx.x / LPA;    // atom of the block
+  const int i = blockIdx.x * (blockDim.x / LPA) + slot;
+  const int lane = threadIdx.x & (LPA - 1);
+  const int hsel = (threadIdx.x & 63) / LPA;    // half of the wavefront
   const int nd = ne * nrbf2;
-  TA *s_s = reinterpret_cast<TA *>(lds_raw) + (threadIdx.x >> 6) * nd;    // [e][m] of atom i
+  TA *s_s = reinterpret_cast<TA *>(lds_raw) + slot * nd;    // [e][m] of atom i
   if (d2) {
-    for (int t = lane; t < nd; t += 64) s_s[t] = TA(0);
+    for (int t = lane; t < nd; t += LPA) s_s[t] = TA(0);
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
     __builtin_amdgcn_wave_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
@@ -2169,7 +2173,7 @@ __global__ void __launch_bounds__(256)
   const int jnum = a.numneigh[gi];
   const unsigned long long below = (1ull << lane) - 1ull;
   int offset = i * ps;
-  for (int j0 = 0; j0 < jnum; j0 += 64) {
+  for (int j0 = 0; j0 < jnum; j0 += LPA) {
     const int jj = j0 + lane;
     bool in = false;
     int gj = 0, jtype = 0;
@@ -2184,7 +2188,8 @@ __global__ void __launch_bounds__(256)
       } else
         in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
     }
-    const unsigned long long mask = __ballot(in);
+    unsigned long long mask = __ballot(in);
+    if (HALF) mask = (mask >> (32 * hsel)) & 0xffffffffull;
     if (in) {
       const int n = offset + __popcll(mask & below);
       // as in neighbor_list_kernel
@@ -2217,7 +2222,7 @@ __global__ void __launch_bounds__(256)
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
     __builtin_amdgcn_wave_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
-    for (int t = lane; t < nd; t += 64)
+    for (int t = lane; t < nd; t += LPA)
       d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
   }
 }
@@ -2226,14 +2231,19 @@ template <typename T, typename TA>
 bool neighbor_fixed(hipStream_t stream, T *rr, T *rhat, int *typeai, int *aj, int *ti, int *tj,
                     int *numij, const T *x, const T *rcutsq, const NeighArgs &a, int gi1, int Ni,
                     int N, int ps, int ne, T *d2 = nullptr, const BsplineArgs<T> &bs = {},
-                    int nrbf2 = 0, int da = 0, int dm = 0, int one = 0)
+                    int nrbf2 = 0, int da = 0, int dm = 0, int one = 0, bool half = false)
 {
   if (Ni <= 0) return false;
-  const size_t lds = d2 ? (size_t) 4 * ne * nrbf2 * sizeof(TA) : 0;
+  const int apb = half ? 8 : 4;    // atoms per block
+  const size_t lds = d2 ? (size_t) apb * ne * nrbf2 * sizeof(TA) : 0;
   if (lds > 32768) return false;
-  return launch(neighbor_fixed_kernel<T, TA>, nblocks_for(Ni, 4), 256, lds, stream, rr, rhat,
-                typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2, da,
-                dm, one);
+  if (half)
+    return launch(neighbor_fixed_kernel<T, TA, true>, nblocks_for(Ni, apb), 256, lds, stream, rr,
+                  rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2,
+                  da, dm, one);
+  return launch(neighbor_fixed_kernel<T, TA, false>, nblocks_for(Ni, apb), 256, lds, stream, rr,
+                rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2,
+                da, dm, one);
 }
 
 // maximum number of neighbors of the atoms in ilist, or -1 on failure
