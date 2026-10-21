@@ -58,10 +58,24 @@ inline int nblocks_for(long n, int nthreads)
 
 // geometry of the pairs (i, j) of a block: distance r and unit vector (u, v, w) = (rj - ri)/r,
 // stored as rhat[j + N*d], d = 0, 1, 2
+// the pairs of atom i are start .. start+nj-1: with ps == 0 numij holds the prefix sums of
+// the pair counts (start = numij[i]); with ps > 0 the pairs of atom i start at i*ps and
+// numij[i + 1] is their number (fixed-stride list of neighbor_fixed_kernel)
 template <typename T> struct PairGeom {
   const T *rr, *rhat;
   int N;
+  int ps;
   __device__ T r(const int j) const { return rr[j]; }
+  __device__ void range(const int *numij, const int i, int &start, int &nj) const
+  {
+    if (ps > 0) {
+      start = i * ps;
+      nj = numij[i + 1];
+    } else {
+      start = numij[i];
+      nj = numij[i + 1] - start;
+    }
+  }
   __device__ void uvw(const int j, T &u, T &v, T &w) const
   {
     u = rhat[j];
@@ -457,7 +471,7 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg,
     }
     return;
   }
-  const int pair = s.ti[j] * s.ne + s.tj[j];
+  const int pair = (s.ne > 1) ? s.ti[j] * s.ne + s.tj[j] : 0;
   const T r = pg.r(j);
   const T r0 = s.r0v[pair];
   const T invdr = s.invdrv[pair];
@@ -495,7 +509,7 @@ template <typename T> struct PairRadial {
       c(nullptr), t(T(0)), s(T(0)), rbf(rs.rbf), drbf(rs.drbf), j(jj), Nij(rs.Nij)
   {
     if (rs.coef == nullptr) return;
-    const int pair = rs.ti[j] * rs.ne + rs.tj[j];
+    const int pair = (rs.ne > 1) ? rs.ti[j] * rs.ne + rs.tj[j] : 0;
     const T r = pg.r(j);
     const T invdr = rs.invdrv[pair];
     const T tg = (r - rs.r0v[pair]) * invdr;
@@ -539,8 +553,8 @@ __global__ void radialangularsum_otf_kernel(T *__restrict__ sumU, const RadialSr
   int *pqd_s = pqm_s + K3;                                    // [K3]
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
   const int nout = nrbf3 * K3;
 
   for (int t = threadIdx.x; t < K3; t += blockDim.x) {
@@ -685,8 +699,8 @@ __global__ void __launch_bounds__(64)
   int *ex_s = tj_s + jtile;                                      // [K3] packed a | b<<8 | c<<16
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
   const int nout = nrbf3 * K3;
   const int NC = nelements * nrbf3;
   const int lane = threadIdx.x;
@@ -939,7 +953,7 @@ template <typename T>
 __device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
                                        const int n, T (&Bq)[4], T (&dBq)[4])
 {
-  const int pair = g.ti[n] * g.ne + g.tj[n];
+  const int pair = (g.ne > 1) ? g.ti[n] * g.ne + g.tj[n] : 0;
   const T r = pg.r(n);
   const T invh = g.invhv[pair];
   T tg = (r - g.r0v[pair]) * invh;
@@ -993,6 +1007,7 @@ template <typename T, typename TA> struct ForceTally {
   TA *vatom;                   // per-atom virial vatom[a*vs0 + d*vs1], or nullptr
   int vs0, vs1;
   const int *ai, *aj;          // atom indices of the pairs
+  const int *gia;              // atom index of atom i of the block, or nullptr: ai[first pair]
   const T *cb2;                // 2-body force coefficients [i + Ni*m]; nullptr: no 2-body part
   const T *drbf2;              // stored 2-body basis derivatives (used when bs.r0v == nullptr)
   const int *base2;            // stored B-spline base index, or nullptr
@@ -1068,12 +1083,13 @@ __device__ inline void pod_atom_finish(const ForceTally<T, TA> &ft, const int i,
 {
   if ((ft.f == nullptr) || (threadIdx.x != 0)) return;
   if (nj > 0) {
-    TA *fi = ft.f + ft.ai[start] * ft.fs0;
+    const int ga = ft.gia ? ft.gia[i] : ft.ai[start];
+    TA *fi = ft.f + ga * ft.fs0;
     atomicAdd(fi, acc_s[0]);
     atomicAdd(fi + ft.fs1, acc_s[1]);
     atomicAdd(fi + 2 * ft.fs1, acc_s[2]);
     if (ft.vatom) {
-      TA *vi = ft.vatom + ft.ai[start] * ft.vs0;
+      TA *vi = ft.vatom + ga * ft.vs0;
       for (int d = 0; d < 6; ++d) atomicAdd(vi + d * ft.vs1, static_cast<TA>(-0.5) * acc_s[3 + d]);
     }
   }
@@ -1104,8 +1120,8 @@ __global__ void __launch_bounds__(64)
   __shared__ TA acc_s[9];    // force and virial sums of atom i
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
 
   for (int t = threadIdx.x; t < nfc; t += blockDim.x) fc_s[t] = forcecoeff[t + nfc * i];
   if (threadIdx.x < 9) acc_s[threadIdx.x] = TA(0);
@@ -1201,8 +1217,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   int *ex_s = tj_s + JT;                                     // [K3]
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
   const int lane = threadIdx.x;
   const int lr = lane & 15, lq = lane >> 4;
 
@@ -1609,13 +1625,13 @@ template <typename T, typename TA>
 __global__ void __launch_bounds__(64)
     twobodydesc_kernel(T *__restrict__ d2, const T *__restrict__ rbf2, const int *__restrict__ tj,
                        const int *__restrict__ numij, const int nelements, const int nrbf2,
-                       const int Ni, const int Nij)
+                       const int Ni, const int Nij, const int ps)
 {
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int end = numij[i + 1];
+  const int start = (ps > 0) ? i * ps : numij[i];
+  const int end = (ps > 0) ? start + numij[i + 1] : numij[i + 1];
   const int nd = nelements * nrbf2;
   for (int t = threadIdx.x; t < nd; t += blockDim.x) s_s[t] = TA(0);
   __syncthreads();
@@ -1629,13 +1645,13 @@ __global__ void __launch_bounds__(64)
 
 template <typename T, typename TA>
 bool twobodydesc(hipStream_t stream, T *d2, const T *rbf2, const int *tj, const int *numij,
-                 int nelements, int nrbf2, int Ni, int Nij)
+                 int nelements, int nrbf2, int Ni, int Nij, int ps)
 {
   if (Ni <= 0) return false;
   const size_t lds = (size_t) nelements * nrbf2 * sizeof(TA);
   if (lds > 65536) return false;
   hipLaunchKernelGGL(HIP_KERNEL_NAME(twobodydesc_kernel<T, TA>), dim3(Ni), dim3(64), lds, stream,
-                     d2, rbf2, tj, numij, nelements, nrbf2, Ni, Nij);
+                     d2, rbf2, tj, numij, nelements, nrbf2, Ni, Nij, ps);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -2048,6 +2064,75 @@ bool neighbor_fused(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, 
                 tj, numij, status, reinterpret_cast<int *>(status + nb), x, rcutsq, a, gi1, Ni, N);
 }
 
+/* ----------------------------------------------------------------------
+   the pairs of the block with a fixed stride: the pairs of atom i inside the
+   cutoff, in the order of its neighbor list, go to i*ps .. i*ps + numij[i+1]-1
+   (ps >= the largest neighbor count), so that every wavefront writes its
+   pairs without waiting for the counts of the other atoms.  one wavefront per
+   atom, four atoms per block.  idxi, ai and ti are not written (the consumers
+   know the atom of a pair); tj is written only with more than one element.
+------------------------------------------------------------------------- */
+
+template <typename T>
+__global__ void __launch_bounds__(256)
+    neighbor_fixed_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
+                          int *__restrict__ aj, int *__restrict__ ti, int *__restrict__ tj,
+                          int *__restrict__ numij, const T *__restrict__ x,
+                          const T *__restrict__ rcutsq, const NeighArgs a, const int gi1,
+                          const int Ni, const int N, const int ps, const int ne)
+{
+  const int i = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
+  const int lane = threadIdx.x & 63;
+  if (i >= Ni) return;
+  const int gi = a.ilist[gi1 + i];
+  const int itype = a.map[a.type[gi]];
+  const T xi0 = x[gi * a.xs0];
+  const T xi1 = x[gi * a.xs0 + a.xs1];
+  const T xi2 = x[gi * a.xs0 + 2 * a.xs1];
+  const int jnum = a.numneigh[gi];
+  const unsigned long long below = (1ull << lane) - 1ull;
+  int offset = i * ps;
+  for (int j0 = 0; j0 < jnum; j0 += 64) {
+    const int jj = j0 + lane;
+    bool in = false;
+    int gj = 0, jtype = 0;
+    T dx = T(0), dy = T(0), dz = T(0);
+    if (jj < jnum)
+      in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
+    const unsigned long long mask = __ballot(in);
+    if (in) {
+      const int n = offset + __popcll(mask & below);
+      // as in neighbor_list_kernel
+      const T r = sqrt(dx * dx + dy * dy + dz * dz);
+      const T sinv = static_cast<T>(1.0) / r;
+      rr[n] = r;
+      rhat[n] = dx * sinv;
+      rhat[n + N] = dy * sinv;
+      rhat[n + 2 * N] = dz * sinv;
+      aj[n] = gj;
+      if (ne > 1) {
+        ti[n] = itype;
+        tj[n] = jtype;
+      }
+    }
+    offset += __popcll(mask);
+  }
+  if (lane == 0) {
+    numij[i + 1] = offset - i * ps;
+    typeai[i] = itype;
+  }
+}
+
+template <typename T>
+bool neighbor_fixed(hipStream_t stream, T *rr, T *rhat, int *typeai, int *aj, int *ti, int *tj,
+                    int *numij, const T *x, const T *rcutsq, const NeighArgs &a, int gi1, int Ni,
+                    int N, int ps, int ne)
+{
+  if (Ni <= 0) return false;
+  return launch(neighbor_fixed_kernel<T>, nblocks_for(Ni, 4), 256, 0, stream, rr, rhat, typeai,
+                aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne);
+}
+
 // maximum number of neighbors of the atoms in ilist, or -1 on failure
 
 static __global__ void __launch_bounds__(256) max_neighs_kernel(int *__restrict__ out,
@@ -2099,7 +2184,7 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
   }
   auto pair = [&](const int n) {
-  const int pair = ti[n] * ne + tj[n];
+  const int pair = (ne > 1) ? ti[n] * ne + tj[n] : 0;
   const T r = pg.r(n);
   const T r0 = r0v[pair];
   const T invdr = invdrv[pair];
@@ -2133,13 +2218,16 @@ __global__ void __launch_bounds__(256)
     const T dfdt = c1 + t * (static_cast<T>(2.0) * c2 + static_cast<T>(3.0) * c3 * t);
     rbf[n + N * k] = f;
     drbf[n + N * k] = dfdt * invdrr;
-    if (PERATOM && (k < nrbf2)) atomicAdd(d2_s + tj[n] * nrbf2 + k, static_cast<TA>(f));
+    if (PERATOM && (k < nrbf2))
+      atomicAdd(d2_s + ((ne > 1) ? tj[n] : 0) * nrbf2 + k, static_cast<TA>(f));
   }
   };
 
   if (PERATOM) {
     const int i = blockIdx.x;
-    for (int n = numij[i] + threadIdx.x; n < numij[i + 1]; n += blockDim.x) pair(n);
+    int start, nj;
+    pg.range(numij, i, start, nj);
+    for (int n = start + threadIdx.x; n < start + nj; n += blockDim.x) pair(n);
     __syncthreads();
     for (int t = threadIdx.x; t < ne * nrbf2; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(d2_s[t]);
   } else {
@@ -2212,7 +2300,9 @@ __global__ void __launch_bounds__(64)
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
   const int i = blockIdx.x;
-  const int start = numij[i], end = numij[i + 1];
+  int start, nj;
+  pg.range(numij, i, start, nj);
+  const int end = start + nj;
   const int nd = nelements * nrbf2;
   for (int t = threadIdx.x; t < nd; t += blockDim.x) s_s[t] = TA(0);
   __syncthreads();
@@ -2220,11 +2310,11 @@ __global__ void __launch_bounds__(64)
     if (bs.r0v) {
       // B-splines evaluated here instead of read from rbf2/base
       T Bq[4], dBq[4];
-      TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * tj[n];
+      TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * ((nelements > 1) ? tj[n] : 0);
 #pragma unroll
       for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
     } else {
-      TA *se = s_s + base[n] + nrbf2 * tj[n];
+      TA *se = s_s + base[n] + nrbf2 * ((nelements > 1) ? tj[n] : 0);
       for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(rbf2[n + Nij * q]));
     }
   }

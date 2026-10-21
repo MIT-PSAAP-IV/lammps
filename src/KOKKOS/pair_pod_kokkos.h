@@ -105,6 +105,8 @@ class PairPODKokkos : public PairPOD {
   bool pairs_fused;        // true if the pairs of the block come from FusedNeighborList()
   bool fused_abort;        // true if a stage needed the pairs of NeighborCount()/NeighborList()
   bool fuse_neigh_off;     // true once a block had to be computed again without the fused list
+  int pair_stride;         // > 0: the pairs of atom i of the block start at i*pair_stride
+  int block_gi1;           // ilist index before the first atom of the current block
 
   // maximum neighbor count of the current neighbor list, reused until the next build
   int mn_value, mn_inum;

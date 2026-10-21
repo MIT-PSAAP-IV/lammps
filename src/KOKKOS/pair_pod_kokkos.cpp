@@ -72,7 +72,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_FUSE = 128,          // radial Hermite spline evaluated inside its consumers
        HIP_FTALLY = 256,        // 2-body forces and force/virial tally inside the force kernel
        HIP_FUSE_FC = 512,       // 3- and 4-body force coefficients inside the force kernel
-       HIP_FUSE_NEIGH = 1024 }; // pair list in one pass, without reading its size back
+       HIP_FUSE_NEIGH = 1024,   // pair list in one pass, without reading its size back
+       HIP_FIXED_PAIRS = 4096 };  // ... with a fixed stride per atom, without a scan
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -127,12 +128,14 @@ PODHIP::DescArgs<KK_FLOAT> pod_desc_args(const VD &d3, const VD &d4, const VI &p
 }
 
 // distances and unit vectors of the pairs of the current block
-template <class VD> PODHIP::PairGeom<KK_FLOAT> pod_geom(const VD &rr, const VD &rhat, int Nij)
+template <class VD>
+PODHIP::PairGeom<KK_FLOAT> pod_geom(const VD &rr, const VD &rhat, int Nij, int ps)
 {
   PODHIP::PairGeom<KK_FLOAT> g;
   g.rr = rr.data();
   g.rhat = rhat.data();
   g.N = Nij;
+  g.ps = ps;
   return g;
 }
 
@@ -255,12 +258,14 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
-      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH;
+      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
   forces_in_fij = false;
   pairs_fused = false;
+  pair_stride = 0;
+  block_gi1 = 0;
   fused_abort = false;
   fuse_neigh_off = false;
   mn_value = -1;
@@ -550,6 +555,7 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     int gi1 = atomBlocks[block]-1;
     int gi2 = atomBlocks[block+1]-1;
     ni = gi2 - gi1; // total number of atoms in the current atom block
+    block_gi1 = gi1;
 
     // the neighbors within rcut, in one pass if every stage reads them atom by atom
     // (nij is then an upper bound of the number of pairs), otherwise counted first
@@ -1111,6 +1117,7 @@ template<class DeviceType>
 int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
 {
   pairs_fused = false;
+  pair_stride = 0;
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     // the radial bases must be deferred to their consumers or computed atom by atom
@@ -1126,6 +1133,16 @@ int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
     if ((int) hip_lookback.extent(0) < nint)
       MemKK::realloc_kokkos(hip_lookback, "pair_pod:hip_lookback", nint);
     const int N = Ni * maxneigh;
+    // fixed stride: the pairs of atom i at i*maxneigh, written without a scan
+    if ((hip_flags & HIP_FIXED_PAIRS) && (maxneigh > 0) &&
+        PODHIP::neighbor_fixed<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
+            typeai.data(), aj.data(), ti.data(), tj.data(), numij.data(), x.data(), rcutsq.data(),
+            pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq), gi1, Ni, N,
+            maxneigh, nelements)) {
+      pairs_fused = true;
+      pair_stride = maxneigh;
+      return N;
+    }
     if (PODHIP::neighbor_fused<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
             typeai.data(), idxi.data(), ai.data(), aj.data(), ti.data(), tj.data(), numij.data(),
             hip_lookback.data(), x.data(), rcutsq.data(),
@@ -1144,6 +1161,7 @@ template<class DeviceType>
 int PairPODKokkos<DeviceType>::exact_pairs(int gi1)
 {
   pairs_fused = false;
+  pair_stride = 0;
   const int n = NeighborCount(numij, gi1, ni);
   NeighborList(rr, rhat, numij, typeai, idxi, ai, aj, ti, tj, gi1, ni, n);
   return n;
@@ -1359,7 +1377,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
       const bool fuse = !use_bspline && (nelements * nrbf2 <= 256);
       if (fuse) {
         d2_fused = PODHIP::launch(PODHIP::radialbasis_hermite_kernel<KK_FLOAT, KK_ACC_FLOAT, true>,
-            ni, 64, 0, Kokkos::HIP().hip_stream(), l_rbf.data(), l_drbf.data(), pod_geom(l_rr, rhat, N),
+            ni, 64, 0, Kokkos::HIP().hip_stream(), l_rbf.data(), l_drbf.data(), pod_geom(l_rr, rhat, N, pair_stride),
             ti.data(), tj.data(), hermite_r0.data(), hermite_invdr.data(),
             rbf_hermite_coeffs.data(), nelements, nhermite_bins, nrbfmax, N, numij.data(),
             bd.data(), nrbf2, ni);
@@ -1368,7 +1386,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
       if (fused_abort_needed()) return;
       if (PODHIP::launch(PODHIP::radialbasis_hermite_kernel<KK_FLOAT, KK_ACC_FLOAT, false>,
             PODHIP::nblocks_for(N, 256), 256, 0, Kokkos::HIP().hip_stream(), l_rbf.data(),
-            l_drbf.data(), pod_geom(l_rr, rhat, N), ti.data(), tj.data(), hermite_r0.data(),
+            l_drbf.data(), pod_geom(l_rr, rhat, N, pair_stride), ti.data(), tj.data(), hermite_r0.data(),
             hermite_invdr.data(), rbf_hermite_coeffs.data(), nelements, nhermite_bins, nrbfmax, N,
             (const int *) nullptr, (KK_FLOAT *) nullptr, 0, 0))
         return;
@@ -1489,7 +1507,7 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
     if (native_hip && (hip_flags & HIP_PORT) &&
         PODHIP::launch(PODHIP::radialbasis_bspline_kernel<KK_FLOAT>, PODHIP::nblocks_for(N, 256), 256,
             0, Kokkos::HIP().hip_stream(), l_rbf2.data(), l_drbf2.data(), l_base.data(),
-            pod_geom(l_rr, rhat, N), pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2,
+            pod_geom(l_rr, rhat, N, pair_stride), pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2,
                                            bs_ileft), N))
       return;
   }
@@ -1635,7 +1653,7 @@ void PairPODKokkos<DeviceType>::twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_
     if (native_hip && (hip_flags & HIP_TALLY) &&
         PODHIP::twobodydesc<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), d2.data(),
                                                      l_rbf2.data(), l_tj.data(), numij.data(),
-                                                     nelements, l_nrbf2, Ni, Nij))
+                                                     nelements, l_nrbf2, Ni, Nij, pair_stride))
       return;
   }
 #endif
@@ -1659,7 +1677,7 @@ void PairPODKokkos<DeviceType>::twobody_forces(
     if (native_hip && (hip_flags & HIP_PORT) &&
         PODHIP::launch(PODHIP::twobody_forces_kernel<KK_FLOAT, KK_ACC_FLOAT>,
             PODHIP::nblocks_for(Nij, 256), 256, 0, Kokkos::HIP().hip_stream(), fij.data(),
-            cb2.data(), l_drbf2.data(), pod_geom(l_rr, l_rhat, Nij), (const int *) nullptr, l_idxi.data(),
+            cb2.data(), l_drbf2.data(), pod_geom(l_rr, l_rhat, Nij, pair_stride), (const int *) nullptr, l_idxi.data(),
             l_tj.data(), l_nrbf2, l_nrbf2, Ni, Nij, PODHIP::BsplineArgs<KK_FLOAT>{}))
       return;
   }
@@ -1695,7 +1713,7 @@ void PairPODKokkos<DeviceType>::twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2
             (size_t) nelements * l_nrbf2 * sizeof(KK_ACC_FLOAT), Kokkos::HIP().hip_stream(),
             d2.data(), l_rbf2.data(), l_base.data(), l_tj.data(), numij.data(), nelements,
             l_nrbf2, Ni, Nij, pod_bspline_args(bs_deferred, bs_r0, bs_invh, ti, l_tj, nelements,
-                                               bs_nb, l_nrbf2, bs_ileft), pod_geom(rr, rhat, Nij)))
+                                               bs_nb, l_nrbf2, bs_ileft), pod_geom(rr, rhat, Nij, pair_stride)))
       return;
   }
 #endif
@@ -1721,7 +1739,7 @@ void PairPODKokkos<DeviceType>::twobody_forces_bspline(
     if (native_hip && (hip_flags & HIP_PORT) &&
         PODHIP::launch(PODHIP::twobody_forces_kernel<KK_FLOAT, KK_ACC_FLOAT>,
             PODHIP::nblocks_for(Nij, 256), 256, 0, Kokkos::HIP().hip_stream(), fij.data(),
-            cb2.data(), l_drbf2.data(), pod_geom(l_rr, l_rhat, Nij), l_base.data(), l_idxi.data(),
+            cb2.data(), l_drbf2.data(), pod_geom(l_rr, l_rhat, Nij, pair_stride), l_base.data(), l_idxi.data(),
             l_tj.data(), l_nrbf2, 4, Ni, Nij,
             pod_bspline_args(bs_deferred, bs_r0, bs_invh, ti, l_tj, nelements, bs_nb, l_nrbf2,
                              bs_ileft)))
@@ -2253,7 +2271,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
       if (native_hip && (hip_flags & HIP_RADIAL))
         done = PODHIP::radialbasis_phi<KK_FLOAT, KK_ACC_FLOAT>(
-            Kokkos::HIP().hip_stream(), rbf.data(), drbf.data(), pod_geom(rr, rhat, Nij), rin.data(),
+            Kokkos::HIP().hip_stream(), rbf.data(), drbf.data(), pod_geom(rr, rhat, Nij, pair_stride), rin.data(),
             invrdiff.data(), rin.stride(0), rin.stride(1), invrdiff.stride(0), invrdiff.stride(1),
             bessel_neg_alpha.data(), bessel_pi_inv_t1.data(), bessel_dx_factor.data(), Phi.data(),
             ti.data(), tj.data(), nelements, besseldegree, inversedegree, nbesselpars, ns,
@@ -2296,7 +2314,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
         const auto rsrc = pod_radial_src(rbf_deferred, rbf, drbf, rbf_hermite_coeffs, hermite_r0,
                                          hermite_invdr, ti, tj, nelements, nhermite_bins, nrbfmax, Nij);
         angular_otf = PODHIP::radialangularsum_otf<KK_FLOAT, KK_ACC_FLOAT>(
-            Kokkos::HIP().hip_stream(), sumU.data(), rsrc, pod_geom(rr, rhat, Nij), tj.data(),
+            Kokkos::HIP().hip_stream(), sumU.data(), rsrc, pod_geom(rr, rhat, Nij, pair_stride), tj.data(),
             numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
             (hip_flags & HIP_MFMA) != 0, hip_jtile);
       }
@@ -2797,6 +2815,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
         ft.vs1 = d_vatom.stride(1);
         ft.ai = ai.data();
         ft.aj = aj.data();
+        ft.gia = d_ilist.data() + block_gi1;
         ft.cb2 = cb2.data();
         ft.drbf2 = drbf2.data();
         ft.base2 = use_bspline ? bs_base.data() : nullptr;
@@ -2813,7 +2832,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
       const bool done = PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
           Kokkos::HIP().hip_stream(), l_fij.data(), ft, forcecoeff.data(),
           fc_deferred ? &fca : nullptr, rsrc,
-          pod_geom(rr, rhat, Nij), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements,
+          pod_geom(rr, rhat, Nij, pair_stride), tj.data(), numij.data(), pq_m.data(), pq_d.data(), nelements,
           nrbf3, K3, Ni, Nij, (hip_flags & HIP_MFMA_FORCE) != 0);
       if (done) fc_deferred = false;
       if (done && ftally) {
@@ -2960,7 +2979,7 @@ void PairPODKokkos<DeviceType>::tallystress(
         PODHIP::launch(PODHIP::tallystress_kernel<KK_FLOAT, KK_ACC_FLOAT>, PODHIP::nblocks_for(Nij, 256),
             256, 0, Kokkos::HIP().hip_stream(), hip_acc.data(),
             vflag_atom ? d_vatom.data() : (KK_ACC_FLOAT *) nullptr, (int) d_vatom.stride(0),
-            (int) d_vatom.stride(1), l_fij.data(), pod_geom(l_rr, l_rhat, Nij), l_ai.data(),
+            (int) d_vatom.stride(1), l_fij.data(), pod_geom(l_rr, l_rhat, Nij, pair_stride), l_ai.data(),
             l_aj.data(), Nij, vflag_global ? 1 : 0))
       return;
   }
