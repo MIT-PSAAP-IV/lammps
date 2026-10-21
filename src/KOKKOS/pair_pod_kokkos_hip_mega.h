@@ -92,7 +92,7 @@ static constexpr int MEGA_KM = 4;
 // of stage 3; SWZ 1 = the xor-16 step of the force stage reduction with ds_swizzle
 // HF 1 = a kernel specialized to the sizes of the Hf model (mega_hf_sizes), used when they match
 #ifndef LMP_POD_MEGA_HF
-#define LMP_POD_MEGA_HF 0
+#define LMP_POD_MEGA_HF 1
 #endif
 #ifndef LMP_POD_MEGA_DPP
 #define LMP_POD_MEGA_DPP 1
