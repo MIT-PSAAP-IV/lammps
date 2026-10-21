@@ -124,6 +124,9 @@ class PairPODKokkos : public PairPOD {
   t_pod_1i mega_paj, mega_pnp, mega_flag, mega_pai, mega_zero;
   t_pod_1d mega_gpr, mega_gprh;
   t_pod_1i mega_gpaj, mega_hist;
+  t_pod_1i mega_frec_i;
+  t_pod_1d mega_frec_d;
+  int mega_frec_ok;    // -1 not built, 0 not possible, 1 built
   bool mega_block(int gi1, int Ni);
   void mega_print_stats(int Ni);
 

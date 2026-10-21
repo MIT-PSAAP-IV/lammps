@@ -43,6 +43,9 @@ enum { MS_NEIGH = 0, MS_TWOBODY, MS_RAS, MS_DESC, MS_LOCALENV, MS_FC, MS_FORCE, 
 
 static constexpr int MEGA_RTM = 2;    // K3 <= 32 (angular degree <= 3)
 static constexpr int MEGA_CSM = 2;    // nelements * nrbf3 <= 8
+static constexpr int MEGA_FT = 12;                // 4-body terms per monomial (FREG=2 recipe)
+static constexpr int MEGA_FRI = 2 + 3 * MEGA_FT;  // ints per monomial in the recipe
+static constexpr int MEGA_FRD = 1 + MEGA_FT;      // doubles per monomial in the recipe
 
 // pairs beyond cap (study of the code variants): 0 none (dropped, reported), 1 pool (pool full:
 // dropped, reported), 2 pool, and when it is full the windows found again from the neighbor list
@@ -56,7 +59,7 @@ static constexpr int MEGA_CSM = 2;    // nelements * nrbf3 <= 8
 #define LMP_POD_MEGA_NOZ 1
 #endif
 #ifndef LMP_POD_MEGA_S6POW
-#define LMP_POD_MEGA_S6POW 1
+#define LMP_POD_MEGA_S6POW 2
 #endif
 #ifndef LMP_POD_MEGA_S2POW
 #define LMP_POD_MEGA_S2POW 1
@@ -146,6 +149,11 @@ template <typename T, typename TA> struct MegaArgs {
   int stop;     // last stage to run (stage timing); MS_N - 1 normally
   int pad;      // extra LDS bytes per block (occupancy experiments)
   int lenv;     // 1: local EA-POD with all lanes of the wave, 0: as the multi-kernel path
+  // freg == 2: per monomial k the terms of forcecoeff34_atom() for one element, built on the
+  // host: frec_i[MEGA_FRI k] = active 3-body index or -1, number of 4-body terms, then per
+  // term (p4, iA, iB); frec_d[MEGA_FRD k] = pc3[k], then pc4 of each term
+  const int *frec_i;
+  const T *frec_d;
   int sdt;      // 1: spill the descriptors as bd [i + Ni*m] (input of the multi-kernel path)
   int freg;     // 1: forcecoeff in registers during the force stage, its LDS shared with the tile
   int *pai, *ptype;    // sdt: atom index of the first pair slot [i*cap], element of atom i
@@ -882,36 +890,30 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
           continue;
         }
         // forcecoeff34_atom() for one element, entry (m, k) only: the 3-body term, then the
-        // 4-body terms that update it (the order of the LDS atomics there is arbitrary)
+        // 4-body terms that update it (the order of the LDS atomics there is arbitrary), from
+        // the host-built recipe of monomial k
         T f = T(0);
         if (valid) {
-          const FcArgs<T> &g = a.fc;
           const int m = cm[cs];
           const T *cb3 = d_s + a.nl2, *cb4 = d_s + a.nl2 + a.nl3;
           const T *um = u_s + K3 * m;
-          int a3 = -1;
-          for (int q = 0; q < g.nabf3_active; q++) {
-            const int p = g.p3_active[q];
-            if ((k >= g.pn3[p]) && (k < g.pn3[p + 1])) a3 = q;
-          }
+          const int *ri = a.frec_i + MEGA_FRI * k;
+          const T *rd = a.frec_d + MEGA_FRD * k;
+          const int a3 = ri[0], cnt = ri[1];
           if (a3 >= 0) {
-            const T wq = static_cast<T>(g.pc3[k]) * cb3[a3 + g.nabf3_active * m];
+            const T wq = rd[0] * cb3[a3 + a.fc.nabf3_active * m];
             const T t = wq * um[k];
             f = t + t;
           }
-          if (g.do4 && (m < g.nrbf4))    // the 4-body terms use the first nrbf4 radial functions
-            for (int q = 0; q < g.Q4; q++) {
-              const int i1 = g.pb4[q], i2 = g.pb4[q + g.Q4], i3 = g.pb4[q + 2 * g.Q4];
-              if ((i1 != k) && (i2 != k) && (i3 != k)) continue;
-              int p4 = 0;
-              for (int p = 0; p < g.nabf4; p++)
-                if ((q >= g.pa4[p]) && (q < g.pa4[p + 1])) p4 = p;
-              const T c1 = um[i1], c2 = um[i2], c3 = um[i3];
-              const T c4 = static_cast<T>(g.pc4[q]) * cb4[p4 + g.nabf4 * m];
-              if (i3 == k) f += c4 * (c1 * c2);
-              if (i2 == k) f += c4 * (c1 * c3);
-              if (i1 == k) f += c4 * (c2 * c3);
-            }
+          if (m < a.fc.nrbf4) {    // the 4-body terms use the first nrbf4 radial functions
+            const int nb4 = a.fc.nabf4;
+#pragma unroll
+            for (int t = 0; t < MEGA_FT; t++)
+              if (t < cnt) {
+                const int p4 = ri[2 + 3 * t], iA = ri[3 + 3 * t], iB = ri[4 + 3 * t];
+                f += (rd[1 + t] * cb4[p4 + nb4 * m]) * (um[iA] * um[iB]);
+              }
+          }
         }
         fa[kt][cs] = static_cast<TA>(f);
         if (fdbg) {

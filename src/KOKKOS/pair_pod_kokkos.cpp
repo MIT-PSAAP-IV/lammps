@@ -295,7 +295,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
       if (*s == ',') s++;
     }
   }
-  mega_cap = 40;
+  mega_cap = 32;
   env = getenv("LAMMPS_POD_MEGA_CAP");
   if (env) mega_cap = atoi(env);
   mega_pglobal = 0;
@@ -319,7 +319,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   mega_lenv = 1;
   env = getenv("LAMMPS_POD_MEGA_LENV");
   if (env) mega_lenv = atoi(env);
-  mega_freg = 1;
+  mega_freg = 2;    // 2: force coefficients per lane (recipe), 1: in LDS, 3: both, compared
   env = getenv("LAMMPS_POD_MEGA_FREG");
   if (env) mega_freg = atoi(env);
   mega_spill = 1;    // 0: stop if an atom has more than mega_cap pairs
@@ -332,6 +332,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   env = getenv("LAMMPS_POD_MEGA_STATS");
   if (env) mega_stats = atoi(env);
   mega_ncall = 0;
+  mega_frec_ok = -1;
   mega_logged = false;
 }
 
@@ -2948,6 +2949,71 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.pool_n = mega_spill ? (int) mega_gpaj.extent(0) : 0;
     a.hist = mega_stats ? mega_hist.data() : nullptr;
     a.freg = mega_freg;
+    if (mega_freg >= 2) {
+      // recipe of the per-lane force coefficients (see MegaArgs::frec_i), built once
+      if (mega_frec_ok < 0) {
+        auto h_pc3 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pc3);
+        auto h_pn3 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pn3);
+        auto h_p3a = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), p3_active);
+        auto h_pa4 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pa4);
+        auto h_pb4 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pb4);
+        auto h_pc4 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pc4);
+        std::vector<int> ri(PODHIP::MEGA_FRI * K3, 0);
+        std::vector<KK_FLOAT> rd(PODHIP::MEGA_FRD * K3, 0.0);
+        mega_frec_ok = 1;
+        for (int k = 0; k < K3; k++) {
+          int a3 = -1;
+          for (int q = 0; q < nabf3_active; q++) {
+            const int pp = h_p3a(q);
+            if ((k >= h_pn3(pp)) && (k < h_pn3(pp + 1))) a3 = q;
+          }
+          const int bi = PODHIP::MEGA_FRI * k, bdo = PODHIP::MEGA_FRD * k;
+          ri[bi] = a3;
+          rd[bdo] = static_cast<KK_FLOAT>(h_pc3(k));
+          int cnt = 0;
+          for (int q = 0; q < Q4; q++) {
+            const int i1 = h_pb4(q), i2 = h_pb4(q + Q4), i3 = h_pb4(q + 2 * Q4);
+            int p4 = 0;
+            for (int pp = 0; pp < nabf4; pp++)
+              if ((q >= h_pa4(pp)) && (q < h_pa4(pp + 1))) p4 = pp;
+            // the updates of forcecoeff34_atom(): idx3 += c4*(c1*c2), idx2 += c4*(c1*c3),
+            // idx1 += c4*(c2*c3)
+            const int roles[3][3] = {{i3, i1, i2}, {i2, i1, i3}, {i1, i2, i3}};
+            for (int r = 0; r < 3; r++) {
+              if (roles[r][0] != k) continue;
+              if (cnt >= PODHIP::MEGA_FT) {
+                mega_frec_ok = 0;
+                continue;
+              }
+              ri[bi + 2 + 3 * cnt] = p4;
+              ri[bi + 3 + 3 * cnt] = roles[r][1];
+              ri[bi + 4 + 3 * cnt] = roles[r][2];
+              rd[bdo + 1 + cnt] = static_cast<KK_FLOAT>(h_pc4(q));
+              cnt++;
+            }
+          }
+          ri[bi + 1] = cnt;
+        }
+        MemKK::realloc_kokkos(mega_frec_i, "pair_pod:mega_frec_i", PODHIP::MEGA_FRI * K3);
+        MemKK::realloc_kokkos(mega_frec_d, "pair_pod:mega_frec_d", PODHIP::MEGA_FRD * K3);
+        auto h_ri = Kokkos::create_mirror_view(mega_frec_i);
+        auto h_rd = Kokkos::create_mirror_view(mega_frec_d);
+        for (int t = 0; t < PODHIP::MEGA_FRI * K3; t++) h_ri(t) = ri[t];
+        for (int t = 0; t < PODHIP::MEGA_FRD * K3; t++) h_rd(t) = rd[t];
+        Kokkos::deep_copy(mega_frec_i, h_ri);
+        Kokkos::deep_copy(mega_frec_d, h_rd);
+        if (mega_frec_ok && (comm->me == 0)) {
+          int mx = 0;
+          for (int k = 0; k < K3; k++) mx = std::max(mx, ri[PODHIP::MEGA_FRI * k + 1]);
+          utils::logmesg(lmp, "pod mega study: FREG=2 recipe built, at most {} 4-body terms per monomial\n", mx);
+        }
+        if (!mega_frec_ok && (comm->me == 0))
+          utils::logmesg(lmp, "pod mega study: more than {} 4-body terms per monomial, FREG=1\n", PODHIP::MEGA_FT);
+      }
+      if (mega_frec_ok != 1) a.freg = 1;
+      a.frec_i = mega_frec_i.data();
+      a.frec_d = mega_frec_d.data();
+    }
     a.sdt = 0;
     a.pai = nullptr;
     a.ptype = nullptr;
