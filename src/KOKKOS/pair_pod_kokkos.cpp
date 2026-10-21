@@ -79,7 +79,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_LENV_ATOM = 32768,       // 3/4-body descriptors and local EA-POD in one kernel per
                                     // atom, descriptors and their coefficients stored per atom
        HIP_LENV_PRE = 65536,        // ... with the cluster tables loaded ahead into registers
-       HIP_NEIGH_D2 = 131072 };       // B-spline 2-body descriptors summed with the pair list
+       HIP_NEIGH_D2 = 131072,       // B-spline 2-body descriptors summed with the pair list
+       HIP_NEIGH_ONE = 262144 };      // pair list without the atom types if all are element 0
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -265,7 +266,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
-      HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2;
+      HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2 | HIP_NEIGH_ONE;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -277,6 +278,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   lenv_nij = 0;
   desc_atom = false;
   d2_in_neigh = false;
+  one_type = false;
   fused_abort = false;
   fuse_neigh_off = false;
   mn_value = -1;
@@ -383,8 +385,11 @@ void PairPODKokkos<DeviceType>::coeff(int narg, char **arg)
 
   auto h_map = Kokkos::create_mirror_view(d_map);
 
-  for (int i = 1; i <= atom->ntypes; i++)
+  one_type = true;
+  for (int i = 1; i <= atom->ntypes; i++) {
     h_map(i) = map[i];
+    if (map[i] != 0) one_type = false;
+  }
 
   Kokkos::deep_copy(d_map,h_map);
 
@@ -1164,7 +1169,8 @@ int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
               rcutsq.data(), pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x,
               rcutsq), gi1, Ni, Nf, ps, nelements, d2n ? bd.data() : nullptr,
               pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2, bs_ileft),
-              nrbf2, desc_atom ? Mdesc : 1, desc_atom ? 1 : Ni)) {
+              nrbf2, desc_atom ? Mdesc : 1, desc_atom ? 1 : Ni,
+              (one_type && (hip_flags & HIP_NEIGH_ONE)) ? 1 : 0)) {
         pairs_fused = true;
         pair_stride = ps;
         d2_in_neigh = d2n;

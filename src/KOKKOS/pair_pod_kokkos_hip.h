@@ -2145,7 +2145,7 @@ __global__ void __launch_bounds__(256)
                           const T *__restrict__ rcutsq, const NeighArgs a, const int gi1,
                           const int Ni, const int N, const int ps, const int ne,
                           T *__restrict__ d2, const BsplineArgs<T> bs, const int nrbf2,
-                          const int da, const int dm)
+                          const int da, const int dm, const int one)
 {
   extern __shared__ char lds_raw[];
   const int i = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
@@ -2160,7 +2160,9 @@ __global__ void __launch_bounds__(256)
   }
   if (i >= Ni) return;
   const int gi = a.ilist[gi1 + i];
-  const int itype = a.map[a.type[gi]];
+  // one != 0: every atom type is element 0, the types need not be read
+  const int itype = one ? 0 : a.map[a.type[gi]];
+  const T rc0 = one ? rcutsq[0] : T(0);
   const T xi0 = x[gi * a.xs0];
   const T xi1 = x[gi * a.xs0 + a.xs1];
   const T xi2 = x[gi * a.xs0 + 2 * a.xs1];
@@ -2172,8 +2174,16 @@ __global__ void __launch_bounds__(256)
     bool in = false;
     int gj = 0, jtype = 0;
     T dx = T(0), dy = T(0), dz = T(0);
-    if (jj < jnum)
-      in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
+    if (jj < jnum) {
+      if (one) {
+        gj = a.neighbors[gi * a.ns0 + jj * a.ns1] & NEIGHMASK;
+        dx = x[gj * a.xs0] - xi0;
+        dy = x[gj * a.xs0 + a.xs1] - xi1;
+        dz = x[gj * a.xs0 + 2 * a.xs1] - xi2;
+        in = dx * dx + dy * dy + dz * dz < rc0;
+      } else
+        in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
+    }
     const unsigned long long mask = __ballot(in);
     if (in) {
       const int n = offset + __popcll(mask & below);
@@ -2216,14 +2226,14 @@ template <typename T, typename TA>
 bool neighbor_fixed(hipStream_t stream, T *rr, T *rhat, int *typeai, int *aj, int *ti, int *tj,
                     int *numij, const T *x, const T *rcutsq, const NeighArgs &a, int gi1, int Ni,
                     int N, int ps, int ne, T *d2 = nullptr, const BsplineArgs<T> &bs = {},
-                    int nrbf2 = 0, int da = 0, int dm = 0)
+                    int nrbf2 = 0, int da = 0, int dm = 0, int one = 0)
 {
   if (Ni <= 0) return false;
   const size_t lds = d2 ? (size_t) 4 * ne * nrbf2 * sizeof(TA) : 0;
   if (lds > 32768) return false;
   return launch(neighbor_fixed_kernel<T, TA>, nblocks_for(Ni, 4), 256, lds, stream, rr, rhat,
                 typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2, da,
-                dm);
+                dm, one);
 }
 
 // maximum number of neighbors of the atoms in ilist, or -1 on failure

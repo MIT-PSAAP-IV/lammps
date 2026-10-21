@@ -112,6 +112,7 @@ class PairPODKokkos : public PairPOD {
   int lenv_nij;            // number of pairs of the block (for the local EA-POD kernel)
   bool desc_atom;          // true if d2 (in bd) and cb are stored per atom, [i*Mdesc + m]
   bool d2_in_neigh;        // true if the 2-body descriptors were computed with the pairs
+  bool one_type;           // true if every atom type is element 0
   t_pod_1d hip_cbt;        // scratch of cb_strided()
 
   // maximum neighbor count of the current neighbor list, reused until the next build
