@@ -106,6 +106,48 @@ static constexpr int MEGA_KM = 4;
 #endif
 // RPF 1 = the radial functions (B operands) of the next pair tile of the force stage are
 // evaluated during the current tile (power-table variants)
+// DFIN: the tally of the pair forces of the force stage (2-body force, global and LDS atomics)
+// is deferred over up to 4 pair tiles, tile t kept by lane group t % 4, so that it runs with up
+// to 64 lanes instead of 16 (1: the pair sums are kept, 2: the 3/4-body pair force is kept)
+#ifndef LMP_POD_MEGA_DFIN
+#define LMP_POD_MEGA_DFIN 1
+#endif
+// ACCR 1: the force and virial of atom i are summed over the lanes (DPP) at each deferred tally
+// instead of with LDS atomics (DFIN only)
+#ifndef LMP_POD_MEGA_ACCR
+#define LMP_POD_MEGA_ACCR 1
+#endif
+// timing diagnostics only (wrong forces): 1 no global force atomics, 2 no LDS atomics of the
+// atom sums, 4 no pair tally at all
+#ifndef LMP_POD_MEGA_NOATOM
+#define LMP_POD_MEGA_NOATOM 0
+#endif
+// S2RT 1: the radial functions of the stage 2 tile are stored [pair][m] instead of [m][pair]
+// (no LDS bank conflicts between the 4 pairs read by the lane groups)
+#ifndef LMP_POD_MEGA_S2RT
+#define LMP_POD_MEGA_S2RT 0
+#endif
+// FAPK 1: the force coefficients (FREG 2) are formed for the NC*K3 valid (c, k) entries packed
+// over the lanes (2 rounds with the Hf sizes instead of 4 MFMA operand slots), then moved to
+// the operand layout with lane shuffles
+#ifndef LMP_POD_MEGA_FAPK
+#define LMP_POD_MEGA_FAPK 0
+#endif
+// WBAR: the blocks are one wavefront, so the barriers of the tile loops only order LDS
+// accesses; bit 1 (force stage) and 2 (stage 2) replace them by wavefront-scope fences (no
+// wait for outstanding global memory operations)
+#ifndef LMP_POD_MEGA_WBAR
+#define LMP_POD_MEGA_WBAR 0
+#endif
+template <int BIT> __device__ inline void mega_tile_sync()
+{
+  if constexpr ((LMP_POD_MEGA_WBAR & BIT) != 0) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+  } else
+    __syncthreads();
+}
 #ifndef LMP_POD_MEGA_RPF
 #define LMP_POD_MEGA_RPF 0
 #endif
@@ -163,6 +205,77 @@ __device__ inline double mega_xor16(const double v)
 #else
   return __shfl_xor(v, 16);
 #endif
+}
+
+// pod_pair_finish() split: the 3/4-body force of pair j from the pair sums and gradients ...
+template <typename T, typename TA>
+__device__ inline void mega_pair_force(const T *g, const TA SA, const TA SU, const TA SV,
+                                       const TA SW, TA &fx, TA &fy, TA &fz)
+{
+  fx = SU * static_cast<TA>(g[0]) + SV * static_cast<TA>(g[1]) + SW * static_cast<TA>(g[2]) +
+      SA * static_cast<TA>(g[6]);
+  fy = SU * static_cast<TA>(g[1]) + SV * static_cast<TA>(g[3]) + SW * static_cast<TA>(g[4]) +
+      SA * static_cast<TA>(g[7]);
+  fz = SU * static_cast<TA>(g[2]) + SV * static_cast<TA>(g[4]) + SW * static_cast<TA>(g[5]) +
+      SA * static_cast<TA>(g[8]);
+}
+// ... and its 2-body force and tally (into acc_s with LDS atomics, or LACC: added to the
+// lane sums o[9] of the force and virial of atom i)
+template <typename T, typename TA, bool LACC>
+__device__ inline void mega_pair_tally(const ForceTally<T, TA> &ft, const PairGeom<T> &pg,
+                                       const int j, const int e, TA fx, TA fy, TA fz, TA *acc_s,
+                                       TA (&o)[9])
+{
+  T u, v, w;
+  pg.uvw(j, u, v, w);
+  const T r = pg.r(j);
+  if (ft.cb2) {
+    TA cR = TA(0);
+    if (ft.bs.r0v) {
+      T Bq[4], dBq[4];
+      const int ii = ft.Ni * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
+#pragma unroll
+      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * dBq[m]);
+    } else {
+      const int ii = ft.Ni * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
+      for (int m = 0; m < ft.nm2; ++m)
+        cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * ft.drbf2[j + pg.N * m]);
+    }
+    cR *= static_cast<TA>(r);
+    fx += cR * static_cast<TA>(u);
+    fy += cR * static_cast<TA>(v);
+    fz += cR * static_cast<TA>(w);
+  }
+  TA *fj = ft.f + ft.aj[j] * ft.fs0;
+  if (!(LMP_POD_MEGA_NOATOM & 1)) {
+    atomicAdd(fj, -fx);
+    atomicAdd(fj + ft.fs1, -fy);
+    atomicAdd(fj + 2 * ft.fs1, -fz);
+  } else if (fx == TA(1.2345e300))
+    fj[0] = fy + fz;
+  if (LACC) {
+    o[0] += fx;
+    o[1] += fy;
+    o[2] += fz;
+  } else if (!(LMP_POD_MEGA_NOATOM & 2)) {
+    atomicAdd(acc_s + 0, fx);
+    atomicAdd(acc_s + 1, fy);
+    atomicAdd(acc_s + 2, fz);
+  }
+  if (ft.vir || ft.vatom) {
+    const TA rx = static_cast<TA>(r * u), ry = static_cast<TA>(r * v), rz = static_cast<TA>(r * w);
+    const TA vl[6] = {rx * fx, ry * fy, rz * fz, rx * fy, rx * fz, ry * fz};
+#pragma unroll
+    for (int d = 0; d < 6; ++d) {
+      if (LACC) o[3 + d] += vl[d];
+      else if (!(LMP_POD_MEGA_NOATOM & 2)) atomicAdd(acc_s + 3 + d, vl[d]);
+    }
+    if (ft.vatom) {
+      TA *vj = ft.vatom + ft.aj[j] * ft.vs0;
+#pragma unroll
+      for (int d = 0; d < 6; ++d) atomicAdd(vj + d * ft.vs1, static_cast<TA>(-0.5) * vl[d]);
+    }
+  }
 }
 
 // copy nw pairs of a window from the pool to the LDS cache (rhat strides cap and pn)
@@ -640,6 +753,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     T *pow_s = reinterpret_cast<T *>(w_s);
     const int ldr = jtile + 1;
     T *rbf_s = pow_s + (LMP_POD_MEGA_S2POW ? jtile * 3 * PL : 0);    // [nrbf3][ldr]
+    // (S2RT: [jtile][nrbf3])
+#define LMP_POD_MEGA_RB(m, jj) (LMP_POD_MEGA_S2RT ? (jj) * nrbf3 + (m) : (m) * ldr + (jj))
     int *tj_s = reinterpret_cast<int *>(rbf_s + nrbf3 * ldr);    // [jtile]
     int *ex_s = tj_s + jtile;                                    // [K3]
 
@@ -680,7 +795,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     for (int j0 = 0; j0 < nj; j0 += jtile) {
       const int nt = min(jtile, nj - j0);
       const int nt4 = (nt + 3) & ~3;
-      __syncthreads();
+      mega_tile_sync<2>();
       // (with the Hf sizes the test is on the tile size and resolved at compile time)
       if (LMP_POD_MEGA_S2FILL && LMP_POD_MEGA_S2POW &&
           (HF ? (jtile * (nrbf3 + 3) <= 64) : (nt4 * (nrbf3 + 3) <= 64))) {
@@ -693,7 +808,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
             const PairRadial<T> prad(rs, pg, j0 + jj);
             prad(m, f, df);
           }
-          rbf_s[m * ldr + jj] = f;
+          rbf_s[LMP_POD_MEGA_RB(m, jj)] = f;
           if (m == 0) tj_s[jj] = (jj < nt) ? 0 : -1;
         } else if (lane < nr + 3 * nt4) {
           const int q = lane - nr, jj = q / 3, d = q - 3 * jj;
@@ -732,16 +847,16 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
               pz *= w;
             }
           }
-          pair_radial<0>(rs, pg, j, nrbf3, [&](int m, T f, T) { rbf_s[m * ldr + jj] = f; });
+          pair_radial<0>(rs, pg, j, nrbf3, [&](int m, T f, T) { rbf_s[LMP_POD_MEGA_RB(m, jj)] = f; });
           tj_s[jj] = 0;
         } else {
           if (LMP_POD_MEGA_S2POW)
             for (int n = 0; n < 3 * PL; n++) pw[n] = T(0);
-          for (int m = 0; m < nrbf3; m++) rbf_s[m * ldr + jj] = T(0);
+          for (int m = 0; m < nrbf3; m++) rbf_s[LMP_POD_MEGA_RB(m, jj)] = T(0);
           tj_s[jj] = -1;
         }
       }
-      __syncthreads();
+      mega_tile_sync<2>();
 
       for (int q = 0; q < nt4; q += 4) {
         const int jj = q + lq;
@@ -774,7 +889,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
 #endif
 #pragma unroll
         for (int ct = 0; ct < CTM; ct++)
-          b[ct] = ((bm[ct] >= 0) && (be[ct] == tjj)) ? static_cast<TA>(rbf_s[bm[ct] * ldr + jj])
+          b[ct] = ((bm[ct] >= 0) && (be[ct] == tjj)) ? static_cast<TA>(rbf_s[LMP_POD_MEGA_RB(bm[ct], jj)])
                                                      : TA(0);
 #pragma unroll
         for (int rt = 0; rt < RTM; rt++)
@@ -786,6 +901,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     }
     };
     win2(min(np, cap));
+#undef LMP_POD_MEGA_RB
     if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 4)) {
       if (np > cap)
         for (int wb = cap; wb < np; wb += cap) {
@@ -1145,6 +1261,61 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     TA fa[MEGA_RTM][CSM];
     const bool flane = (a.freg == 2) && mega_has(S0, S1, MS_FC);
     const bool fdbg = (a.freg == 3) && mega_has(S0, S1, MS_FC);    // both, report differences
+    // forcecoeff34_atom() for one element, entry (m, k) only (see below)
+    auto frecipe = [&](const int m, const int k) -> T {
+      const T *cb3 = d_s + a.nl2, *cb4 = d_s + a.nl2 + a.nl3;
+      const T *um = u_s + K3 * m;
+      const int *ri = a.frec_i + MEGA_FRI * k;
+      const T *rd = a.frec_d + MEGA_FRD * k;
+      const int a3 = ri[0], cnt = ri[1];
+      T f = T(0);
+      if (a3 >= 0) {
+        const T wq = rd[0] * cb3[a3 + a.fc.nabf3_active * m];
+        const T t = wq * um[k];
+        f = t + t;
+      }
+      if (m < a.fc.nrbf4) {
+        const int nb4 = a.fc.nabf4;
+#pragma unroll
+        for (int t = 0; t < MEGA_FT; t++)
+          if (t < cnt) {
+            const int p4 = ri[2 + 3 * t], iA = ri[3 + 3 * t], iB = ri[4 + 3 * t];
+            f += (rd[1 + t] * cb4[p4 + nb4 * m]) * (um[iA] * um[iB]);
+          }
+      }
+      return f;
+    };
+    if (LMP_POD_MEGA_FAPK && flane) {
+      // entries e = c K3 + k, entry e in lane e % 64 of round e / 64
+      constexpr int RMAX = (MEGA_RTM * 16 * CSM * 4 + 63) / 64;
+      const int NE = NC * K3;
+      T fr[RMAX];
+#pragma unroll
+      for (int r = 0; r < RMAX; r++) {
+        fr[r] = T(0);
+        const int e = lane + 64 * r;
+        if ((64 * r < NE) && (e < NE)) {
+          const int cc = e / K3, k = e - cc * K3;
+          fr[r] = frecipe(cc % nrbf3, k);
+        }
+      }
+#pragma unroll
+      for (int kt = 0; kt < MEGA_RTM; kt++)
+#pragma unroll
+        for (int cs = 0; cs < CSM; cs++) {
+          const int k = 16 * kt + lr, cc = 4 * cs + lq;
+          const bool valid = (kt < KT) && (cs < CS) && (k < K3) && (ce[cs] >= 0);
+          const int e = valid ? cc * K3 + k : 0;
+          T v = T(0);
+#pragma unroll
+          for (int r = 0; r < RMAX; r++)
+            if (64 * r < NE) {
+              const T t = __shfl(fr[r], e & 63);
+              if ((e >> 6) == r) v = t;
+            }
+          fa[kt][cs] = valid ? static_cast<TA>(v) : TA(0);
+        }
+    } else
 #pragma unroll
     for (int kt = 0; kt < MEGA_RTM; kt++)
 #pragma unroll
@@ -1215,6 +1386,34 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     nj = np;
     if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 64)) ensure(0);
     fetch(0);
+    // DFIN: the deferred pair of this lane (window index qj, -1: none) and its sums or force
+    int qj = -1, tc = 0;
+    TA q0 = TA(0), q1 = TA(0), q2 = TA(0), q3 = TA(0);
+    auto flush = [&]() {
+      TA o[9];
+#pragma unroll
+      for (int d = 0; d < 9; d++) o[d] = TA(0);
+      if (qj >= 0) {
+        TA fx = q0, fy = q1, fz = q2;
+        if (LMP_POD_MEGA_DFIN == 1) {
+          T g[9];
+          pod_pair_gradients<T>(g, pg, qj);
+          mega_pair_force<T, TA>(g, q0, q1, q2, q3, fx, fy, fz);
+        }
+        if (!(LMP_POD_MEGA_NOATOM & 4))
+          mega_pair_tally<T, TA, (bool) LMP_POD_MEGA_ACCR>(ft, pg, qj, 0, fx, fy, fz, acc_s, o);
+        else if (fx == TA(1.2345e300))
+          acc_s[0] = fy + fz;
+      }
+      qj = -1;
+      if (LMP_POD_MEGA_ACCR && !(LMP_POD_MEGA_NOATOM & 6)) {
+        const int nd = (ft.vir || ft.vatom) ? 9 : 3;
+        for (int d = 0; d < nd; d++) {
+          const TA s = mega_wave_sum(o[d]);
+          if (lane == 0) acc_s[d] += s;
+        }
+      }
+    };
     // RPF: radial B operands of the tile starting at jbase (column lr), from the LDS window
     TA brn[CSM], bdrn[CSM];
     bool rpf_have = false;
@@ -1247,7 +1446,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         }
       }
       const int jl0 = __builtin_amdgcn_readfirstlane(j0 - curw);
-      __syncthreads();
+      mega_tile_sync<1>();
       if (lane < 3 * JT) {
         const int jj = lane % JT, d = lane / JT;
         T *pd = pd_s + jj * PD + PO + d * PL;
@@ -1262,7 +1461,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         if (d == 0) tj_s[jj] = in ? tjh : -1;
       }
       if ((j0 + JT < nj) && (j0 + JT - curw < cap)) fetch(j0 + JT);
-      __syncthreads();
+      mega_tile_sync<1>();
 
       for (int s0 = 0; s0 < nt; s0 += 16) {
         TA SA = TA(0), SU = TA(0), SV = TA(0), SW = TA(0);
@@ -1361,12 +1560,51 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         SU += __shfl_xor(SU, 32);
         SV += __shfl_xor(SV, 32);
         SW += __shfl_xor(SW, 32);
+#if LMP_POD_MEGA_S6POW && LMP_POD_MEGA_DFIN
+        static_assert(JT == 16, "DFIN: one 16-pair chunk per tile");
+        if (LMP_POD_MEGA_DFIN == 2) {
+          T g[9];
+          pod_pair_gradients<T>(g, pg, jl0 + min(jb, nt - 1));
+          TA fx, fy, fz;
+          mega_pair_force<T, TA>(g, SA, SU, SV, SW, fx, fy, fz);
+          SA = fx;
+          SU = fy;
+          SV = fz;
+        }
+        if ((lq == (tc & 3)) && (jb < nt)) {
+          q0 = SA;
+          q1 = SU;
+          q2 = SV;
+          q3 = SW;
+          qj = jl0 + jb;
+        }
+#else
         if ((lq == 0) && (jb < nt)) {
           T g[9];
           pod_pair_gradients<T>(g, pg, jl0 + jb);
+#if LMP_POD_MEGA_NOATOM
+          TA o[9], fx, fy, fz;
+          mega_pair_force<T, TA>(g, SA, SU, SV, SW, fx, fy, fz);
+          if (!(LMP_POD_MEGA_NOATOM & 4))
+            mega_pair_tally<T, TA, false>(ft, pg, jl0 + jb, tjb, fx, fy, fz, acc_s, o);
+          else if (fx == TA(1.2345e300))
+            acc_s[0] = fy + fz;
+#else
           pod_pair_finish<T, TA>(ft, pg, nullptr, 0, jl0 + jb, tjb, g, SA, SU, SV, SW, acc_s);
+#endif
         }
+#endif
       }
+#if LMP_POD_MEGA_S6POW && LMP_POD_MEGA_DFIN
+      // flush every 4 tiles, after the last, and before a tile that reloads the window
+      tc++;
+      {
+        const int jn = j0 + JT;
+        bool fl = ((tc & 3) == 0) || (jn >= nj);
+        if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 64)) fl = fl || (jn - curw + min(JT, nj - jn) > cap);
+        if (fl) flush();
+      }
+#endif
     }
     __syncthreads();
     if constexpr (PERSIST) {
