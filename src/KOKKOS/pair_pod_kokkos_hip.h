@@ -1724,6 +1724,43 @@ bool twobodydesc(hipStream_t stream, T *d2, const T *rbf2, const int *tj, const 
 ====================================================================== */
 
 // wavefront and block sums; blockDim.x must be a multiple of 64 and at most 1024
+// sum over the 64 lanes with DPP row operations (no LDS permutes), the result in every lane
+// (read from lane 63).  CDNA (gfx9) DPP controls: quad_perm, row_half_mirror, row_mirror,
+// row_bcast15, row_bcast31
+template <int CTRL, int ROWMASK> __device__ inline double dpp_move(const double v)
+{
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_update_dpp(0, (int) (b & 0xffffffffll), CTRL, ROWMASK, 0xf, false);
+  const int hi = __builtin_amdgcn_update_dpp(0, (int) (b >> 32), CTRL, ROWMASK, 0xf, false);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+}
+template <int CTRL, int ROWMASK> __device__ inline float dpp_move(const float v)
+{
+  return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v),
+                                                                CTRL, ROWMASK, 0xf, false));
+}
+__device__ inline double lane63(const double v)
+{
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_readlane((int) (b & 0xffffffffll), 63);
+  const int hi = __builtin_amdgcn_readlane((int) (b >> 32), 63);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+}
+__device__ inline float lane63(const float v)
+{
+  return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), 63));
+}
+template <typename V> __device__ inline V wave_sum_dpp(V v)
+{
+  v += dpp_move<0xb1, 0xf>(v);     // quad_perm [1,0,3,2]
+  v += dpp_move<0x4e, 0xf>(v);     // quad_perm [2,3,0,1]
+  v += dpp_move<0x141, 0xf>(v);    // row_half_mirror
+  v += dpp_move<0x140, 0xf>(v);    // row_mirror
+  v += dpp_move<0x142, 0xa>(v);    // row_bcast15 to rows 1 and 3
+  v += dpp_move<0x143, 0xc>(v);    // row_bcast31 to rows 2 and 3
+  return lane63(v);
+}
+
 template <typename V> __device__ inline V wave_sum(V v)
 {
   for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off);
@@ -2612,6 +2649,7 @@ __global__ void __launch_bounds__(256)
 
 struct LocalEnvArgs {
   int nCls, nDes, nCoeff, nActMax;
+  int dpp;    // 1: wave sums of localenv_wave_kernel with DPP
 };
 
 template <typename T, typename TA>
@@ -2933,7 +2971,7 @@ __global__ void __launch_bounds__(64)
       if (lane + 64 * q < nDes) p += static_cast<TA>(pv[q] * d_s[lane + 64 * q]);
   } else
     for (int m = lane; m < nDes; m += 64) p += static_cast<TA>(pr[m] * d_s[m]);
-  const TA pcai = wave_sum(p);
+  const TA pcai = a.dpp ? wave_sum_dpp(p) : wave_sum(p);
   int kl = 0, kni = 1;
   if (PRE) {
     kl = __popcll(__ballot((lane < nCls) && (static_cast<TA>(re) < pcai)));
@@ -2983,7 +3021,7 @@ __global__ void __launch_bounds__(64)
     }
 #pragma unroll
   for (int k = 0; k < KM; k++)
-    if (k < kni) sumE[k] = wave_sum(sumE[k]);
+    if (k < kni) sumE[k] = a.dpp ? wave_sum_dpp(sumE[k]) : wave_sum(sumE[k]);
 
   const T pcaiT = static_cast<T>(pcai);
   const int kncct = kl + ncct;

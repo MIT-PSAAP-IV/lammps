@@ -81,7 +81,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_LENV_PRE = 65536,        // ... with the cluster tables loaded ahead into registers
        HIP_NEIGH_D2 = 131072,       // B-spline 2-body descriptors summed with the pair list
        HIP_NEIGH_ONE = 262144,        // pair list without the atom types if all are element 0
-       HIP_NEIGH_HALF = 524288 };     // ... with two atoms per wavefront
+       HIP_NEIGH_HALF = 524288,       // ... with two atoms per wavefront
+       HIP_LENV_DPP = 1048576 };      // wave sums of the local EA-POD kernel with DPP
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -268,7 +269,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
       HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2 | HIP_NEIGH_ONE |
-      HIP_NEIGH_HALF;
+      HIP_NEIGH_HALF | HIP_LENV_DPP;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2568,7 +2569,8 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       const auto g = pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4,
                                    nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
                                    (nl4 > 0) && (lenv_nij > 2));
-      const PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax};
+      PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax, 0};
+      la.dpp = (hip_flags & HIP_LENV_DPP) ? 1 : 0;
       if (!PODHIP::localenv_wave<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), ei.data(),
               cb.data(), B.data(), g, sumU.data(), proj.data(), ledges.data(), redges.data(),
               cent.data(), cefs.data(), invlcut2.data(), invrcut2.data(), tyai.data(), la, nl2,
