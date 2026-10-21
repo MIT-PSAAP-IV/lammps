@@ -108,6 +108,10 @@ class PairPODKokkos : public PairPOD {
   bool fuse_neigh_off;     // true once a block had to be computed again without the fused list
   int pair_stride;         // > 0: the pairs of atom i of the block start at i*pair_stride
   int block_gi1;           // ilist index before the first atom of the current block
+  bool desc_in_lenv;       // true if the local EA-POD kernel computes the 3/4-body descriptors
+  int lenv_nij;            // number of pairs of the block (for the local EA-POD kernel)
+  bool desc_atom;          // true if d2 (in bd) and cb are stored per atom, [i*Mdesc + m]
+  t_pod_1d hip_cbt;        // scratch of cb_strided()
 
   // maximum neighbor count of the current neighbor list, reused until the next build
   int mn_value, mn_inum;
@@ -298,6 +302,10 @@ class PairPODKokkos : public PairPOD {
   void crossdesc_reduction(t_pod_1d cb1, t_pod_1d cb2, t_pod_1d c12, t_pod_1d d1,
         t_pod_1d d2, t_pod_1i ind1, t_pod_1i ind2, int n12, int Ni);
   void blockatom_base_descriptors(t_pod_1d bd, int Ni, int Nij);
+  void base_descriptors34(t_pod_1d d3, t_pod_1d d4, int Ni, int Nij);
+  bool lenv_wave_ok(int Nij) const;
+  void cb_strided(int Ni);
+  void desc_layout(int Nij);
   void blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);

@@ -75,7 +75,9 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_FUSE_NEIGH = 1024,   // pair list in one pass, without reading its size back
        HIP_FIXED_PAIRS = 4096,  // ... with a fixed stride per atom, without a scan
        HIP_PAIR_ALIGN = 8192,   // ... rounded up to a multiple of hip_palign pairs
-       HIP_RAS_PREFETCH = 16384 };    // next pair tile loaded during the radial-angular sums
+       HIP_RAS_PREFETCH = 16384,    // next pair tile loaded during the radial-angular sums
+       HIP_LENV_ATOM = 32768 };       // 3/4-body descriptors and local EA-POD in one kernel per
+                                    // atom, descriptors and their coefficients stored per atom
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -261,7 +263,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
-      HIP_RAS_PREFETCH;
+      HIP_RAS_PREFETCH | HIP_LENV_ATOM;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -269,6 +271,9 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   pairs_fused = false;
   pair_stride = 0;
   block_gi1 = 0;
+  desc_in_lenv = false;
+  lenv_nij = 0;
+  desc_atom = false;
   fused_abort = false;
   fuse_neigh_off = false;
   mn_value = -1;
@@ -1393,7 +1398,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
             ni, 64, 0, Kokkos::HIP().hip_stream(), l_rbf.data(), l_drbf.data(), pod_geom(l_rr, rhat, N, pair_stride),
             ti.data(), tj.data(), hermite_r0.data(), hermite_invdr.data(),
             rbf_hermite_coeffs.data(), nelements, nhermite_bins, nrbfmax, N, numij.data(),
-            bd.data(), nrbf2, ni);
+            bd.data(), nrbf2, ni, desc_atom ? Mdesc : 1, desc_atom ? 1 : ni);
         if (d2_fused) return;
       }
       if (fused_abort_needed()) return;
@@ -1401,7 +1406,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
             PODHIP::nblocks_for(N, 256), 256, 0, Kokkos::HIP().hip_stream(), l_rbf.data(),
             l_drbf.data(), pod_geom(l_rr, rhat, N, pair_stride), ti.data(), tj.data(), hermite_r0.data(),
             hermite_invdr.data(), rbf_hermite_coeffs.data(), nelements, nhermite_bins, nrbfmax, N,
-            (const int *) nullptr, (KK_FLOAT *) nullptr, 0, 0))
+            (const int *) nullptr, (KK_FLOAT *) nullptr, 0, 0, 0, 0))
         return;
     }
   }
@@ -1661,17 +1666,20 @@ void PairPODKokkos<DeviceType>::twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_
         int l_nrbf2, const int Ni, const int Nij)
 {
 #ifdef KOKKOS_ENABLE_HIP
-  // d2 is written, not accumulated, by the native kernel; it was zeroed before
+  // d2 is written, not accumulated, by the native kernel
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if (native_hip && (hip_flags & HIP_TALLY) &&
         PODHIP::twobodydesc<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), d2.data(),
                                                      l_rbf2.data(), l_tj.data(), numij.data(),
-                                                     nelements, l_nrbf2, Ni, Nij, pair_stride))
+                                                     nelements, l_nrbf2, Ni, Nij, pair_stride,
+                                                     desc_atom ? Mdesc : 1, desc_atom ? 1 : Ni))
       return;
   }
 #endif
 
   if (fused_abort_needed()) return;
+  desc_atom = false;    // d2 in the layout [i + Ni*m]
+  set_array_to_zero(d2, Ni*l_nrbf2*nelements);
   int totalIterations = l_nrbf2 * Nij;
   Kokkos::parallel_for("twobodydesc", Kokkos::RangePolicy<DeviceType>(0,totalIterations), KOKKOS_LAMBDA(int idx) {
     int n = idx / l_nrbf2;
@@ -1720,19 +1728,22 @@ void PairPODKokkos<DeviceType>::twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2
 {
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
-    // d2 is written, not accumulated, by the native kernel; it was zeroed before
+    // d2 is written, not accumulated, by the native kernel
     if (native_hip && (hip_flags & HIP_PORT) &&
         PODHIP::launch(PODHIP::twobodydesc_bspline_kernel<KK_FLOAT, KK_ACC_FLOAT>, Ni, 64,
             (size_t) nelements * l_nrbf2 * sizeof(KK_ACC_FLOAT), Kokkos::HIP().hip_stream(),
             d2.data(), l_rbf2.data(), l_base.data(), l_tj.data(), numij.data(), nelements,
             l_nrbf2, Ni, Nij, pod_bspline_args(bs_deferred, bs_r0, bs_invh, ti, l_tj, nelements,
-                                               bs_nb, l_nrbf2, bs_ileft), pod_geom(rr, rhat, Nij, pair_stride)))
+                                               bs_nb, l_nrbf2, bs_ileft), pod_geom(rr, rhat, Nij, pair_stride),
+            desc_atom ? Mdesc : 1, desc_atom ? 1 : Ni))
       return;
   }
 #endif
 
   if (fused_abort_needed()) return;
   ensure_bspline(Nij);
+  desc_atom = false;
+  set_array_to_zero(d2, Ni*l_nrbf2*nelements);
 
   Kokkos::parallel_for("twobodydesc_bspline",
     Kokkos::RangePolicy<DeviceType>(0, Nij), KOKKOS_LAMBDA(const int n) {
@@ -2263,6 +2274,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   auto d34 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33), Ni * (nl2 + nl3 + nl4 + nl33 + nl34)));
   auto d44 = Kokkos::subview(bd, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
 
+  desc_layout(Nij);
   d2_fused = false;
 
   rbf_deferred = false;
@@ -2312,7 +2324,6 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   }
 
   if (!d2_fused) {
-    set_array_to_zero(d2, Ni*nl2);
     if (use_bspline) twobodydesc_bspline(d2, rbf2, bs_base, idxi, tj, nrbf2, Ni, Nij);
     else             twobodydesc(d2, rbf2, idxi, tj, nrbf2, Ni, Nij);
   }
@@ -2340,6 +2351,25 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     }
   }
 
+  if (!desc_in_lenv) base_descriptors34(d3, d4, Ni, Nij);
+
+  if ((nl33>0) && (Nij>3)) {
+    crossdesc(d33, d3, d3, ind33l, ind33r, nl33, Ni);
+  }
+
+  if ((nl34>0) && (Nij>4)) {
+    crossdesc(d34, d3, d4, ind34l, ind34r, nl34, Ni);
+  }
+
+  if ((nl44>0) && (Nij>5)) {
+    crossdesc(d44, d4, d4, ind44l, ind44r, nl44, Ni);
+  }
+}
+
+// 3- and 4-body descriptors from sumU
+template<class DeviceType>
+void PairPODKokkos<DeviceType>::base_descriptors34(t_pod_1d d3, t_pod_1d d4, int Ni, int Nij)
+{
   bool desc_done = false;
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
@@ -2358,18 +2388,57 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     if ((nl4 > 0) && (Nij>2))
       fourbodydesc(d4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
   }
+}
 
-  if ((nl33>0) && (Nij>3)) {
-    crossdesc(d33, d3, d3, ind33l, ind33r, nl33, Ni);
+// with HIP_LENV_ATOM the native local EA-POD kernel computes the 3- and 4-body descriptors
+// itself (desc_in_lenv), and the 2-body descriptors and the coefficients are stored per atom
+// (desc_atom), for the native force kernel.  depends only on the settings and on Nij.
+// desc_atom is cleared if a kernel writes or needs the layout [i + Ni*m] instead
+template<class DeviceType>
+void PairPODKokkos<DeviceType>::desc_layout(int Nij)
+{
+  desc_in_lenv = false;
+  desc_atom = false;
+  lenv_nij = Nij;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    desc_in_lenv = localeapod && (hip_flags & HIP_DESC) && lenv_wave_ok(Nij) && (nl3 > 0) &&
+        (Nij > 1) && (nl33 <= 0) && (nl34 <= 0) && (nl44 <= 0) && hip_acc_used &&
+        (hip_flags & HIP_FTALLY) && (hip_flags & HIP_ANGULAR) && (abf_degree >= 0);
+    desc_atom = desc_in_lenv;
   }
+#endif
+}
 
-  if ((nl34>0) && (Nij>4)) {
-    crossdesc(d34, d3, d4, ind34l, ind34r, nl34, Ni);
+// cb from the per-atom layout (desc_atom) to the layout [i + Ni*m] read by the other kernels
+template<class DeviceType>
+void PairPODKokkos<DeviceType>::cb_strided(int Ni)
+{
+  if (!desc_atom) return;
+  desc_atom = false;
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    const int n = Ni * Mdesc;
+    if ((int) hip_cbt.extent(0) < n) MemKK::realloc_kokkos(hip_cbt, "pair_pod:hip_cbt", n);
+    if (!PODHIP::launch(PODHIP::atom_to_strided_kernel<KK_FLOAT>, PODHIP::nblocks_for(n, 256),
+                        256, 0, Kokkos::HIP().hip_stream(), hip_cbt.data(), cb.data(), Ni, Mdesc) ||
+        (hipMemcpyAsync(cb.data(), hip_cbt.data(), (size_t) n * sizeof(KK_FLOAT),
+                        hipMemcpyDeviceToDevice, Kokkos::HIP().hip_stream()) != hipSuccess))
+      error->one(FLERR, "pair pod/kk: reordering the descriptor coefficients failed");
   }
+#endif
+}
 
-  if ((nl44>0) && (Nij>5)) {
-    crossdesc(d44, d4, d4, ind44l, ind44r, nl44, Ni);
-  }
+// true if the native one-wavefront-per-atom local EA-POD kernel can be used
+template<class DeviceType>
+bool PairPODKokkos<DeviceType>::lenv_wave_ok(int /*Nij*/) const
+{
+#ifdef KOKKOS_ENABLE_HIP
+  if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>)
+    return native_hip && (hip_flags & HIP_PORT) && (hip_flags & HIP_LENV_ATOM) &&
+        (nMaxActiveClusters >= 1) && (nMaxActiveClusters <= PODHIP::LP_KMAX);
+#endif
+  return false;
 }
 
 template<class DeviceType>
@@ -2471,6 +2540,29 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
 
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
+    if (desc_atom) {
+      // one wavefront per atom, with the 3- and 4-body descriptors (desc_atom implies
+      // desc_in_lenv); the descriptors and the coefficients of atom i are [i*nDes + m]
+      auto d3 = Kokkos::subview(B, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
+      auto d4 = Kokkos::subview(B, std::make_pair(Ni * (nl2 + nl3), Ni * (nl2 + nl3 + nl4)));
+      const auto g = pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4,
+                                   nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
+                                   (nl4 > 0) && (lenv_nij > 2));
+      const PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax};
+      if (!PODHIP::localenv_wave<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), ei.data(),
+              cb.data(), B.data(), g, sumU.data(), proj.data(), ledges.data(), redges.data(),
+              cent.data(), cefs.data(), invlcut2.data(), invrcut2.data(), tyai.data(), la, nl2,
+              nl3, Ni, nDes, 1))
+        error->one(FLERR, "pair pod/kk: the native local EA-POD kernel failed");
+      return;
+    }
+    // the descriptors left to the local EA-POD kernel are computed here if it did not run
+    if (desc_in_lenv) {
+      desc_in_lenv = false;
+      auto d3 = Kokkos::subview(B, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
+      auto d4 = Kokkos::subview(B, std::make_pair(Ni * (nl2 + nl3), Ni * (nl2 + nl3 + nl4)));
+      base_descriptors34(d3, d4, Ni, lenv_nij);
+    }
     if (native_hip && (hip_flags & HIP_PORT)) {
       const hipStream_t stream = Kokkos::HIP().hip_stream();
       const PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax};
@@ -2776,10 +2868,14 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   PODHIP::FcArgs<KK_FLOAT> fca{};
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if (native_hip && (nl3 > 0) && (Nij > 1)) {
-      fca = PODHIP::FcArgs<KK_FLOAT>{cb3.data(), cb4.data(), sumU.data(), pc3.data(), pn3.data(),
+      // with desc_atom the coefficients of atom i are cb[i*Mdesc + m]
+      fca = PODHIP::FcArgs<KK_FLOAT>{desc_atom ? cb.data() + nl2 : cb3.data(),
+                                     desc_atom ? cb.data() + nl2 + nl3 : cb4.data(),
+                                     sumU.data(), pc3.data(), pn3.data(),
                                      p3_active.data(), pa4.data(), pb4.data(), pc4.data(),
                                      nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
-                                     ((nl4 > 0) && (Nij > 2)) ? 1 : 0};
+                                     ((nl4 > 0) && (Nij > 2)) ? 1 : 0, desc_atom ? Mdesc : 1,
+                                     desc_atom ? 1 : Ni};
       fc_deferred = angular_otf && (hip_flags & HIP_FUSE_FC);
       if (!fc_deferred)
         fc_done =
@@ -2797,6 +2893,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
     }
 #endif
     if (!fc_done && (Nij > 1)) {
+      cb_strided(Ni);
       set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
       if (nl3 > 0) threebody_forcecoeff(forcecoeff, cb3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
       if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
@@ -2837,6 +2934,8 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
         ft.nrbf2 = nrbf2;
         ft.nm2 = use_bspline ? 4 : nrbf2;
         ft.Ni = Ni;
+        ft.ca = desc_atom ? Mdesc : 1;
+        ft.cm = desc_atom ? 1 : Ni;
       } else {
         set_array_to_zero(l_fij, 3*Nij);
       }
@@ -2856,6 +2955,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
           error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");
       } else if (done) {
         forces_in_fij = true;
+        cb_strided(Ni);
         if (use_bspline) twobody_forces_bspline(l_fij, cb2, drbf2, rhat, rr, bs_base, idxi, tj, nrbf2, Ni, Nij);
         else             twobody_forces(l_fij, cb2, drbf2, rhat, rr, idxi, tj, nrbf2, Ni, Nij);
       }
@@ -2865,6 +2965,7 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   if (!forces_in_fij && !tallied) {
     if (fused_abort_needed()) return;
     if (fc_deferred) compute_forcecoeff();
+    cb_strided(Ni);
     ensure_rbf(Nij);
     ensure_bspline(Nij);
     allbody_forces(l_fij, cb2, Ni, Nij);

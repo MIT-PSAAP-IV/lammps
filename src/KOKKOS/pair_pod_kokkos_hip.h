@@ -103,6 +103,7 @@ template <typename T> struct FcArgs {
   const T *cb3, *cb4, *sumU;    // sumU == nullptr: nothing to compute
   const int *pc3, *pn3, *p3_active, *pa4, *pb4, *pc4;
   int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
+  int ca, cm;    // coefficient k of atom i: cb3[i*ca + cm*k] (likewise cb4)
 };
 
 // force coefficients of atom i into f_s, with u_s (nelements * K3 * nrbf3 values), qa_s (K3)
@@ -112,7 +113,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
                                          int *qp_s, const int i)
 {
   const int nelements = g.nelements, nrbf3 = g.nrbf3, nabf3_active = g.nabf3_active;
-  const int K3 = g.K3, Q4 = g.Q4, Ni = g.Ni;
+  const int K3 = g.K3, Q4 = g.Q4, ca = g.ca, cm = g.cm;
   const int S = nelements * K3 * nrbf3;
   const int base = S * i;
   const int NeK3 = nelements * K3;
@@ -132,9 +133,9 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
       for (int q = g.pa4[p]; q < g.pa4[p + 1]; q++) qp_s[q] = p;
   __syncthreads();
 
-  // three-body: cb3 index i + Ni*(a + nabf3_active*m) + N3*(element pair)
+  // three-body: cb3 index i*ca + cm*(a + nabf3_active*m) + N3*(element pair)
 
-  const int N3 = Ni * nabf3_active * nrbf3;
+  const int N3 = cm * nabf3_active * nrbf3;
   for (int item = threadIdx.x; item < nrbf3 * K3; item += blockDim.x) {
     const int q = item % K3;
     const int m = item / K3;
@@ -142,7 +143,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
     if (a < 0) continue;
     const T pk = static_cast<T>(g.pc3[q]);
     const int iu = NeK3 * m + nelements * q;
-    int em = i + Ni * (a + nabf3_active * m);
+    int em = i * ca + cm * (a + nabf3_active * m);
     for (int i1 = 0; i1 < nelements; i1++) {
       const T u1 = u_s[iu + i1];
       for (int i2 = i1; i2 < nelements; i2++, em += N3) {
@@ -154,10 +155,10 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
   }
   __syncthreads();
 
-  // four-body: cb4 index i + Ni*(p + nabf4*m) + N4*(element triple)
+  // four-body: cb4 index i*ca + cm*(p + nabf4*m) + N4*(element triple)
 
   if (g.do4) {
-    const int N4 = Ni * g.nabf4 * g.nrbf4;
+    const int N4 = cm * g.nabf4 * g.nrbf4;
     for (int item = threadIdx.x; item < g.nrbf4 * Q4; item += blockDim.x) {
       const int q = item % Q4;
       const int m = item / Q4;
@@ -167,7 +168,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
       const int idx1 = iu + nelements * g.pb4[q];
       const int idx2 = iu + nelements * g.pb4[q + Q4];
       const int idx3 = iu + nelements * g.pb4[q + 2 * Q4];
-      int k = i + Ni * (p + g.nabf4 * m);
+      int k = i * ca + cm * (p + g.nabf4 * m);
       for (int i1 = 0; i1 < nelements; i1++) {
         const T c1 = u_s[idx1 + i1];
         for (int i2 = i1; i2 < nelements; i2++) {
@@ -635,8 +636,8 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
   for (int item = threadIdx.x; item < g.nrbf3 * g.nabf3_active; item += blockDim.x) {
     const int a = item % g.nabf3_active;
     const int m = item / g.nabf3_active;
-    const int p = g.p3_active[a];
-    const int n1 = g.pn3[p], n2 = g.pn3[p + 1];
+    const int2 qr = g.qrange3[a];    // = pn3[p3_active[a]], pn3[p3_active[a] + 1]
+    const int n1 = qr.x, n2 = qr.y;
     const T *u = u_s + NeK3 * m;
     int k = i + Ni * (a + g.nabf3_active * m);
     for (int i1 = 0; i1 < nelements; i1++)
@@ -1066,6 +1067,7 @@ template <typename T, typename TA> struct ForceTally {
   const int *base2;            // stored B-spline base index, or nullptr
   BsplineArgs<T> bs;           // bs.r0v != nullptr: B-splines evaluated here
   int nrbf2, nm2, Ni;
+  int ca, cm;                  // cb2 of atom i, coefficient m: cb2[i*ca + cm*m]
 };
 
 // adds the force (SA, SU, SV, SW contracted with the gradients g) of pair j of atom i,
@@ -1095,13 +1097,14 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
     TA cR = TA(0);
     if (ft.bs.r0v) {
       T Bq[4], dBq[4];
-      const int ii = i + ft.Ni * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
+      const int ii =
+          i * ft.ca + ft.cm * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
 #pragma unroll
-      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * dBq[m]);
+      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * dBq[m]);
     } else {
-      const int ii = i + ft.Ni * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
+      const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
       for (int m = 0; m < ft.nm2; ++m)
-        cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * ft.drbf2[j + pg.N * m]);
+        cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + pg.N * m]);
     }
     cR *= static_cast<TA>(r);
     fx += cR * static_cast<TA>(u);
@@ -1678,7 +1681,7 @@ template <typename T, typename TA>
 __global__ void __launch_bounds__(64)
     twobodydesc_kernel(T *__restrict__ d2, const T *__restrict__ rbf2, const int *__restrict__ tj,
                        const int *__restrict__ numij, const int nelements, const int nrbf2,
-                       const int Ni, const int Nij, const int ps)
+                       const int Ni, const int Nij, const int ps, const int da, const int dm)
 {
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
@@ -1693,18 +1696,19 @@ __global__ void __launch_bounds__(64)
     for (int m = 0; m < nrbf2; m++) atomicAdd(se + m, static_cast<TA>(rbf2[n + Nij * m]));
   }
   __syncthreads();
-  for (int t = threadIdx.x; t < nd; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(s_s[t]);
+  for (int t = threadIdx.x; t < nd; t += blockDim.x)
+    d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
 }
 
 template <typename T, typename TA>
 bool twobodydesc(hipStream_t stream, T *d2, const T *rbf2, const int *tj, const int *numij,
-                 int nelements, int nrbf2, int Ni, int Nij, int ps)
+                 int nelements, int nrbf2, int Ni, int Nij, int ps, int da, int dm)
 {
   if (Ni <= 0) return false;
   const size_t lds = (size_t) nelements * nrbf2 * sizeof(TA);
   if (lds > 65536) return false;
   hipLaunchKernelGGL(HIP_KERNEL_NAME(twobodydesc_kernel<T, TA>), dim3(Ni), dim3(64), lds, stream,
-                     d2, rbf2, tj, numij, nelements, nrbf2, Ni, Nij, ps);
+                     d2, rbf2, tj, numij, nelements, nrbf2, Ni, Nij, ps, da, dm);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -2229,7 +2233,7 @@ __global__ void __launch_bounds__(256)
                                const T *__restrict__ invdrv, const T *__restrict__ coef,
                                const int ne, const int nb, const int nr, const int N,
                                const int *__restrict__ numij, T *__restrict__ d2,
-                               const int nrbf2, const int Ni)
+                               const int nrbf2, const int Ni, const int da, const int dm)
 {
   __shared__ TA d2_s[PERATOM ? 256 : 1];    // PERATOM: 2-body descriptors of atom i, [e][m]
   if (PERATOM) {
@@ -2282,7 +2286,8 @@ __global__ void __launch_bounds__(256)
     pg.range(numij, i, start, nj);
     for (int n = start + threadIdx.x; n < start + nj; n += blockDim.x) pair(n);
     __syncthreads();
-    for (int t = threadIdx.x; t < ne * nrbf2; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(d2_s[t]);
+    for (int t = threadIdx.x; t < ne * nrbf2; t += blockDim.x)
+      d2[(long) i * da + (long) dm * t] = static_cast<T>(d2_s[t]);
   } else {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n < N) pair(n);
@@ -2348,7 +2353,8 @@ __global__ void __launch_bounds__(64)
                                const int *__restrict__ base, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int nelements,
                                const int nrbf2, const int Ni, const int Nij,
-                               const BsplineArgs<T> bs, const PairGeom<T> pg)
+                               const BsplineArgs<T> bs, const PairGeom<T> pg, const int da,
+                               const int dm)
 {
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
@@ -2372,7 +2378,8 @@ __global__ void __launch_bounds__(64)
     }
   }
   __syncthreads();
-  for (int t = threadIdx.x; t < nd; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(s_s[t]);
+  for (int t = threadIdx.x; t < nd; t += blockDim.x)
+    d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
 }
 
 /* ----------------------------------------------------------------------
@@ -2781,6 +2788,164 @@ __global__ void __launch_bounds__(256)
   TA sum = static_cast<TA>(U[i] * proj[m + a.nDes * typei]);
   for (int k = 0; k < kni; ++k) sum += static_cast<TA>(cefs[knc + k * a.nDes] * D[i + Ni * k]);
   cb[i + Ni * m] = static_cast<T>(sum);
+}
+
+// out[i + Ni*m] = in[i*M + m]: per-atom rows of M values to the layout [i + Ni*m]
+template <typename T>
+__global__ void __launch_bounds__(256)
+    atom_to_strided_kernel(T *__restrict__ out, const T *__restrict__ in, const int Ni,
+                           const int M)
+{
+  const long idx = (long) blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long) Ni * M) return;
+  const int i = (int) (idx % Ni), m = (int) (idx / Ni);
+  out[idx] = in[(long) i * M + m];
+}
+
+/* ----------------------------------------------------------------------
+   local EA-POD (localenv_pca_split, localenv_atom_split and localenv_cb) in
+   one kernel, one wavefront per atom: the projection and the sums over the
+   descriptors are wave sums, and the two binary searches for the active
+   clusters are ballots over the (sorted) cluster edges.  with g.d3 != nullptr
+   the 3- and 4-body descriptors are computed first from sumU, as desc34_kernel,
+   and stay in LDS; the other descriptors are read from B.  the descriptors
+   of atom i are B[i*sa + sm*m] and its coefficients go to cb[i*sa + sm*m].
+   at most KM <= LP_KMAX active clusters.
+------------------------------------------------------------------------- */
+
+template <typename T, typename TA, int KM>
+__global__ void __launch_bounds__(64)
+    localenv_wave_kernel(T *__restrict__ ei, T *__restrict__ cb, const T *__restrict__ B,
+                         const DescArgs<T> g, const T *__restrict__ sumU,
+                         const T *__restrict__ proj, const T *__restrict__ ledges,
+                         const T *__restrict__ redges, const T *__restrict__ cent,
+                         const T *__restrict__ cefs, const T *__restrict__ invlcut2,
+                         const T *__restrict__ invrcut2, const int *__restrict__ typeai,
+                         const LocalEnvArgs a, const int nl2, const int nl3, const int sa,
+                         const int sm)
+{
+  extern __shared__ char lds_raw[];
+  const int nDes = a.nDes, nCls = a.nCls;
+  T *d_s = reinterpret_cast<T *>(lds_raw);    // descriptors of atom i
+  T *u_s = d_s + nDes;                        // sumU of atom i: [m][q][e]
+  const int i = blockIdx.x;
+  const int lane = threadIdx.x;
+  const long ib = (long) i * sa;
+  const int typei = typeai[i];
+  const int ncct = typei * nCls;
+  const T *pr = proj + typei * nDes;
+
+  if (g.d3) {
+    const int S = g.nelements * g.K3 * g.nrbf3;
+    for (int t = lane; t < S; t += 64) u_s[t] = sumU[(long) S * i + t];
+    for (int m = lane; m < nDes; m += 64) d_s[m] = (m < nl2) ? B[ib + (long) sm * m] : T(0);
+    __syncthreads();
+    DescArgs<T> gl = g;
+    gl.d3 = d_s + nl2;
+    gl.d4 = d_s + nl2 + nl3;
+    gl.Ni = 1;
+    desc34_atom<T, TA>(gl, u_s, 0);
+  } else {
+    for (int m = lane; m < nDes; m += 64) d_s[m] = B[ib + (long) sm * m];
+  }
+  __syncthreads();
+
+  // projection and active clusters, as localenv_pca_split_kernel
+  TA p = TA(0);
+  for (int m = lane; m < nDes; m += 64) p += static_cast<TA>(pr[m] * d_s[m]);
+  const TA pcai = wave_sum(p);
+  int kl = 0, kni = 1;
+  for (int c0 = 0; c0 < nCls; c0 += 64) {
+    const int cc = c0 + lane;
+    kl += __popcll(__ballot((cc < nCls) && (static_cast<TA>(redges[ncct + cc]) < pcai)));
+  }
+  const int hi = min(kl + a.nActMax, nCls);
+  for (int c0 = kl + 1; c0 < hi; c0 += 64) {
+    const int cc = c0 + lane;
+    kni += __popcll(__ballot((cc < hi) && (static_cast<TA>(ledges[ncct + cc]) <= pcai)));
+  }
+
+  // sumE(k) = sum_m cefs(m, k) B(m), as localenv_atom_split_kernel
+  const int nc = a.nCoeff * typei;
+  const int knc = 1 + nc + kl * nDes;
+  TA sumE[KM];
+#pragma unroll
+  for (int k = 0; k < KM; k++) sumE[k] = TA(0);
+  for (int m = lane; m < nDes; m += 64) {
+    const T b = d_s[m];
+#pragma unroll
+    for (int k = 0; k < KM; k++)
+      if (k < kni) sumE[k] += static_cast<TA>(cefs[knc + k * nDes + m] * b);
+  }
+#pragma unroll
+  for (int k = 0; k < KM; k++)
+    if (k < kni) sumE[k] = wave_sum(sumE[k]);
+
+  const T pcaiT = static_cast<T>(pcai);
+  const int kncct = kl + ncct;
+  TA sumfDi = 0.0, S = 0.0;
+  T Dk[KM], dDk[KM], Pk[KM];
+#pragma unroll
+  for (int k = 0; k < KM; k++) {
+    Dk[k] = dDk[k] = Pk[k] = T(0);
+    if (k < kni) {
+      const int kg = k + kncct;
+      const T pc = pcaiT - cent[kg];
+      const T inv_rcut2 = (pc >= static_cast<T>(0.0)) ? invrcut2[kg] : invlcut2[kg];
+      const T y2 = (pc * pc) * inv_rcut2;
+      const T omy = static_cast<T>(1.0) - y2 * y2;
+      const T omy2 = omy * omy;
+      const T fcut = omy2 * omy2;
+      const T dfcut = static_cast<T>(-8.0) * inv_rcut2 * y2 * omy2 * omy;
+      const T invDk = static_cast<T>(1.0) / (pc * pc + static_cast<T>(1e-20));
+      const T fDk = fcut * invDk;
+      Dk[k] = fDk;
+      dDk[k] = static_cast<T>(2.0) * pc * invDk * (dfcut - fDk);
+      sumfDi += static_cast<TA>(fDk);
+      S += static_cast<TA>(dDk[k]);
+    }
+  }
+  sumfDi = static_cast<TA>(1.0) / sumfDi;
+  TA eival = static_cast<TA>(cefs[nc]);
+  TA Tt = 0.0, A = 0.0;
+#pragma unroll
+  for (int k = 0; k < KM; k++)
+    if (k < kni) {
+      Pk[k] = static_cast<T>(static_cast<TA>(Dk[k]) * sumfDi);
+      const T cpk = static_cast<T>(sumE[k] * sumfDi);
+      eival += sumE[k] * static_cast<TA>(Pk[k]);
+      Tt += static_cast<TA>(cpk * Pk[k]);
+      A += static_cast<TA>(cpk * dDk[k]);
+    }
+  if (lane == 0) ei[i] = static_cast<T>(eival);
+
+  // force coefficients of the descriptors, as localenv_cb_kernel
+  const T Ui = static_cast<T>(A - S * Tt);
+  for (int m = lane; m < nDes; m += 64) {
+    const int kncm = 1 + m + kl * nDes + nc;
+    TA sum = static_cast<TA>(Ui * pr[m]);
+#pragma unroll
+    for (int k = 0; k < KM; k++)
+      if (k < kni) sum += static_cast<TA>(cefs[kncm + k * nDes] * Pk[k]);
+    cb[ib + (long) sm * m] = static_cast<T>(sum);
+  }
+}
+
+template <typename T, typename TA>
+bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<T> &g,
+                   const T *sumU, const T *proj, const T *ledges, const T *redges, const T *cent,
+                   const T *cefs, const T *invlcut2, const T *invrcut2, const int *typeai,
+                   const LocalEnvArgs &a, int nl2, int nl3, int Ni, int sa, int sm)
+{
+  if ((Ni <= 0) || (a.nActMax > LP_KMAX) || (a.nActMax < 1)) return false;
+  size_t lds = (size_t) a.nDes * sizeof(T);
+  if (g.d3) lds += (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T);
+  if (lds > 65536) return false;
+  if (a.nActMax <= 4)
+    return launch(localenv_wave_kernel<T, TA, 4>, Ni, 64, lds, stream, ei, cb, B, g, sumU, proj,
+                  ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm);
+  return launch(localenv_wave_kernel<T, TA, LP_KMAX>, Ni, 64, lds, stream, ei, cb, B, g, sumU,
+                proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, sa, sm);
 }
 
 /* ----------------------------------------------------------------------
