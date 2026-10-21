@@ -83,7 +83,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_NEIGH_ONE = 262144,        // pair list without the atom types if all are element 0
        HIP_NEIGH_HALF = 524288,       // ... with two atoms per wavefront
        HIP_LENV_DPP = 1048576,        // wave sums of the local EA-POD kernel with DPP
-       HIP_RAS_FILL = 2097152 };      // radial-angular tile filled by (pair, function) lanes
+       HIP_RAS_FILL = 2097152,        // radial-angular tile filled by (pair, function) lanes
+       HIP_DESC_SPLIT = 4194304 };    // 3/4-body descriptor sums split over up to 8 threads
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -134,6 +135,7 @@ PODHIP::DescArgs<KK_FLOAT> pod_desc_args(const VD &d3, const VD &d4, const VI &p
   g.Q4 = Q4;
   g.Ni = Ni;
   g.do4 = do4 ? 1 : 0;
+  g.split = 0;
   return g;
 }
 
@@ -270,7 +272,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
       HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2 | HIP_NEIGH_ONE |
-      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL;
+      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL | HIP_DESC_SPLIT;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2396,11 +2398,13 @@ void PairPODKokkos<DeviceType>::base_descriptors34(t_pod_1d d3, t_pod_1d d4, int
   bool desc_done = false;
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
-    if (native_hip && (hip_flags & HIP_DESC) && (nl3 > 0) && (Nij > 1))
-      desc_done = PODHIP::desc34<KK_FLOAT, KK_ACC_FLOAT>(
-          Kokkos::HIP().hip_stream(), pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4, nelements, nrbf3, nabf3_active,
-                          nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2)),
-          sumU.data());
+    if (native_hip && (hip_flags & HIP_DESC) && (nl3 > 0) && (Nij > 1)) {
+      auto g = pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4, nelements,
+                             nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2));
+      g.split = (hip_flags & HIP_DESC_SPLIT) ? 1 : 0;
+      desc_done =
+          PODHIP::desc34<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), g, sumU.data());
+    }
   }
 #endif
 
@@ -2568,9 +2572,10 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       // desc_in_lenv); the descriptors and the coefficients of atom i are [i*nDes + m]
       auto d3 = Kokkos::subview(B, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
       auto d4 = Kokkos::subview(B, std::make_pair(Ni * (nl2 + nl3), Ni * (nl2 + nl3 + nl4)));
-      const auto g = pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4,
-                                   nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
-                                   (nl4 > 0) && (lenv_nij > 2));
+      auto g = pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4,
+                             nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni,
+                             (nl4 > 0) && (lenv_nij > 2));
+      g.split = (hip_flags & HIP_DESC_SPLIT) ? 1 : 0;
       PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax, 0};
       la.dpp = (hip_flags & HIP_LENV_DPP) ? 1 : 0;
       if (!PODHIP::localenv_wave<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), ei.data(),

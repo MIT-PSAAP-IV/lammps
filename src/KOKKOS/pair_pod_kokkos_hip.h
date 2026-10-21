@@ -621,7 +621,18 @@ template <typename T> struct DescArgs {
   const int *pc3, *pn3, *p3_active, *pa4, *pb4, *pc4;
   const int2 *qrange3;    // (pn3[p3_active[a]], pn3[p3_active[a] + 1]) for each a
   int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
+  int split;    // 1: a descriptor may be summed by up to 8 threads (desc34_atom)
 };
+
+// threads per descriptor in desc34_atom(): the power of 2 (<= 8) that spreads n items over the
+// block, or 1
+__device__ inline int desc34_lpi(const int split, const int n)
+{
+  if (!split || (n <= 0)) return 1;
+  int l = 1;
+  while ((l < 8) && (2 * l * n <= (int) blockDim.x)) l *= 2;
+  return l;
+}
 
 // 3- and 4-body descriptors of atom i from its sumU block u_s (in LDS),
 // computed by the threads of the calling block
@@ -631,9 +642,13 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
   const int nelements = g.nelements, Ni = g.Ni;
   const int NeK3 = nelements * g.K3;
 
-  // three-body: d3 index i + Ni*(a + nabf3_active*m) + N3*(element pair)
+  // three-body: d3 index i + Ni*(a + nabf3_active*m) + N3*(element pair).  lpi threads per
+  // descriptor sum every lpi-th term and combine their partial sums
   const int N3 = Ni * g.nabf3_active * g.nrbf3;
-  for (int item = threadIdx.x; item < g.nrbf3 * g.nabf3_active; item += blockDim.x) {
+  const int lpi3 = desc34_lpi(g.split, g.nrbf3 * g.nabf3_active);
+  const int sub3 = threadIdx.x % lpi3;
+  for (int item = threadIdx.x / lpi3; item < g.nrbf3 * g.nabf3_active;
+       item += blockDim.x / lpi3) {
     const int a = item % g.nabf3_active;
     const int m = item / g.nabf3_active;
     const int2 qr = g.qrange3[a];    // = pn3[p3_active[a]], pn3[p3_active[a] + 1]
@@ -643,17 +658,20 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
     for (int i1 = 0; i1 < nelements; i1++)
       for (int i2 = i1; i2 < nelements; i2++, k += N3) {
         TA tmp = TA(0);
-        for (int q = n1; q < n2; q++)
+        for (int q = n1 + sub3; q < n2; q += lpi3)
           tmp += static_cast<TA>(static_cast<T>(g.pc3[q]) * u[i1 + nelements * q] *
                                  u[i2 + nelements * q]);
-        g.d3[k] = static_cast<T>(tmp);
+        for (int o = 1; o < lpi3; o <<= 1) tmp += __shfl_xor(tmp, o);
+        if (sub3 == 0) g.d3[k] = static_cast<T>(tmp);
       }
   }
 
   // four-body: d4 index i + Ni*(p + nabf4*m) + N4*(element triple)
   if (g.do4) {
     const int N4 = Ni * g.nabf4 * g.nrbf4;
-    for (int item = threadIdx.x; item < g.nrbf4 * g.nabf4; item += blockDim.x) {
+    const int lpi4 = desc34_lpi(g.split, g.nrbf4 * g.nabf4);
+    const int sub4 = threadIdx.x % lpi4;
+    for (int item = threadIdx.x / lpi4; item < g.nrbf4 * g.nabf4; item += blockDim.x / lpi4) {
       const int p = item % g.nabf4;
       const int m = item / g.nabf4;
       const int n1 = g.pa4[p], n2 = g.pa4[p + 1];
@@ -663,13 +681,14 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
         for (int i2 = i1; i2 < nelements; i2++)
           for (int i3 = i2; i3 < nelements; i3++, k += N4) {
             TA tmp = TA(0);
-            for (int q = n1; q < n2; q++) {
+            for (int q = n1 + sub4; q < n2; q += lpi4) {
               const int c = g.pc4[q];
               const int j1 = g.pb4[q], j2 = g.pb4[q + g.Q4], j3 = g.pb4[q + 2 * g.Q4];
               tmp += static_cast<TA>(static_cast<T>(c) * u[i1 + nelements * j1] *
                                      u[i2 + nelements * j2] * u[i3 + nelements * j3]);
             }
-            g.d4[k] = static_cast<T>(tmp);
+            for (int o = 1; o < lpi4; o <<= 1) tmp += __shfl_xor(tmp, o);
+            if (sub4 == 0) g.d4[k] = static_cast<T>(tmp);
           }
     }
   }
