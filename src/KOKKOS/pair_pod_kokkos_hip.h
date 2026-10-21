@@ -2376,16 +2376,25 @@ bool neighbor_fused(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, 
    HALF: two atoms per wavefront, 32 lanes each (most lists are shorter than 64).
 ------------------------------------------------------------------------- */
 
-template <typename T, typename TA, bool HALF>
+// HF: the sizes of the Hf model (one element, all atom types element 0, 40 B-splines summed
+// into the per-atom rows of 66 descriptors) as constants
+template <typename T, typename TA, bool HALF, bool HF>
 __global__ void __launch_bounds__(256)
     neighbor_fixed_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
                           int *__restrict__ aj, int *__restrict__ ti, int *__restrict__ tj,
                           int *__restrict__ numij, const T *__restrict__ x,
                           const T *__restrict__ rcutsq, const NeighArgs a, const int gi1,
-                          const int Ni, const int N, const int ps, const int ne,
-                          T *__restrict__ d2, const BsplineArgs<T> bs, const int nrbf2,
-                          const int da, const int dm, const int one)
+                          const int Ni, const int N, const int ps, const int ne_in,
+                          T *__restrict__ d2, const BsplineArgs<T> bs_in, const int nrbf2_in,
+                          const int da_in, const int dm_in, const int one_in)
 {
+  BsplineArgs<T> bs = bs_in;
+  if constexpr (HF) {
+    bs.ne = 1;
+    bs.gmax = PodHf::nrbf2 - 4;
+  }
+  const int ne = HF ? 1 : ne_in, nrbf2 = HF ? PodHf::nrbf2 : nrbf2_in;
+  const int da = HF ? PodHf::nDes : da_in, dm = HF ? 1 : dm_in, one = HF ? 1 : one_in;
   extern __shared__ char lds_raw[];
   constexpr int LPA = HALF ? 32 : 64;    // lanes per atom
   const int slot = threadIdx.x / LPA;    // atom of the block
@@ -2469,19 +2478,26 @@ template <typename T, typename TA>
 bool neighbor_fixed(hipStream_t stream, T *rr, T *rhat, int *typeai, int *aj, int *ti, int *tj,
                     int *numij, const T *x, const T *rcutsq, const NeighArgs &a, int gi1, int Ni,
                     int N, int ps, int ne, T *d2 = nullptr, const BsplineArgs<T> &bs = {},
-                    int nrbf2 = 0, int da = 0, int dm = 0, int one = 0, bool half = false)
+                    int nrbf2 = 0, int da = 0, int dm = 0, int one = 0, bool half = false,
+                    bool hf = false)
 {
   if (Ni <= 0) return false;
   const int apb = half ? 8 : 4;    // atoms per block
   const size_t lds = d2 ? (size_t) apb * ne * nrbf2 * sizeof(TA) : 0;
   if (lds > 32768) return false;
+  // the Hf instance: one element and type, B-spline descriptors in the per-atom rows
+  if (hf && half && d2 && one && (ne == 1) && (nrbf2 == PodHf::nrbf2) && (bs.gmax == nrbf2 - 4) &&
+      (da == PodHf::nDes) && (dm == 1))
+    return launch(neighbor_fixed_kernel<T, TA, true, true>, nblocks_for(Ni, apb), 256, lds, stream,
+                  rr, rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs,
+                  nrbf2, da, dm, one);
   if (half)
-    return launch(neighbor_fixed_kernel<T, TA, true>, nblocks_for(Ni, apb), 256, lds, stream, rr,
-                  rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2,
-                  da, dm, one);
-  return launch(neighbor_fixed_kernel<T, TA, false>, nblocks_for(Ni, apb), 256, lds, stream, rr,
-                rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs, nrbf2,
-                da, dm, one);
+    return launch(neighbor_fixed_kernel<T, TA, true, false>, nblocks_for(Ni, apb), 256, lds,
+                  stream, rr, rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne,
+                  d2, bs, nrbf2, da, dm, one);
+  return launch(neighbor_fixed_kernel<T, TA, false, false>, nblocks_for(Ni, apb), 256, lds,
+                stream, rr, rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2,
+                bs, nrbf2, da, dm, one);
 }
 
 // maximum number of neighbors of the atoms in ilist, or -1 on failure

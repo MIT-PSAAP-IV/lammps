@@ -1211,7 +1211,7 @@ int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
               pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2, bs_ileft),
               nrbf2, desc_atom ? Mdesc : 1, desc_atom ? 1 : Ni,
               (one_type && (hip_flags & HIP_NEIGH_ONE)) ? 1 : 0,
-              (hip_flags & HIP_NEIGH_HALF) != 0)) {
+              (hip_flags & HIP_NEIGH_HALF) != 0, d2n && hf_sizes(Nf))) {
         pairs_fused = true;
         pair_stride = ps;
         d2_in_neigh = d2n;
