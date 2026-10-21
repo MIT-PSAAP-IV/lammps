@@ -1217,6 +1217,59 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
   }
 }
 
+// component d (0, 1, 2) of the force of pair j of atom i as pod_pair_finish() (atom forces
+// tallied, ft.f != nullptr): subtracts it from f_j and returns it in fd, with the virial terms
+// vd = r_d f_d and vo (xy, xz, yz for d = 0, 1, 2) of the pair
+template <typename T, typename TA>
+__device__ inline void pod_pair_force_d(const ForceTally<T, TA> &ft, const PairGeom<T> &pg,
+                                        const int i, const int j, const int e, const TA SA,
+                                        const TA SU, const TA SV, const TA SW, const int d,
+                                        TA &fd, TA &vd, TA &vo)
+{
+  T g[9];
+  pod_pair_gradients<T>(g, pg, j);
+  TA fx = SU * static_cast<TA>(g[0]) + SV * static_cast<TA>(g[1]) + SW * static_cast<TA>(g[2]) +
+      SA * static_cast<TA>(g[6]);
+  TA fy = SU * static_cast<TA>(g[1]) + SV * static_cast<TA>(g[3]) + SW * static_cast<TA>(g[4]) +
+      SA * static_cast<TA>(g[7]);
+  TA fz = SU * static_cast<TA>(g[2]) + SV * static_cast<TA>(g[4]) + SW * static_cast<TA>(g[5]) +
+      SA * static_cast<TA>(g[8]);
+  T u, v, w;
+  pg.uvw(j, u, v, w);
+  const T r = pg.r(j);
+  if (ft.cb2) {
+    TA cR = TA(0);
+    if (ft.bs.r0v) {
+      T Bq[4], dBq[4];
+      const int ii =
+          i * ft.ca + ft.cm * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
+#pragma unroll
+      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * dBq[m]);
+    } else {
+      const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
+      for (int m = 0; m < ft.nm2; ++m)
+        cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + pg.N * m]);
+    }
+    cR *= static_cast<TA>(r);
+    fx += cR * static_cast<TA>(u);
+    fy += cR * static_cast<TA>(v);
+    fz += cR * static_cast<TA>(w);
+  }
+  fd = (d == 0) ? fx : ((d == 1) ? fy : fz);
+  atomicAdd(ft.f + ft.aj[j] * ft.fs0 + d * ft.fs1, -fd);
+  vd = vo = TA(0);
+  if (ft.vir || ft.vatom) {
+    const TA rx = static_cast<TA>(r * u), ry = static_cast<TA>(r * v), rz = static_cast<TA>(r * w);
+    vd = ((d == 0) ? rx : ((d == 1) ? ry : rz)) * fd;
+    vo = (d == 0) ? rx * fy : ((d == 1) ? rx * fz : ry * fz);
+    if (ft.vatom) {
+      TA *vj = ft.vatom + ft.aj[j] * ft.vs0;
+      atomicAdd(vj + d * ft.vs1, static_cast<TA>(-0.5) * vd);
+      atomicAdd(vj + (3 + d) * ft.vs1, static_cast<TA>(-0.5) * vo);
+    }
+  }
+}
+
 // adds the sums of atom i (pairs start .. start+nj-1) to its force and virial; called by
 // all threads of the block after the last pair
 template <typename T, typename TA>
@@ -1325,6 +1378,10 @@ __global__ void __launch_bounds__(64)
 static constexpr int MFMA_MAX_CS = 8;    // nelements * nrbf3 <= 32
 static constexpr int MFMA_PAIR_TILE = 16;
 
+#ifndef LMP_POD_HF_SPREAD
+#define LMP_POD_HF_SPREAD 1
+#endif
+
 // register budget of the matrix core force kernel: without it the compiler keeps the
 // accumulators in separate AGPRs, which costs occupancy
 #ifndef LMP_POD_ALLBODY_VGPR
@@ -1416,6 +1473,12 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     ce[cs] = (c < NC) ? c / nrbf3 : -1;
   }
   typedef typename Mfma<TA>::acc_t acc_t;
+
+  // LMP_POD_HF_SPREAD (HF instance): the force of a pair is finished by three lane groups, one
+  // component each, summed per lane (af, avd, avo) and reduced once per atom, instead of one
+  // lane group and per-pair LDS atomics
+  constexpr bool SPREAD = HF && LMP_POD_HF_SPREAD;
+  TA af = TA(0), avd = TA(0), avo = TA(0);
 
   // the direction (u, v or w) and element of the pairs of the next tile are loaded while the
   // current tile is computed.  only where the 2 registers this takes do not lower the
@@ -1583,11 +1646,33 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         SV += __shfl_xor(SV, off);
         SW += __shfl_xor(SW, off);
       }
-      if ((lq == 0) && (jb < nt)) {
+      if constexpr (SPREAD) {
+        if ((lq < 3) && (jb < nt)) {
+          TA fd, vd, vo;
+          pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd, vo);
+          af += fd;
+          avd += vd;
+          avo += vo;
+        }
+      } else if ((lq == 0) && (jb < nt)) {
         T g[9];
         pod_pair_gradients<T>(g, pg, start + j0 + jb);
         pod_pair_finish<T, TA>(ft, pg, fij, i, start + j0 + jb, tjb, g, SA, SU, SV, SW, acc_s);
       }
+    }
+  }
+  if constexpr (SPREAD) {
+#pragma unroll
+    for (int off = 1; off < 16; off <<= 1) {
+      af += __shfl_xor(af, off);
+      avd += __shfl_xor(avd, off);
+      avo += __shfl_xor(avo, off);
+    }
+    __syncthreads();
+    if ((lr == 0) && (lq < 3)) {
+      acc_s[lq] = af;
+      acc_s[3 + lq] = avd;
+      acc_s[6 + lq] = avo;
     }
   }
   __syncthreads();
