@@ -73,7 +73,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_FTALLY = 256,        // 2-body forces and force/virial tally inside the force kernel
        HIP_FUSE_FC = 512,       // 3- and 4-body force coefficients inside the force kernel
        HIP_FUSE_NEIGH = 1024,   // pair list in one pass, without reading its size back
-       HIP_FIXED_PAIRS = 4096 };  // ... with a fixed stride per atom, without a scan
+       HIP_FIXED_PAIRS = 4096,  // ... with a fixed stride per atom, without a scan
+       HIP_PAIR_ALIGN = 8192 };   // ... rounded up to a multiple of hip_palign pairs
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -258,7 +259,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   const char *env = getenv("LAMMPS_POD_NATIVE_HIP");
   if (env && (strcmp(env, "0") == 0)) native_hip = 0;
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
-      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS;
+      HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -274,6 +275,10 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   mn_inum = -1;
   env = getenv("LAMMPS_POD_HIP_FLAGS");
   if (env) hip_flags = atoi(env);
+  hip_palign = 8;
+  env = getenv("LAMMPS_POD_PAIR_ALIGN");
+  if (env) hip_palign = atoi(env);
+  if (hip_palign < 1) hip_palign = 1;
   hip_jtile = 16;
   env = getenv("LAMMPS_POD_HIP_JTILE");
   if (env) hip_jtile = atoi(env);
@@ -538,7 +543,8 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     if (nmax < n) nmax = n;
   }
   grow_atoms(nmax);
-  grow_pairs(nmax*maxneigh);
+  // room for the fixed pair stride, rounded up to a multiple of hip_palign
+  grow_pairs(nmax * (((maxneigh + hip_palign - 1) / hip_palign) * hip_palign));
 
   hip_acc_used = false;
 #ifdef KOKKOS_ENABLE_HIP
@@ -1133,15 +1139,20 @@ int PairPODKokkos<DeviceType>::FusedNeighborList(int gi1, int Ni)
     if ((int) hip_lookback.extent(0) < nint)
       MemKK::realloc_kokkos(hip_lookback, "pair_pod:hip_lookback", nint);
     const int N = Ni * maxneigh;
-    // fixed stride: the pairs of atom i at i*maxneigh, written without a scan
-    if ((hip_flags & HIP_FIXED_PAIRS) && (maxneigh > 0) &&
-        PODHIP::neighbor_fixed<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
-            typeai.data(), aj.data(), ti.data(), tj.data(), numij.data(), x.data(), rcutsq.data(),
-            pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq), gi1, Ni, N,
-            maxneigh, nelements)) {
-      pairs_fused = true;
-      pair_stride = maxneigh;
-      return N;
+    // fixed stride: the pairs of atom i at i*ps (maxneigh, rounded up to a multiple of
+    // hip_palign with HIP_PAIR_ALIGN), written without a scan
+    if ((hip_flags & HIP_FIXED_PAIRS) && (maxneigh > 0)) {
+      const int ps = (hip_flags & HIP_PAIR_ALIGN)
+          ? ((maxneigh + hip_palign - 1) / hip_palign) * hip_palign : maxneigh;
+      const int Nf = Ni * ps;
+      if (PODHIP::neighbor_fixed<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
+              typeai.data(), aj.data(), ti.data(), tj.data(), numij.data(), x.data(),
+              rcutsq.data(), pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x,
+              rcutsq), gi1, Ni, Nf, ps, nelements)) {
+        pairs_fused = true;
+        pair_stride = ps;
+        return Nf;
+      }
     }
     if (PODHIP::neighbor_fused<KK_FLOAT>(Kokkos::HIP().hip_stream(), rr.data(), rhat.data(),
             typeai.data(), idxi.data(), ai.data(), aj.data(), ti.data(), tj.data(), numij.data(),

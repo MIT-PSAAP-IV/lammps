@@ -95,6 +95,7 @@ class PairPODKokkos : public PairPOD {
   int native_hip;          // 1 to use native HIP kernels where available
   int hip_flags;           // which native HIP kernel variants are used (HIP_* bits)
   int hip_jtile;           // neighbor tile size of the native HIP radial-angular sum
+  int hip_palign;          // multiple of the fixed pair stride
   int abf_degree;          // angular degree L of the 3-body monomials, or -1
   bool angular_otf;        // true if the angular basis of the current block was not stored
   bool hip_acc_used;       // true if global energy/virial are accumulated in hip_acc
