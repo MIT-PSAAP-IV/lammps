@@ -82,7 +82,8 @@ enum { HIP_RADIAL = 1,     // fused radial basis and projection
        HIP_NEIGH_D2 = 131072,       // B-spline 2-body descriptors summed with the pair list
        HIP_NEIGH_ONE = 262144,        // pair list without the atom types if all are element 0
        HIP_NEIGH_HALF = 524288,       // ... with two atoms per wavefront
-       HIP_LENV_DPP = 1048576 };      // wave sums of the local EA-POD kernel with DPP
+       HIP_LENV_DPP = 1048576,        // wave sums of the local EA-POD kernel with DPP
+       HIP_RAS_FILL = 2097152 };      // radial-angular tile filled by (pair, function) lanes
 
 #ifdef KOKKOS_ENABLE_HIP
 namespace {
@@ -269,7 +270,7 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   hip_flags = HIP_RADIAL | HIP_ANGULAR | HIP_MFMA | HIP_MFMA_FORCE | HIP_DESC | HIP_TALLY | HIP_PORT |
       HIP_FUSE | HIP_FTALLY | HIP_FUSE_FC | HIP_FUSE_NEIGH | HIP_FIXED_PAIRS | HIP_PAIR_ALIGN |
       HIP_RAS_PREFETCH | HIP_LENV_ATOM | HIP_LENV_PRE | HIP_NEIGH_D2 | HIP_NEIGH_ONE |
-      HIP_NEIGH_HALF | HIP_LENV_DPP;
+      HIP_NEIGH_HALF | HIP_LENV_DPP | HIP_RAS_FILL;
   angular_otf = false;
   rbf_deferred = false;
   bs_deferred = false;
@@ -2361,7 +2362,8 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
         angular_otf = PODHIP::radialangularsum_otf<KK_FLOAT, KK_ACC_FLOAT>(
             Kokkos::HIP().hip_stream(), sumU.data(), rsrc, pod_geom(rr, rhat, Nij, pair_stride), tj.data(),
             numij.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, Nij,
-            (hip_flags & HIP_MFMA) != 0, hip_jtile, (hip_flags & HIP_RAS_PREFETCH) != 0);
+            (hip_flags & HIP_MFMA) != 0, hip_jtile, (hip_flags & HIP_RAS_PREFETCH) != 0,
+            (hip_flags & HIP_RAS_FILL) != 0);
       }
     }
 #endif

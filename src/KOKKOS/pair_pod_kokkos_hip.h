@@ -689,9 +689,10 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
 ------------------------------------------------------------------------- */
 
 // RTM x CTM output tiles (RTM >= ceil(K3/16), CTM >= ceil(Ne*nrbf3/16)) are kept in registers
-// PF: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
-// loaded while the current tile is on the matrix cores, and all lanes fill the tile
-template <typename T, typename TA, int RTM, int CTM, bool PF>
+// PF 1: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
+// loaded while the current tile is on the matrix cores, and all lanes fill the tile.
+// PF 2: the tile is filled by all lanes, one (pair, radial function) or (pair, direction) each
+template <typename T, typename TA, int RTM, int CTM, int PF>
 __global__ void __launch_bounds__(64)
     radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
                                  const PairGeom<T> pg, const int *__restrict__ tj,
@@ -762,13 +763,39 @@ __global__ void __launch_bounds__(64)
       }
     }
   };
-  if constexpr (PF) fetch(0);
+  if constexpr (PF == 1) fetch(0);
 
   for (int j0 = 0; j0 < nj; j0 += jtile) {
     const int nt = min(jtile, nj - j0);
     const int nt4 = (nt + 3) & ~3;
     __syncthreads();
-    if constexpr (PF) {
+    if constexpr (PF == 2) {
+      const int nr = nt4 * nrbf3;
+      for (int t = lane; t < nt4 * (nrbf3 + 3); t += 64) {
+        if (t < nr) {
+          const int jj = t / nrbf3, m = t - jj * nrbf3;
+          T f = T(0), df;
+          if (jj < nt) {
+            const PairRadial<T> prad(rs, pg, start + j0 + jj);
+            prad(m, f, df);
+          }
+          rbf_s[m * ldr + jj] = f;
+          if (m == 0) tj_s[jj] = (jj < nt) ? ((nelements > 1) ? tj[start + j0 + jj] : 0) : -1;
+        } else {
+          const int q = t - nr, jj = q / 3, d = q - 3 * jj;
+          T *pw = pow_s + jj * 3 * L1 + d * L1;
+          T x = T(0), p = T(0);
+          if (jj < nt) {
+            x = pg.rhat[start + j0 + jj + d * pg.N];
+            p = static_cast<T>(1.0);
+          }
+          for (int n = 0; n < L1; n++) {
+            pw[n] = p;
+            p *= x;
+          }
+        }
+      }
+    } else if constexpr (PF == 1) {
       if ((pd < 4) && (pjj < nt4)) {
         T *pw = pow_s + pjj * 3 * L1;
         if (pd < 3) {
@@ -852,7 +879,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
                           const int *tj,
                           const int *numij, const int *pq_m, const int *pq_d, int nelements,
                           int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile,
-                          bool prefetch = false)
+                          bool prefetch = false, bool spread = false)
 {
   const int nout = nrbf3 * K3;
   if ((Ni <= 0) || (nelements > MAX_ELEMENTS) || (K3 < 1)) return false;
@@ -877,17 +904,16 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     const size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
         ((size_t) jtile + K3) * sizeof(int);
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
-    const bool pf = prefetch && (4 * jtile <= 64);
+    const int pf = spread ? 2 : ((prefetch && (4 * jtile <= 64)) ? 1 : 0);
+#define LMP_POD_RAS_MFMA1(R, C, P)                                                               \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, P>), dim3(Ni),   \
+                     dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,         \
+                     nelements, nrbf3, K3, L, Nij, jtile)
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
   do {                                                                                           \
-    if (pf)                                                                                      \
-      hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, true>),      \
-                         dim3(Ni), dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m,  \
-                         pq_d, nelements, nrbf3, K3, L, Nij, jtile);                            \
-    else                                                                                         \
-      hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, false>),     \
-                         dim3(Ni), dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m,  \
-                         pq_d, nelements, nrbf3, K3, L, Nij, jtile);                            \
+    if (pf == 2) LMP_POD_RAS_MFMA1(R, C, 2);                                                     \
+    else if (pf == 1) LMP_POD_RAS_MFMA1(R, C, 1);                                                \
+    else LMP_POD_RAS_MFMA1(R, C, 0);                                                             \
   } while (0)
     if (CT == 1) {
       if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
@@ -901,6 +927,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
       else LMP_POD_RAS_MFMA(4, 2);
     }
 #undef LMP_POD_RAS_MFMA
+#undef LMP_POD_RAS_MFMA1
   } else
     hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_otf_kernel<T, TA>), dim3(Ni),
                        dim3(threads), lds, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,
