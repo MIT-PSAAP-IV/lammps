@@ -158,7 +158,7 @@ template <int BIT> __device__ inline void mega_tile_sync()
 #endif
 // S6SYMLDS 1: the LDS layout of the Hf kernel leaves out the force stage tables (S6SYM)
 #ifndef LMP_POD_MEGA_S6SYMLDS
-#define LMP_POD_MEGA_S6SYMLDS 0
+#define LMP_POD_MEGA_S6SYMLDS 1
 #endif
 #ifndef LMP_POD_MEGA_RPF
 #define LMP_POD_MEGA_RPF 0
