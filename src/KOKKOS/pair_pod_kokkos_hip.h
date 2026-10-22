@@ -1065,6 +1065,20 @@ __device__ inline void pod_monomial(const T *pd, const int ex, const int L1, T &
   Pw = static_cast<T>(c) * pa * pb * pd[2 * L1 + (c > 0 ? c - 1 : 0)];
 }
 
+// as pod_monomial(), with the powers of pd at stride S: pd[S*n] (layout [direction][power][pair])
+template <typename T, int S>
+__device__ inline void pod_monomial_s(const T *pd, const int ex, const int L1, T &P, T &Pu, T &Pv,
+                                      T &Pw)
+{
+  const int a = ex & 255, b = (ex >> 8) & 255, c = (ex >> 16) & 255;
+  const T pa = pd[S * a], pb = pd[S * (L1 + b)], pc = pd[S * (2 * L1 + c)];
+  const T pbc = pb * pc;
+  P = pa * pbc;
+  Pu = static_cast<T>(a) * pd[S * (a > 0 ? a - 1 : 0)] * pbc;
+  Pv = static_cast<T>(b) * pa * pd[S * (L1 + (b > 0 ? b - 1 : 0))] * pc;
+  Pw = static_cast<T>(c) * pa * pb * pd[S * (2 * L1 + (c > 0 ? c - 1 : 0))];
+}
+
 template <typename T> __device__ inline T pod_sel4(int i, T v0, T v1, T v2, T v3)
 {
   T r = T(0);
@@ -1398,6 +1412,12 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #ifndef LMP_POD_HF_EREG
 #define LMP_POD_HF_EREG 1
 #endif
+// LMP_POD_HF_PDT (HF instance): the power table of the tile is stored [direction][power][pair]
+// instead of [pair][direction][power], so that the 16 lanes of a row group (16 pairs, same
+// monomial) read consecutive entries (no LDS bank conflicts)
+#ifndef LMP_POD_HF_PDT
+#define LMP_POD_HF_PDT 1
+#endif
 
 // register budget of the matrix core force kernel: without it the compiler keeps the
 // accumulators in separate AGPRs, which costs occupancy
@@ -1496,6 +1516,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   // lane group and per-pair LDS atomics
   constexpr bool SPREAD = HF && LMP_POD_HF_SPREAD;
   constexpr bool EREG = SPREAD && LMP_POD_HF_EREG;
+  constexpr bool PDT = HF && (JT == 16) && (CSM == 2) && !GROUP && LMP_POD_HF_PDT;
+  constexpr int PS = PDT ? JT : 1;    // stride of the powers of a pair in pd_s
   TA af = TA(0), avd = TA(0), avo = TA(0);
 
   // the direction (u, v or w) and element of the pairs of the next tile are loaded while the
@@ -1523,11 +1545,11 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     if constexpr (PREFETCH) {
       if (lane < 3 * JT) {
         const int jj = lane % JT, d = lane / JT;
-        T *pd = pd_s + jj * PD + d * L1;
+        T *pd = PDT ? pd_s + d * L1 * JT + jj : pd_s + jj * PD + d * L1;
         const bool in = (jj < nt);
         T p = in ? static_cast<T>(1.0) : T(0);
         for (int n = 0; n < L1; n++) {
-          pd[n] = p;
+          pd[PS * n] = p;
           p *= xh;
         }
         if (d == 0) tj_s[jj] = in ? tjh : -1;
@@ -1566,7 +1588,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       const int jb = s0 + lr;
       const int tjb = tj_s[jb];
       const PairRadial<T> prad(rs, pg, start + j0 + min(jb, nt - 1));
-      const T *pd = pd_s + jb * PD;
+      const T *pd = PDT ? pd_s + jb : pd_s + jb * PD;
       if constexpr (!GROUP) {
         TA br[CSM], bdr[CSM];
 #pragma unroll
@@ -1597,7 +1619,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
             const int kv = 16 * kt + Mfma<TA>::row(lane, v);
             if (kv < K3) {
               T P, Pu, Pv, Pw;
-              pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+              pod_monomial_s<T, PS>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
               SA += accH[v] * static_cast<TA>(P);
               SU += accG[v] * static_cast<TA>(Pu);
               SV += accG[v] * static_cast<TA>(Pv);
@@ -1645,7 +1667,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
               const int kv = 16 * kt + Mfma<TA>::row(lane, v);
               if (kv < K3) {
                 T P, Pu, Pv, Pw;
-                pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+                pod_monomial_s<T, PS>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
                 SA += accH[v] * static_cast<TA>(P);
                 SU += accG[v] * static_cast<TA>(Pu);
                 SV += accG[v] * static_cast<TA>(Pv);
@@ -1669,7 +1691,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
           TA fd, vd, vo;
           if constexpr (EREG)
             pod_pair_force_dg<T, TA>(ft, pg.N, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq,
-                                     pg.r(start + j0 + jb), pd[1], pd[L1 + 1], pd[2 * L1 + 1],
+                                     pg.r(start + j0 + jb), pd[PS], pd[PS * (L1 + 1)],
+                                     pd[PS * (2 * L1 + 1)],
                                      fd, vd, vo);
           else
             pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd,
