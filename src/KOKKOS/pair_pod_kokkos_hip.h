@@ -1418,6 +1418,18 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #ifndef LMP_POD_HF_PDT
 #define LMP_POD_HF_PDT 1
 #endif
+// LMP_POD_HF_REMAT (HF instance, bits): the lane-dependent indices of a region of the tile loop
+// are derived from a copy of the lane index the compiler cannot see through, so that it
+// recomputes them there instead of keeping them in registers over the whole loop (1 force
+// epilogue, 2 tile setup, 4 matrix core part)
+#ifndef LMP_POD_HF_REMAT
+#define LMP_POD_HF_REMAT 7
+#endif
+__device__ inline int pod_opaque(int x)
+{
+  asm volatile("" : "+v"(x));
+  return x;
+}
 
 // register budget of the matrix core force kernel: without it the compiler keeps the
 // accumulators in separate AGPRs, which costs occupancy
@@ -1543,8 +1555,9 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     __syncthreads();
     // powers of u, v and w of the pairs of the tile, one direction per lane
     if constexpr (PREFETCH) {
-      if (lane < 3 * JT) {
-        const int jj = lane % JT, d = lane / JT;
+      const int ls = (HF && (LMP_POD_HF_REMAT & 2)) ? pod_opaque(lane) : lane;
+      if (ls < 3 * JT) {
+        const int jj = ls % JT, d = ls / JT;
         T *pd = PDT ? pd_s + d * L1 * JT + jj : pd_s + jj * PD + d * L1;
         const bool in = (jj < nt);
         T p = in ? static_cast<T>(1.0) : T(0);
@@ -1585,7 +1598,9 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
 
       // B operands of this pair tile: column s0 + lr, inner index 4*cs + lq; each lane
       // evaluates the radial functions of its own entries
-      const int jb = s0 + lr;
+      const int lb = (HF && (LMP_POD_HF_REMAT & 4)) ? pod_opaque(lane) : lane;
+      const int lrb = lb & 15;
+      const int jb = s0 + lrb;
       const int tjb = tj_s[jb];
       const PairRadial<T> prad(rs, pg, start + j0 + min(jb, nt - 1));
       const T *pd = PDT ? pd_s + jb : pd_s + jb * PD;
@@ -1603,7 +1618,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         }
 
         for (int kt = 0; kt < KT; kt++) {
-          const int k = 16 * kt + lr;
+          const int k = 16 * kt + lrb;
           acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
 #pragma unroll
           for (int cs = 0; cs < CSM; cs++)
@@ -1616,7 +1631,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
             }
 #pragma unroll
           for (int v = 0; v < 4; v++) {
-            const int kv = 16 * kt + Mfma<TA>::row(lane, v);
+            const int kv = 16 * kt + Mfma<TA>::row(lb, v);
             if (kv < K3) {
               T P, Pu, Pv, Pw;
               pod_monomial_s<T, PS>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
@@ -1687,13 +1702,16 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         SW += __shfl_xor(SW, off);
       }
       if constexpr (SPREAD) {
-        if ((lq < 3) && (jb < nt)) {
+        const int le = (HF && (LMP_POD_HF_REMAT & 1)) ? pod_opaque(lane) : lane;
+        const int lqe = le >> 4, jbe = s0 + (le & 15);
+        if ((lqe < 3) && (jbe < nt)) {
           TA fd, vd, vo;
+          const T *pde = PDT ? pd_s + jbe : pd_s + jbe * PD;
           if constexpr (EREG)
-            pod_pair_force_dg<T, TA>(ft, pg.N, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq,
-                                     pg.r(start + j0 + jb), pd[PS], pd[PS * (L1 + 1)],
-                                     pd[PS * (2 * L1 + 1)],
-                                     fd, vd, vo);
+            pod_pair_force_dg<T, TA>(
+                ft, pg.N, i, start + j0 + jbe, tj_s[jbe], SA, SU, SV, SW, lqe,
+                pg.r(start + j0 + jbe), pde[PS], pde[PS * (L1 + 1)], pde[PS * (2 * L1 + 1)], fd,
+                vd, vo);
           else
             pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd,
                                     vo);
