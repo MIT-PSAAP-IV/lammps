@@ -45,9 +45,9 @@ using namespace MathSpecial;
 
 static constexpr int GPU_CONCURRENCY_DIV = 1;
 
-static constexpr int POD_MAX_NRBF  = 8;   // max nrbf3 held in registers
-static constexpr int POD_MAX_NELEM = 2;   // max nelements in the fused sum
-static constexpr int POD_MAX_DEG   = 4;   // max monomial degree (P3)
+static constexpr int POD_MAX_NRBF  = 5;   // max nrbf3 held in registers
+static constexpr int POD_MAX_NELEM = 1;   // max nelements in the fused sum
+static constexpr int POD_MAX_DEG   = 3;   // max monomial degree (P3)
 
 // true : allbody_forces handles force calculations, tallying: forces, virial
 // false: allbody_forces writes fij, tallyforce() does the atomics (original, for benchmarking)
@@ -769,7 +769,7 @@ void PairPODKokkos<DeviceType>::grow_atoms(int Ni)
     if (localeapod) {
       MemKK::realloc_kokkos(d_ks, "pair_pod:ks", nimax);
       MemKK::realloc_kokkos(d_kn, "pair_pod:kn", nimax);
-      int envtmpmem = 1 + 2*nMaxActiveClusters;
+      int envtmpmem = 1 + nMaxActiveClusters;
       MemKK::realloc_kokkos(pd, "pair_pod:pd", nimax * envtmpmem);
     }
     else if (eapod) {
@@ -1970,10 +1970,8 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
   const int nActMax = nMaxActiveClusters;
 
   int totIters = Ni * nActMax;
-  auto D       = Kokkos::subview(pd, std::make_pair(0, totIters));
-  auto dD_dpca = Kokkos::subview(pd, std::make_pair(totIters, 2*totIters));
-  auto pca     = Kokkos::subview(pd, std::make_pair(2*totIters, 2*totIters + Ni));
-  auto U       = pca; // reuse buffer
+  auto U = Kokkos::subview(pd, std::make_pair(0, Ni));
+  auto P = Kokkos::subview(pd, std::make_pair(Ni, Ni + totIters));
 
   auto proj = Proj;
   auto cent = Centroids;
@@ -1989,19 +1987,20 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
   auto kn = d_kn;
 
   // 1) PCA + active cluster search
-  Kokkos::parallel_for("pca_and_active_clusters",
-    Kokkos::RangePolicy<DeviceType>(0, Ni),
-    KOKKOS_LAMBDA(const int i) {
+  // 2) Pk, ei, cp, U
+  Kokkos::parallel_for("MoE_clusters_D_dD_Pk_ei_cp_U",
+    Kokkos::RangePolicy<DeviceType>(0, Ni), KOKKOS_LAMBDA(const int i) {
       const int typei = tyai[i];
+      const int nc    = typei * nCoeff;
       const int ncdt  = typei * nDes;
       const int ncct  = typei * nCls;
 
+      // PCA
       KK_ACC_FLOAT pcai = 0.0;
-      for (int m = 0; m < nDes; ++m) {
+      for (int m = 0; m < nDes; ++m)
         pcai += proj[ncdt + m] * B[i + Ni * m];
-      }
-      pca[i] = pcai;
 
+      // Active cluster search
       // lower_bound on redges[ncct + k], ks in [0, nCls-1]
       int lo = 0, hi = nCls;
       while (lo < hi) {
@@ -2009,10 +2008,10 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
         if (redges[ncct + mid] < pcai) lo = mid + 1;
         else                           hi = mid;
       }
-      const int ksi = lo;
+      const int kl = lo;
 
       // upper_bound on ledges[ncct + k], ke in [ks+1, min(ks+nActMax,nCls))
-      hi = ksi + nActMax;
+      hi = kl + nActMax;
       if (hi > nCls) hi = nCls;
       lo++;
       while (lo < hi) {
@@ -2020,27 +2019,20 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
         if (ledges[ncct + mid] <= pcai) lo = mid + 1;
         else                            hi = mid;
       }
+      const int kni = lo - kl;
 
-      ks[i] = ksi;
-      kn[i] = lo - ksi;   // ke - ks
-    }
-  );
+      ks[i] = kl;
+      kn[i] = kni;   // ke - ks
 
-  // 2) D, dD/dpca, Pk, ei, cp, U
-  Kokkos::parallel_for("D_dD_Pk_ei_cp_U",
-    Kokkos::RangePolicy<DeviceType>(0, Ni), KOKKOS_LAMBDA(const int i) {
-      const int kl    = ks[i];
-      const int kni   = kn[i];
-      const int typei = tyai[i];
+      // 2) Pk, ei, cp, U
 
-      const int nc    = nCoeff * typei;
-      const int kncct = kl + nCls * typei;
+      const int kncct = kl + ncct;
       const int knc   = 1 + nc + kl * nDes;
       
       KK_ACC_FLOAT sumfDi = 0.0;
       KK_ACC_FLOAT S      = 0.0;
 
-      const KK_FLOAT pcai = pca[i];
+      KK_FLOAT D[3], dD_dpca[3];
       KK_FLOAT fcut, dfcut;
       for (int k = 0; k < kni; ++k) {
         const int kg = k + kncct;
@@ -2055,9 +2047,8 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
         const KK_FLOAT fDk   = fcut * invDk;
         const KK_FLOAT dfDkdpc = 2.0 * pc * invDk * (dfcut - fDk);
 
-        const int idx = i + Ni * k;
-        D[idx]       = fDk;
-        dD_dpca[idx] = dfDkdpc;
+        D[k] = fDk;
+        dD_dpca[k] = dfDkdpc;
 
         sumfDi += fDk;
         S      += dfDkdpc;
@@ -2068,20 +2059,19 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
       KK_ACC_FLOAT T     = 0.0;
       KK_ACC_FLOAT A     = 0.0;
       for (int k = 0; k < kni; ++k) {
-        int idx = knc + k*nDes;
+        const int idx = knc + k*nDes;
         KK_ACC_FLOAT sumE = 0.0;
         for (int m = 0; m < nDes; ++m)
           sumE += cefs[m + idx] * B[i + Ni*m];
         
-        idx = i + Ni * k;
-        const KK_FLOAT Pk  = D[idx] * sumfDi;
+        const KK_FLOAT Pk  = D[k] * sumfDi;
         const KK_FLOAT cpk = sumE * sumfDi;
 
-        D[idx] = Pk;
+        P[i + Ni*k] = Pk;
 
         eival += sumE * Pk;
         T     += cpk * Pk;
-        A     += cpk * dD_dpca[idx];
+        A     += cpk * dD_dpca[k];
       }
       ei[i] = eival;
       U[i]  = A - S * T;
@@ -2100,7 +2090,7 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
 
       KK_ACC_FLOAT sum = U[i] * proj[m + nDes*typei];
       for (int k = 0; k < kni; ++k)
-        sum += cefs[knc + k*nDes] * D[i + Ni*k];
+        sum += cefs[knc + k*nDes] * P[i + Ni*k];
 
       cb[i + Ni*m] = sum;
   });
