@@ -1218,37 +1218,37 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
 }
 
 // component d (0, 1, 2) of the force of pair j of atom i as pod_pair_finish() (atom forces
-// tallied, ft.f != nullptr): subtracts it from f_j and returns it in fd, with the virial terms
+// tallied, ft.f != nullptr), with the distance r and the direction (u, v, w) of the pair given
+// (N: the number of pairs): subtracts it from f_j and returns it in fd, with the virial terms
 // vd = r_d f_d and vo (xy, xz, yz for d = 0, 1, 2) of the pair
 template <typename T, typename TA>
-__device__ inline void pod_pair_force_d(const ForceTally<T, TA> &ft, const PairGeom<T> &pg,
-                                        const int i, const int j, const int e, const TA SA,
-                                        const TA SU, const TA SV, const TA SW, const int d,
-                                        TA &fd, TA &vd, TA &vo)
+__device__ inline void pod_pair_force_dg(const ForceTally<T, TA> &ft, const int N, const int i,
+                                         const int j, const int e, const TA SA, const TA SU,
+                                         const TA SV, const TA SW, const int d, const T r,
+                                         const T u, const T v, const T w, TA &fd, TA &vd,
+                                         TA &vo)
 {
-  T g[9];
-  pod_pair_gradients<T>(g, pg, j);
-  TA fx = SU * static_cast<TA>(g[0]) + SV * static_cast<TA>(g[1]) + SW * static_cast<TA>(g[2]) +
-      SA * static_cast<TA>(g[6]);
-  TA fy = SU * static_cast<TA>(g[1]) + SV * static_cast<TA>(g[3]) + SW * static_cast<TA>(g[4]) +
-      SA * static_cast<TA>(g[7]);
-  TA fz = SU * static_cast<TA>(g[2]) + SV * static_cast<TA>(g[4]) + SW * static_cast<TA>(g[5]) +
-      SA * static_cast<TA>(g[8]);
-  T u, v, w;
-  pg.uvw(j, u, v, w);
-  const T r = pg.r(j);
+  const T invr = static_cast<T>(1.0) / r;
+  const T g0 = (v * v + w * w) * invr, g1 = -(u * v) * invr, g2 = -(u * w) * invr;
+  const T g3 = (u * u + w * w) * invr, g4 = -(v * w) * invr, g5 = (u * u + v * v) * invr;
+  TA fx = SU * static_cast<TA>(g0) + SV * static_cast<TA>(g1) + SW * static_cast<TA>(g2) +
+      SA * static_cast<TA>(r * u);
+  TA fy = SU * static_cast<TA>(g1) + SV * static_cast<TA>(g3) + SW * static_cast<TA>(g4) +
+      SA * static_cast<TA>(r * v);
+  TA fz = SU * static_cast<TA>(g2) + SV * static_cast<TA>(g4) + SW * static_cast<TA>(g5) +
+      SA * static_cast<TA>(r * w);
   if (ft.cb2) {
     TA cR = TA(0);
     if (ft.bs.r0v) {
       T Bq[4], dBq[4];
-      const int ii =
-          i * ft.ca + ft.cm * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
+      const int pair = (ft.bs.ne > 1) ? ft.bs.ti[j] * ft.bs.ne + ft.bs.tj[j] : 0;
+      const int ii = i * ft.ca + ft.cm * (pod_bspline_eval(ft.bs, pair, r, Bq, dBq) + ft.nrbf2 * e);
 #pragma unroll
       for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * dBq[m]);
     } else {
       const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
       for (int m = 0; m < ft.nm2; ++m)
-        cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + pg.N * m]);
+        cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + N * m]);
     }
     cR *= static_cast<TA>(r);
     fx += cR * static_cast<TA>(u);
@@ -1268,6 +1268,18 @@ __device__ inline void pod_pair_force_d(const ForceTally<T, TA> &ft, const PairG
       atomicAdd(vj + (3 + d) * ft.vs1, static_cast<TA>(-0.5) * vo);
     }
   }
+}
+
+// as pod_pair_force_dg(), with the geometry of pair j read from pg
+template <typename T, typename TA>
+__device__ inline void pod_pair_force_d(const ForceTally<T, TA> &ft, const PairGeom<T> &pg,
+                                        const int i, const int j, const int e, const TA SA,
+                                        const TA SU, const TA SV, const TA SW, const int d,
+                                        TA &fd, TA &vd, TA &vo)
+{
+  T u, v, w;
+  pg.uvw(j, u, v, w);
+  pod_pair_force_dg<T, TA>(ft, pg.N, i, j, e, SA, SU, SV, SW, d, pg.r(j), u, v, w, fd, vd, vo);
 }
 
 // adds the sums of atom i (pairs start .. start+nj-1) to its force and virial; called by
@@ -1381,6 +1393,11 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #ifndef LMP_POD_HF_SPREAD
 #define LMP_POD_HF_SPREAD 1
 #endif
+// LMP_POD_HF_EREG (HF spread epilogue): the direction of the pair is taken from the powers of
+// the tile in LDS instead of global memory
+#ifndef LMP_POD_HF_EREG
+#define LMP_POD_HF_EREG 1
+#endif
 
 // register budget of the matrix core force kernel: without it the compiler keeps the
 // accumulators in separate AGPRs, which costs occupancy
@@ -1478,6 +1495,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   // component each, summed per lane (af, avd, avo) and reduced once per atom, instead of one
   // lane group and per-pair LDS atomics
   constexpr bool SPREAD = HF && LMP_POD_HF_SPREAD;
+  constexpr bool EREG = SPREAD && LMP_POD_HF_EREG;
   TA af = TA(0), avd = TA(0), avo = TA(0);
 
   // the direction (u, v or w) and element of the pairs of the next tile are loaded while the
@@ -1649,7 +1667,13 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       if constexpr (SPREAD) {
         if ((lq < 3) && (jb < nt)) {
           TA fd, vd, vo;
-          pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd, vo);
+          if constexpr (EREG)
+            pod_pair_force_dg<T, TA>(ft, pg.N, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq,
+                                     pg.r(start + j0 + jb), pd[1], pd[L1 + 1], pd[2 * L1 + 1],
+                                     fd, vd, vo);
+          else
+            pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd,
+                                    vo);
           af += fd;
           avd += vd;
           avo += vo;
