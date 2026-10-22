@@ -250,7 +250,7 @@ class PairPODKokkos : public PairPOD {
                            t_pod_1i l_idxi, t_pod_1i l_tj,
                            int l_nrbf2, const int Ni, const int Nij);
 
-  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat, t_pod_1d l_rr,
+  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
                               t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj,
                               int l_nrbf2, const int Ni, const int Nij);
 
@@ -272,7 +272,7 @@ class PairPODKokkos : public PairPOD {
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
-  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat, t_pod_1d l_rr,
+  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
                       t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3, t_pod_1d l_sumU, t_pod_1i l_pc3,
