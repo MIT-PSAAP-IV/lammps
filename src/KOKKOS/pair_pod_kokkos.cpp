@@ -972,7 +972,7 @@ void PairPODKokkos<DeviceType>::radialbasis(
         const KK_FLOAT drbftdr = bg1 * isinax + Kf1dx * cosax;
 
         rbft (nij) = rbfv;
-        drbft(nij) = drbftdr * invdij;  // R'/r
+        drbft(nij) = drbftdr;  // R'(r)
 
         ix  += static_cast<KK_ACC_FLOAT>(xpi);
         nij += Nij;
@@ -990,7 +990,7 @@ void PairPODKokkos<DeviceType>::radialbasis(
       dterm -= fcut_invd;
       inva  *= invdij;
       rbft (nij) = fcut * inva;
-      drbft(nij) = dterm * inva * invdij;  // R'/r
+      drbft(nij) = dterm * inva;  // R'(r)
       nij += Nij;
     }
   });
@@ -1029,9 +1029,9 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
   const int nb = nhermite_bins;
   const int nr = nrbfmax;
 
-  auto s_r0    = hermite_r0;
-  auto s_invdr = hermite_invdr;
-  auto s_coef  = rbf_hermite_coeffs;
+  auto s_r0   = hermite_r0;
+  auto s_invh = hermite_invdr;
+  auto s_coef = rbf_hermite_coeffs;
 
   Kokkos::parallel_for("radialbasis_hermite",
     Kokkos::RangePolicy<DeviceType>(0, N),
@@ -1043,11 +1043,10 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
 
       const KK_FLOAT r = l_rr(n);
 
-      const KK_FLOAT r0    = s_r0(pair);
-      const KK_FLOAT invdr = s_invdr(pair);
-      const KK_FLOAT invdrr = invdr / r;
+      const KK_FLOAT r0   = s_r0(pair);
+      const KK_FLOAT invh = s_invh(pair);
 
-      const KK_FLOAT tg = (r - r0) * invdr;
+      const KK_FLOAT tg = (r - r0) * invh;
       int b = (int) tg;
       if (b < 0) b = 0;
       else if (b > nb-1) b = nb-1;
@@ -1068,7 +1067,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
 
         const int idx = n + N*k;
         l_rbf (idx) = f;
-        l_drbf(idx) = dfdt * invdrr;   // f'(r)/r
+        l_drbf(idx) = dfdt * invh;   // R'(r)
       }
     });
 }
@@ -1139,7 +1138,7 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
       // for r <= r_in the basis is extended as a constant, so forces vanish
       // fold that into the derivative scale instead of zeroing dB afterwards
       const bool     inside = (tg >= (KK_FLOAT)0.0);
-      const KK_FLOAT dscale = inside ? invh / r : (KK_FLOAT)0.0;
+      const KK_FLOAT dscale = inside ? invh : (KK_FLOAT)0.0;
       if (!inside) tg = (KK_FLOAT)0.0;
 
       int b = (int) tg;
@@ -1162,7 +1161,7 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
       l_rbf2 (n + 2*N) = sel4(sh + 2, B0, B1, B2, B3);
       l_rbf2 (n + 3*N) = sel4(sh + 3, B0, B1, B2, B3);
 
-      l_drbf2(n      ) = sel4(sh    , dB0, dB1, dB2, dB3);   // R'(r)/r
+      l_drbf2(n      ) = sel4(sh    , dB0, dB1, dB2, dB3);   // R'(r)
       l_drbf2(n +   N) = sel4(sh + 1, dB0, dB1, dB2, dB3);
       l_drbf2(n + 2*N) = sel4(sh + 2, dB0, dB1, dB2, dB3);
       l_drbf2(n + 3*N) = sel4(sh + 3, dB0, dB1, dB2, dB3);
@@ -1254,7 +1253,7 @@ void PairPODKokkos<DeviceType>::twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_
 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::twobody_forces(
-    t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat, t_pod_1d l_rr,
+    t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
     t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
 {
   Kokkos::parallel_for("twobody_forces",
@@ -1263,10 +1262,8 @@ void PairPODKokkos<DeviceType>::twobody_forces(
       const int ii = l_idxi(n) + Ni * l_nrbf2 * l_tj(n);
 
       KK_ACC_FLOAT cR = 0.0;
-      for (int m = 0; m < l_nrbf2; ++m) {
+      for (int m = 0; m < l_nrbf2; ++m)
         cR += static_cast<KK_ACC_FLOAT>(cb2(ii + Ni * m) * l_drbf2(n + Nij * m));
-      }
-      cR *= l_rr(n);
 
       const int i1 = 3 * n;
       fij(i1 + 0) = cR * l_rhat(i1 + 0);
@@ -1289,7 +1286,7 @@ void PairPODKokkos<DeviceType>::twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2
 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::twobody_forces_bspline(
-    t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat, t_pod_1d l_rr,
+    t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
     t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij)
 {
   Kokkos::parallel_for("twobody_forces_bspline",
@@ -1299,7 +1296,6 @@ void PairPODKokkos<DeviceType>::twobody_forces_bspline(
       KK_ACC_FLOAT cR = 0.0;
       for (int s = 0; s < 4; ++s)
         cR += cb2(ii + Ni * s) * l_drbf2(n + Nij * s);
-      cR *= l_rr(n);
 
       const int i1 = 3 * n;
       fij(i1 + 0) = cR * l_rhat(i1 + 0);
@@ -1563,7 +1559,7 @@ struct PODAllBodyForceFunctor {
       drb[m] = drbf(j + Nij*m);
     });
 
-    // two-body (drbf = R'/r): A00 = 1 -> accumulate to fcAdR
+    // two-body (drbf = R'): A00 = 1 -> accumulate to fcAdR
     KK_ACC_FLOAT fcAdR = 0.0;
     if constexpr (BSPLINE) {
       const int i2 = ia + Ni*(base(j) + nr2*te);
@@ -1621,9 +1617,9 @@ struct PODAllBodyForceFunctor {
 
     // Jacobian: J = d(u,v,w) / d(x,y,z) = (I - rhat rhat^T) / r
     // f_ij = fc * d(R * A) = J * Dr_hat + fc * A * r_hat
-    //      = D/r + (fcAdR r - (D*u)/r) u
+    //      = Dr_hat/r + (fcAdR - (Dr_hat*r_hat)/r) r_hat
     const KK_ACC_FLOAT g  = Du*u + Dv*v + Dw*w;
-    const KK_ACC_FLOAT sr = fcAdR*dij - g*invr;
+    const KK_ACC_FLOAT sr = fcAdR - g*invr;
     const KK_ACC_FLOAT fx = Du*invr + sr*u;
     const KK_ACC_FLOAT fy = Dv*invr + sr*v;
     const KK_ACC_FLOAT fz = Dw*invr + sr*w;
@@ -2139,8 +2135,8 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   //// GPUs have large atomblocks. Nij<=1 makes little sense: Nij is the total number of neighbors of all atoms in a block
   //// Would need to treat nij=1 neighbors differently: With numij in the allbody_forces and early return exit
   //if (Nij=1) {
-  //  if (use_bspline) twobody_forces_bspline(l_fij, cb2, drbf2, rij, bs_base, idxi, tj, nrbf2, Ni, Nij);
-  //  else             twobody_forces(l_fij, cb2, drbf2, rij, idxi, tj, nrbf2, Ni, Nij);
+  //  if (use_bspline) twobody_forces_bspline(l_fij, cb2, drbf2, rhat, bs_base, idxi, tj, nrbf2, Ni, Nij);
+  //  else             twobody_forces(l_fij, cb2, drbf2, rhat, idxi, tj, nrbf2, Ni, Nij);
   //}
 
   // Similarly conditionals Nij>1 and Nij>2 make little sense on GPUs
