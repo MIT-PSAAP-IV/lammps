@@ -1232,9 +1232,8 @@ void PairPODKokkos<DeviceType>::radialangularsum(
   pod_dispatch_int<1, POD_MAX_NELEM>(l_nelements, [&](auto NE) {
     pod_dispatch_int<1, POD_MAX_NRBF>(nrbf3, [&](auto NR) {
       pod_dispatch_int<1, POD_MAX_DEG>(P3, [&](auto MD) {
-        this->template radialangularsum_impl<decltype(NE)::value,
-                                             decltype(NR)::value,
-                                             decltype(MD)::value>(
+        constexpr int ne = decltype(NE)::value, nr = decltype(NR)::value, md = decltype(MD)::value;
+        this->template radialangularsum_impl<ne, nr, md>(
             l_sumU, l_rbf, l_rhat, l_tj, l_numij, K3, Ni, Nij);
       });
     });
