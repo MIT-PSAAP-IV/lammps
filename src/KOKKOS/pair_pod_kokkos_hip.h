@@ -1425,6 +1425,15 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #ifndef LMP_POD_HF_REMAT
 #define LMP_POD_HF_REMAT 7
 #endif
+// LMP_POD_HF_SYM (HF instance): lane group g of the matrix core output evaluates the 8 template
+// monomials 1, X, X^2, XY, X^3, X^2 Y, X Y^2, XYZ of (X, Y, Z) = sigma_g(u, v, w) (identity, the
+// two cyclic shifts, the swap of u and v) in registers; the host table pq_ex[K3 + q] gives the
+// monomial of A row q (or -1 for a repeat), so that the 32 rows cover the 20 monomials of degree
+// <= 3.  No power table, no tile fill and no barriers in the pair loop (after the mega study's
+// S6SYM, from the nested Horner rewrite in leapod2 243dda528f)
+#ifndef LMP_POD_HF_SYM
+#define LMP_POD_HF_SYM 1
+#endif
 __device__ inline int pod_opaque(int x)
 {
   asm volatile("" : "+v"(x));
@@ -1530,6 +1539,12 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   constexpr bool EREG = SPREAD && LMP_POD_HF_EREG;
   constexpr bool PDT = HF && (JT == 16) && (CSM == 2) && !GROUP && LMP_POD_HF_PDT;
   constexpr int PS = PDT ? JT : 1;    // stride of the powers of a pair in pd_s
+  constexpr bool SYM = HF && (JT == 16) && (CSM == 2) && !GROUP && LMP_POD_HF_SYM;
+  int rk[2] = {0, 0};    // SYM: monomial of the A rows 16 kt + lr of this lane, or -1
+  if constexpr (SYM) {
+    rk[0] = pq_ex[K3 + lr];
+    rk[1] = pq_ex[K3 + 16 + lr];
+  }
   TA af = TA(0), avd = TA(0), avo = TA(0);
 
   // the direction (u, v or w) and element of the pairs of the next tile are loaded while the
@@ -1548,13 +1563,14 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       }
     }
   };
-  if constexpr (PREFETCH) fetch(0);
+  if constexpr (PREFETCH && !SYM) fetch(0);
 
   for (int j0 = 0; j0 < nj; j0 += JT) {
     const int nt = min(JT, nj - j0);
-    __syncthreads();
+    if constexpr (!SYM) __syncthreads();
     // powers of u, v and w of the pairs of the tile, one direction per lane
-    if constexpr (PREFETCH) {
+    if constexpr (SYM) {
+    } else if constexpr (PREFETCH) {
       const int ls = (HF && (LMP_POD_HF_REMAT & 2)) ? pod_opaque(lane) : lane;
       if (ls < 3 * JT) {
         const int jj = ls % JT, d = ls / JT;
@@ -1588,7 +1604,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         if (d == 0) tj_s[jj] = -1;
       }
     }
-    __syncthreads();
+    if constexpr (!SYM) __syncthreads();
 
     // C^T (k x pairs) = F^T R^T on the matrix cores: lane column lr is pair s0 + lr and
     // its four accumulators are rows k = 16 kt + row(lane, v), so each lane sums over its own
@@ -1601,7 +1617,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       const int lb = (HF && (LMP_POD_HF_REMAT & 4)) ? pod_opaque(lane) : lane;
       const int lrb = lb & 15;
       const int jb = s0 + lrb;
-      const int tjb = tj_s[jb];
+      const int tjb = SYM ? ((jb < nt) ? 0 : -1) : tj_s[jb];
+      T eu = T(0), ev = T(0), ew = T(0);    // SYM: direction of pair jb
       const PairRadial<T> prad(rs, pg, start + j0 + min(jb, nt - 1));
       const T *pd = PDT ? pd_s + jb : pd_s + jb * PD;
       if constexpr (!GROUP) {
@@ -1617,6 +1634,55 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
           }
         }
 
+        if constexpr (SYM) {
+          pg.uvw(start + j0 + min(jb, nt - 1), eu, ev, ew);
+          const int g = lb >> 4;
+          const T X = (g == 0) ? eu : ((g == 2) ? ew : ev);
+          const T Y = (g == 0) ? ev : ((g == 1) ? ew : eu);
+          const T Z = (g == 1) ? eu : ((g == 2) ? ev : ew);
+          const T X2 = X * X, XY = X * Y;
+          TA SX = TA(0), SY = TA(0), SZ = TA(0);
+#pragma unroll
+          for (int kt = 0; kt < 2; kt++) {
+            acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
+#pragma unroll
+            for (int cs = 0; cs < CSM; cs++)
+              if (cs < CS) {
+                const TA a = ((rk[kt] >= 0) && (ce[cs] >= 0))
+                    ? static_cast<TA>(fc_s[ce[cs] + nelements * rk[kt] + NeK3 * cm[cs]])
+                    : TA(0);
+                accG = Mfma<TA>::mma(a, br[cs], accG);
+                accH = Mfma<TA>::mma(a, bdr[cs], accH);
+              }
+            if (kt == 0) {    // slots 0-3: 1, X, X^2, XY
+              SA += accH[0];
+              SA += accH[1] * X;
+              SX += accG[1];
+              SA += accH[2] * X2;
+              SX += accG[2] * (X + X);
+              SA += accH[3] * XY;
+              SX += accG[3] * Y;
+              SY += accG[3] * X;
+            } else {          // slots 4-7: X^3, X^2 Y, X Y^2, XYZ
+              SA += accH[0] * (X2 * X);
+              SX += accG[0] * (static_cast<T>(3.0) * X2);
+              SA += accH[1] * (X2 * Y);
+              SX += accG[1] * (XY + XY);
+              SY += accG[1] * X2;
+              SA += accH[2] * (XY * Y);
+              SX += accG[2] * (Y * Y);
+              SY += accG[2] * (XY + XY);
+              SA += accH[3] * (XY * Z);
+              SX += accG[3] * (Y * Z);
+              SY += accG[3] * (X * Z);
+              SZ += accG[3] * XY;
+            }
+          }
+          // back to (u, v, w)
+          SU = (g == 0) ? SX : ((g == 1) ? SZ : SY);
+          SV = (g == 0) ? SY : ((g == 2) ? SZ : SX);
+          SW = (g == 1) ? SY : ((g == 2) ? SX : SZ);
+        } else
         for (int kt = 0; kt < KT; kt++) {
           const int k = 16 * kt + lrb;
           acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
@@ -1709,9 +1775,9 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
           const T *pde = PDT ? pd_s + jbe : pd_s + jbe * PD;
           if constexpr (EREG)
             pod_pair_force_dg<T, TA>(
-                ft, pg.N, i, start + j0 + jbe, tj_s[jbe], SA, SU, SV, SW, lqe,
-                pg.r(start + j0 + jbe), pde[PS], pde[PS * (L1 + 1)], pde[PS * (2 * L1 + 1)], fd,
-                vd, vo);
+                ft, pg.N, i, start + j0 + jbe, SYM ? 0 : tj_s[jbe], SA, SU, SV, SW, lqe,
+                pg.r(start + j0 + jbe), SYM ? eu : pde[PS], SYM ? ev : pde[PS * (L1 + 1)],
+                SYM ? ew : pde[PS * (2 * L1 + 1)], fd, vd, vo);
           else
             pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd,
                                     vo);

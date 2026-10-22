@@ -214,6 +214,7 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d coefficients; // coefficients nCoeffPerElement x nelements
   t_pod_1i pq_m, pq_d, pn3, pc3; // arrays to compute 3-body angular basis functions
   t_pod_1i pq_ex;          // packed exponents of the 3-body monomials (native kernels)
+  int hf_rows = 0;         // pq_ex holds the row table of the Hf force kernel (all monomials)
   t_pod_1i fc_qa, fc_qp;   // index tables of the native force coefficients (HIP_FC_TABLE)
   t_pod_1i p3_qrange;  // pn3[p3_active[a]] and pn3[p3_active[a]+1] for each active channel a
   t_pod_1i pa4, pb4, pc4; // arrays to compute 4-body angular basis functions

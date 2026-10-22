@@ -861,7 +861,11 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
   }
   // packed exponents ex[k] = ex[pq_m[k]] + (1 << 8*(pq_d[k] - 1)) (a | b << 8 | c << 16) for
   // the matrix core radial-angular sums, which read them instead of running the recursion
-  MemKK::realloc_kokkos(pq_ex, "pair_pod:pq_ex", K3);
+  // entries K3 .. K3+31: the monomial k of the 32 A rows q of the Hf instance of the matrix core
+  // force kernel (lane group g = q % 4, template slot s = q / 4 in the first and 4 + (q-16)/4 in
+  // the second tile, of (X, Y, Z) = sigma_g(u, v, w)), or -1 for a repeat; hf_rows is set when
+  // the rows cover all K3 monomials
+  MemKK::realloc_kokkos(pq_ex, "pair_pod:pq_ex", K3 + 32);
   {
     auto h_pq_ex = Kokkos::create_mirror_view(pq_ex);
     h_pq_ex[0] = 0;
@@ -870,6 +874,26 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
       h_pq_ex[k] = ((m >= 0) && (m < k) && (d >= 1) && (d <= 3))
           ? h_pq_ex[m] + (1 << (8 * (d - 1))) : 0;
     }
+    static const int tmpl[8][3] = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {1, 1, 0},
+                                   {3, 0, 0}, {2, 1, 0}, {1, 2, 0}, {1, 1, 1}};
+    static const int sig[4][3] = {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {1, 0, 2}};
+    std::vector<int> seen(K3, 0);
+    for (int q = 0; q < 32; q++) {
+      const int g = q % 4, sl = (q < 16) ? q / 4 : 4 + (q - 16) / 4;
+      int e[3] = {0, 0, 0};
+      for (int t = 0; t < 3; t++) e[sig[g][t]] += tmpl[sl][t];
+      const int ex = e[0] | (e[1] << 8) | (e[2] << 16);
+      int kk = -1;
+      for (int k = 0; k < K3; k++)
+        if (h_pq_ex[k] == ex) kk = k;
+      if ((kk >= 0) && !seen[kk]) {
+        seen[kk] = 1;
+        h_pq_ex[K3 + q] = kk;
+      } else
+        h_pq_ex[K3 + q] = -1;
+    }
+    hf_rows = 1;
+    for (int k = 0; k < K3; k++) hf_rows = hf_rows && seen[k];
     Kokkos::deep_copy(pq_ex, h_pq_ex);
   }
 
@@ -2484,7 +2508,7 @@ bool PairPODKokkos<DeviceType>::hf_sizes(int Nij) const
         (nl2 == H::nl2) && (nl3 == H::nl3) && (nl4 == H::nl4) && (nClusters == H::nCls) &&
         (nMaxActiveClusters == H::nActMax) && (nCoeffPerElement == H::nCoeff) &&
         (nabf3_active == H::nabf3_active) && (nrbf4 == H::nrbf4) && (nabf4 == H::nabf4) &&
-        (Q4 == H::Q4) && (hip_jtile == H::jtile) && (Nij > 2);
+        (Q4 == H::Q4) && (hip_jtile == H::jtile) && hf_rows && (Nij > 2);
   }
 #endif
   (void) Nij;
