@@ -148,6 +148,18 @@ template <int BIT> __device__ inline void mega_tile_sync()
   } else
     __syncthreads();
 }
+// S6SYM 1 (Hf kernel): the force stage forms its angular monomials from the pair's (u, v, w) in
+// registers, without the per-tile power table: lane group g of the MFMA output holds 8
+// template monomials 1, X, X^2, XY, X^3, X^2 Y, X Y^2, XYZ of (X, Y, Z) = sigma_g(u, v, w)
+// (sigma = identity, two cyclic shifts, swap of u and v), which cover the 20 monomials of
+// degree <= 3 (the A rows of repeated monomials are zero, host table rowmono)
+#ifndef LMP_POD_MEGA_S6SYM
+#define LMP_POD_MEGA_S6SYM 1
+#endif
+// S6SYMLDS 1: the LDS layout of the Hf kernel leaves out the force stage tables (S6SYM)
+#ifndef LMP_POD_MEGA_S6SYMLDS
+#define LMP_POD_MEGA_S6SYMLDS 0
+#endif
 #ifndef LMP_POD_MEGA_RPF
 #define LMP_POD_MEGA_RPF 0
 #endif
@@ -401,6 +413,7 @@ template <typename T, typename TA> struct MegaArgs {
   // term (p4, iA, iB); frec_d[MEGA_FRD k] = pc3[k], then pc4 of each term
   const int *frec_i;
   const T *frec_d;
+  const int *rowmono;    // S6SYM: monomial k of A row 0..31 of the force stage, or -1
   int sdt;      // 1: spill the descriptors as bd [i + Ni*m] (input of the multi-kernel path)
   int freg;     // 1: forcecoeff in registers during the force stage, its LDS shared with the tile
   int *pai, *ptype;    // sdt: atom index of the first pair slot [i*cap], element of atom i
@@ -477,7 +490,10 @@ __host__ __device__ inline MegaLayout mega_layout(const MegaArgs<T, TA> &a)
   int end6 = 0;
   lo.w6 = lo.w;
   if (mega_has(S0, S1, 6)) {
-    const int t6 = mega_round(9 * (int) sizeof(TA)) +
+    // S6SYM (Hf kernel): no power table, pair element and monomial tables, only the atom sums
+    const bool sym6 = LMP_POD_MEGA_S6SYM && LMP_POD_MEGA_S6SYMLDS && (LMP_POD_MEGA_S6POW == 3) &&
+        LMP_POD_MEGA_DFIN && a.hf;
+    const int t6 = sym6 ? mega_round(9 * (int) sizeof(TA)) : mega_round(9 * (int) sizeof(TA)) +
         (LMP_POD_MEGA_S6POW ? MFMA_PAIR_TILE *
                                   (3 * (LMP_POD_MEGA_S6POW >= 2 ? a.L : L1) +
                                    (LMP_POD_MEGA_S6POW == 3 ? 1 + LMP_POD_MEGA_S6PAD : 0)) *
@@ -1259,6 +1275,9 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     // the A operands (force coefficients) of this lane, loaded once; afterwards the
     // forcecoeff LDS may be reused by the pair tile (a.freg)
     TA fa[MEGA_RTM][CSM];
+    constexpr bool SYM = HF && LMP_POD_MEGA_S6SYM && (LMP_POD_MEGA_S6POW == 3) && LMP_POD_MEGA_DFIN;
+    // monomial of A row q (SYM: host table), or -1
+    auto rowk = [&](const int q) -> int { return SYM ? a.rowmono[q] : ((q < K3) ? q : -1); };
     const bool flane = (a.freg == 2) && mega_has(S0, S1, MS_FC);
     const bool fdbg = (a.freg == 3) && mega_has(S0, S1, MS_FC);    // both, report differences
     // forcecoeff34_atom() for one element, entry (m, k) only (see below)
@@ -1303,8 +1322,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       for (int kt = 0; kt < MEGA_RTM; kt++)
 #pragma unroll
         for (int cs = 0; cs < CSM; cs++) {
-          const int k = 16 * kt + lr, cc = 4 * cs + lq;
-          const bool valid = (kt < KT) && (cs < CS) && (k < K3) && (ce[cs] >= 0);
+          const int k = rowk(16 * kt + lr), cc = 4 * cs + lq;
+          const bool valid = (kt < KT) && (cs < CS) && (k >= 0) && (ce[cs] >= 0);
           const int e = valid ? cc * K3 + k : 0;
           T v = T(0);
 #pragma unroll
@@ -1320,8 +1339,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     for (int kt = 0; kt < MEGA_RTM; kt++)
 #pragma unroll
       for (int cs = 0; cs < CSM; cs++) {
-        const int k = 16 * kt + lr;
-        const bool valid = (kt < KT) && (cs < CS) && (k < K3) && (ce[cs] >= 0);
+        const int kr = rowk(16 * kt + lr), k = (kr >= 0) ? kr : 0;
+        const bool valid = (kt < KT) && (cs < CS) && (kr >= 0) && (ce[cs] >= 0);
         if (!flane && !fdbg) {
           fa[kt][cs] = valid ? static_cast<TA>(fc_s[ce[cs] + nelements * k + NeK3 * cm[cs]]) : TA(0);
           continue;
@@ -1363,7 +1382,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       }
     __syncthreads();
     if (lane < 9) acc_s[lane] = TA(0);
-    if (LMP_POD_MEGA_S6POW == 3) {
+    if (SYM) {
+    } else if (LMP_POD_MEGA_S6POW == 3) {
       if (lane < K3) mo_s[lane] = a.mono[lane];
     } else if (LMP_POD_MEGA_EXT) {
       if (lane < K3) ex_s[lane] = a.extab[lane];
@@ -1385,7 +1405,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     };
     nj = np;
     if constexpr (SPILL && (LMP_POD_MEGA_SPILLS & 64)) ensure(0);
-    fetch(0);
+    if (!SYM) fetch(0);
     // DFIN: the deferred pair of this lane (window index qj, -1: none) and its sums or force
     int qj = -1, tc = 0;
     TA q0 = TA(0), q1 = TA(0), q2 = TA(0), q3 = TA(0);
@@ -1446,8 +1466,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         }
       }
       const int jl0 = __builtin_amdgcn_readfirstlane(j0 - curw);
-      mega_tile_sync<1>();
-      if (lane < 3 * JT) {
+      if (!SYM) mega_tile_sync<1>();
+      if (!SYM && (lane < 3 * JT)) {
         const int jj = lane % JT, d = lane / JT;
         T *pd = pd_s + jj * PD + PO + d * PL;
         const bool in = (jj < nt);
@@ -1460,13 +1480,15 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         }
         if (d == 0) tj_s[jj] = in ? tjh : -1;
       }
-      if ((j0 + JT < nj) && (j0 + JT - curw < cap)) fetch(j0 + JT);
-      mega_tile_sync<1>();
+      if (!SYM) {
+        if ((j0 + JT < nj) && (j0 + JT - curw < cap)) fetch(j0 + JT);
+        mega_tile_sync<1>();
+      }
 
       for (int s0 = 0; s0 < nt; s0 += 16) {
         TA SA = TA(0), SU = TA(0), SV = TA(0), SW = TA(0);
         const int jb = s0 + lr;
-        const int tjb = tj_s[jb];
+        const int tjb = SYM ? ((jb < nt) ? 0 : -1) : tj_s[jb];
         const PairRadial<T> prad(rs, pg, jl0 + min(jb, nt - 1));
         const T *pd = pd_s + jb * PD;
 #if LMP_POD_MEGA_S6POW == 3
@@ -1526,6 +1548,55 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
           rpf_have = (jn < nj) && (jn - curw + min(JT, nj - jn) <= cap);
           if (rpf_have) radial_of(jn);
         }
+#endif
+#if LMP_POD_MEGA_S6POW
+        if constexpr (SYM) {
+          // (X, Y, Z) = sigma_g(u, v, w) for lane group g = lq; rows lq + 4 v of tile 0 are the
+          // template slots v, rows 16 + lq + 4 v of tile 1 the slots 4 + v
+          T ux, vx, wx;
+          pg.uvw(jl0 + min(jb, nt - 1), ux, vx, wx);
+          const T X = (lq == 0) ? ux : ((lq == 2) ? wx : vx);
+          const T Y = (lq == 0) ? vx : ((lq == 1) ? wx : ux);
+          const T Z = (lq == 1) ? ux : ((lq == 2) ? vx : wx);
+          const T X2 = X * X, XY = X * Y;
+          acc_t accG0 = acc_t{0, 0, 0, 0}, accH0 = acc_t{0, 0, 0, 0};
+          acc_t accG1 = acc_t{0, 0, 0, 0}, accH1 = acc_t{0, 0, 0, 0};
+#pragma unroll
+          for (int cs = 0; cs < CSM; cs++)
+            if (cs < CS) {
+              accG0 = Mfma<TA>::mma(fa[0][cs], br[cs], accG0);
+              accH0 = Mfma<TA>::mma(fa[0][cs], bdr[cs], accH0);
+              accG1 = Mfma<TA>::mma(fa[1][cs], br[cs], accG1);
+              accH1 = Mfma<TA>::mma(fa[1][cs], bdr[cs], accH1);
+            }
+          TA SX = TA(0), SY = TA(0), SZ = TA(0);
+          // slots 0-3: 1, X, X^2, XY
+          SA += accH0[0];
+          SA += accH0[1] * X;
+          SX += accG0[1];
+          SA += accH0[2] * X2;
+          SX += accG0[2] * (X + X);
+          SA += accH0[3] * XY;
+          SX += accG0[3] * Y;
+          SY += accG0[3] * X;
+          // slots 4-7: X^3, X^2 Y, X Y^2, XYZ
+          SA += accH1[0] * (X2 * X);
+          SX += accG1[0] * (T(3) * X2);
+          SA += accH1[1] * (X2 * Y);
+          SX += accG1[1] * (XY + XY);
+          SY += accG1[1] * X2;
+          SA += accH1[2] * (XY * Y);
+          SX += accG1[2] * (Y * Y);
+          SY += accG1[2] * (XY + XY);
+          SA += accH1[3] * (XY * Z);
+          SX += accG1[3] * (Y * Z);
+          SY += accG1[3] * (X * Z);
+          SZ += accG1[3] * XY;
+          // back to (u, v, w): d/du is d/dX (g 0), d/dZ (g 1), d/dY (g 2, 3), ...
+          SU = (lq == 0) ? SX : ((lq == 1) ? SZ : SY);
+          SV = (lq == 0) ? SY : ((lq == 2) ? SZ : SX);
+          SW = (lq == 1) ? SY : ((lq == 2) ? SX : SZ);
+        } else
 #endif
 #pragma unroll
         for (int kt = 0; kt < MEGA_RTM; kt++) {

@@ -18,6 +18,8 @@
 
 #include "pair_pod_kokkos.h"
 
+#include <vector>
+
 #include "atom_kokkos.h"
 #include "atom_masks.h"
 #include "comm.h"
@@ -2973,7 +2975,38 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       }
       Kokkos::deep_copy(mega_extab, h_ex);
       Kokkos::deep_copy(mega_mono, h_mo);
+      // S6SYM: monomial of each of the 32 A rows of the force stage (row q: lane group g = q % 4,
+      // slot s = q / 4 in tile 0, 4 + (q - 16) / 4 in tile 1), from the template slots in
+      // (X, Y, Z) = sigma_g(u, v, w); a repeated monomial is kept in its first row only
+      mega_rowmono_ok = 0;
+      if (K3 == 20) {
+        static const int tmpl[8][3] = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}, {1, 1, 0},
+                                       {3, 0, 0}, {2, 1, 0}, {1, 2, 0}, {1, 1, 1}};
+        static const int sig[4][3] = {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {1, 0, 2}};    // X, Y, Z vars
+        MemKK::realloc_kokkos(mega_rowmono, "pair_pod:mega_rowmono", 32);
+        auto h_rm = Kokkos::create_mirror_view(mega_rowmono);
+        std::vector<int> seen(K3, 0);
+        for (int q = 0; q < 32; q++) {
+          const int g = q % 4, s = (q < 16) ? q / 4 : 4 + (q - 16) / 4;
+          int e[3] = {0, 0, 0};
+          for (int j = 0; j < 3; j++) e[sig[g][j]] += tmpl[s][j];
+          const int ex = e[0] | (e[1] << 8) | (e[2] << 16);
+          int kk = -1;
+          for (int k = 0; k < K3; k++)
+            if (h_ex(k) == ex) kk = k;
+          if ((kk >= 0) && !seen[kk]) {
+            seen[kk] = 1;
+            h_rm(q) = kk;
+          } else
+            h_rm(q) = -1;
+        }
+        int nseen = 0;
+        for (int k = 0; k < K3; k++) nseen += seen[k];
+        mega_rowmono_ok = (nseen == K3) ? 1 : 0;
+        Kokkos::deep_copy(mega_rowmono, h_rm);
+      }
     }
+    a.rowmono = mega_rowmono_ok ? mega_rowmono.data() : nullptr;
     a.extab = mega_extab.data();
     a.mono = reinterpret_cast<const int2 *>(mega_mono.data());
     if (mega_freg >= 2) {
@@ -3046,6 +3079,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.ptype = nullptr;
 
     a.hf = PODHIP::mega_is_hf(a) ? 1 : 0;
+    if (LMP_POD_MEGA_S6SYM && !a.rowmono) a.hf = 0;    // the Hf kernel needs the row table
     { const char *e = getenv("LAMMPS_POD_MEGA_HFOFF"); if (e && atoi(e)) a.hf = 0; }
     if (!mega_logged && (comm->me == 0)) {
       mega_logged = true;
