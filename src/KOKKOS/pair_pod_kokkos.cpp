@@ -62,8 +62,14 @@ KK_FLOAT pod_uvw_factor(const int c, const KK_FLOAT u, const KK_FLOAT v, const K
 
 enum{FS,FS_SHIFTEDSCALED};
 
-KOKKOS_INLINE_FUNCTION int npa(int d)   { return d*(d+1)*(d+2)/6; }  // # monomials of degree < d
-KOKKOS_INLINE_FUNCTION int nmono(int d) { return (d+1)*(d+2)/2;   }  // # monomials of degree == d
+KOKKOS_FORCEINLINE_FUNCTION constexpr int npa(int d)   { return d*(d+1)*(d+2)/6; }  // # monomials of degree < d
+KOKKOS_FORCEINLINE_FUNCTION constexpr int nmono(int d) { return (d+1)*(d+2)/2;   }  // # monomials of degree == d
+
+// Linear index of monomial u^p v^q w^r, d = p+q+r.
+KOKKOS_FORCEINLINE_FUNCTION constexpr int pod_mono_index(int p, int q, int r) {
+  const int d = p + q + r;
+  return (d*(d+1)*(d+2))/6 + (d+1)*r - (r*(r-1))/2 + q;
+}
 
 /* ----------------------------------------------------------------------
    compile-time index usable on host and device
@@ -1598,45 +1604,76 @@ struct PODAllBodyForceFunctor {
     }
 
     // many-body: fcRdA + fcAdR
+    // fcAdR = sum dR     u^(p  ) v^(q  ) w^(r  )
+    // Du    = sum  R  p  u^(p-1) v^(q  ) w^(r  )
+    // Dv    = sum  R  q  u^(p  ) v^(q-1) w^(r  )
+    // Dw    = sum  R  r  u^(p  ) v^(q  ) w^(r-1)
+    // Nested Horner in decreasing polynomial degree (w -> v -> u)
     const int NeK3 = ne * K3;
     const int ii   = te + NeK3 * NR * ia;
 
-    KK_ACC_FLOAT Du = 0.0, Dv = 0.0, Dw = 0.0;
-    KK_FLOAT wr = 1.0, wrm1 = 0.0;
-    #pragma unroll
-    for (int r = 0; r <= MD; ++r) {
-      KK_FLOAT vq = 1.0, vqm1 = 0.0;
-      #pragma unroll
-      for (int q = 0; q + r <= MD; ++q) {
-        const KK_FLOAT vw  = vq * wr;
-        const KK_FLOAT vwv = (KK_FLOAT) q * vqm1 * wr;
-        const KK_FLOAT vww = (KK_FLOAT) r * vq * wrm1;
+    // w-dir: value(dR) / value(R) / d/du / d/dv / d/dw
+    KK_ACC_FLOAT E3 = 0.0, F3 = 0.0, Du = 0.0, Dv = 0.0, Dw = 0.0;
 
-        int d  = q + r;
-        int k  = npa(d) + (d+1)*r - (r*(r-1))/2 + q;
-        int nm = nmono(d);
-        KK_FLOAT up = 1.0, upm1 = 0.0;
+    #pragma unroll
+    for (int r = MD; r >= 0; --r) {
+      const int QM = MD - r;
+      // v-dir: value(dR) / value(R) / d/du / d/dv
+      KK_ACC_FLOAT E2 = 0.0, F2 = 0.0, Gu2 = 0.0, Gv2 = 0.0;
+
+      #pragma unroll
+      for (int q = QM; q >= 0; --q) {
+        const int PM = QM - q;
+        // u-dir: value(dR) / value(R) / d/du
+        KK_ACC_FLOAT E1 = 0.0, F1 = 0.0, Gu1 = 0.0;
+
         #pragma unroll
-        for (int p = 0; p + q + r <= MD; ++p) {
-          const int b = ii + ne * k;
+        for (int p = PM; p >= 0; --p) {
+          const int b = ii + ne * pod_mono_index(p, q, r);
           KK_ACC_FLOAT fcR = 0.0, fcdR = 0.0;
           pod_static_for<NR>([&](auto m) {
             const KK_FLOAT c = fc(b + NeK3*m);
             fcR  += c * rb[m];
             fcdR += c * drb[m];
           });
-          fcAdR += fcdR * (up * vw);
-          Du += fcR * ((KK_FLOAT) p * upm1 * vw);
-          Dv += fcR * (up * vwv);
-          Dw += fcR * (up * vww);
 
-          upm1 = up;  up *= u;
-          k += nm + r;  nm += d + 2;  ++d;
+          if (p == PM) {                 // leading term: no multiply
+            E1 = fcdR;
+            F1 = fcR;                    // Gu1 = 0
+          } else {                       // derivative first (reuse F1)
+            Gu1 = (p == PM-1) ? F1 : Gu1*u + F1;
+            F1  = F1*u + fcR;
+            E1  = E1*u + fcdR;
+          }
         }
-        vqm1 = vq;  vq *= v;
+
+        // fold u- into v- polynomial
+        if (q == QM) {                   // leading term (PM == 0 -> Gu1 = 0)
+          E2 = E1;
+          F2 = F1;                       // Gu2, Gv2 = 0
+        } else {
+          const bool second = (q == QM-1);
+          Gv2 = second ? F2  : Gv2*v + F2;    // d/dv, reuse F2
+          Gu2 = second ? Gu1 : Gu2*v + Gu1;
+          F2  = F2*v + F1;
+          E2  = E2*v + E1;
+        }
       }
-      wrm1 = wr;  wr *= w;
+
+      // fold v- into w- polynomial
+      if (r == MD) {                     // leading term (QM == 0 -> Gu2, Gv2 = 0)
+        E3 = E2;
+        F3 = F2;                         // Du, Dv, Dw = 0
+      } else {
+        const bool third = (r == MD-1);
+        Dw = third ? F3  : Dw*w + F3;    // d/dw, reuse F3
+        Du = third ? Gu2 : Du*w + Gu2;
+        Dv = third ? Gv2 : Dv*w + Gv2;
+        F3 = F3*w + F2;
+        E3 = E3*w + E2;
+      }
     }
+    fcAdR += E3;
 
     // Jacobian: J = d(u,v,w) / d(x,y,z) = (I - rhat rhat^T) / r
     // f_ij = fc * d(R * A) = J * Dr_hat + fc * A * r_hat
