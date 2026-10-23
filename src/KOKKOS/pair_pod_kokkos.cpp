@@ -2920,6 +2920,26 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
 
     PODHIP::MegaArgs<KK_FLOAT, KK_ACC_FLOAT> a{};
     a.na = pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq);
+    a.onetype = (atom->ntypes == 1) ? 1 : 0;
+    // NTR: row-major copy of the neighbor list, rebuilt after each neighbor list build
+    if (LMP_POD_MEGA_NTR && (maxneigh > 0)) {
+      const int nrow = (int) std::min(d_neighbors.extent(0), d_numneigh.extent(0)), mn = maxneigh;
+      if ((neighbor->ncalls != mega_ntr_ncalls) || (list != mega_ntr_list) || (nrow != mega_ntr_nrow) ||
+          (mn != mega_ntr_mn)) {
+        if ((long long) mega_ntr.extent(0) < (long long) nrow * mn)
+          MemKK::realloc_kokkos(mega_ntr, "pair_pod:mega_ntr", (size_t) nrow * mn);
+        if (!PODHIP::mega_transpose(stream, mega_ntr.data(), d_neighbors.data(), d_numneigh.data(),
+                                    (int) d_neighbors.stride(0), (int) d_neighbors.stride(1), mn, nrow))
+          error->one(FLERR, "pair pod/kk mega study: neighbor list copy failed");
+        mega_ntr_ncalls = neighbor->ncalls;
+        mega_ntr_list = list;
+        mega_ntr_nrow = nrow;
+        mega_ntr_mn = mn;
+      }
+      a.na.neighbors = mega_ntr.data();
+      a.na.ns0 = mn;
+      a.na.ns1 = 1;
+    }
     a.x = x.data();
     a.rcutsq = rcutsq.data();
     a.gi1 = gi1;

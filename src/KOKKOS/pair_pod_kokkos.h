@@ -129,6 +129,9 @@ class PairPODKokkos : public PairPOD {
   int mega_frec_ok;    // -1 not built, 0 not possible, 1 built
   t_pod_1i mega_extab, mega_mono;    // round 5 exponent tables (built once)
   t_pod_1i mega_rowmono;    // S6SYM row table of the force stage (built once)
+  t_pod_1i mega_ntr;    // NTR row-major neighbor list copy
+  int mega_ntr_ncalls = -1, mega_ntr_nrow = -1, mega_ntr_mn = -1;
+  NeighList *mega_ntr_list = nullptr;
   int mega_rowmono_ok = 0;
   t_pod_1i mega_ovf;    // atoms whose pairs did not fit in the pool (overflow kernel)
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> mega_fdum;    // force sink of those atoms in mega_kernel

@@ -162,6 +162,15 @@ template <int BIT> __device__ inline void mega_tile_sync()
 #ifndef LMP_POD_MEGA_S6SYMLDS
 #define LMP_POD_MEGA_S6SYMLDS 1
 #endif
+// ONET 1: with one atom type (a.onetype) the neighbor scan reads no type, map or cutoff tables
+#ifndef LMP_POD_MEGA_ONET
+#define LMP_POD_MEGA_ONET 1
+#endif
+// NTR 1: the mega kernel reads a row-major copy of the neighbor list (neighbors of an atom
+// contiguous, one coalesced load per wave), rebuilt by mega_transpose() after each list build
+#ifndef LMP_POD_MEGA_NTR
+#define LMP_POD_MEGA_NTR 1
+#endif
 #ifndef LMP_POD_MEGA_RPF
 #define LMP_POD_MEGA_RPF 0
 #endif
@@ -434,6 +443,7 @@ template <typename T, typename TA> struct MegaArgs {
   // counters of the next step, zeroed by the overflow kernel (or nullptr)
   int *cnt, *cntz;
   TA *fdummy;   // force sink of those atoms in mega_kernel (the overflow kernel adds their forces)
+  int onetype;    // 1: one atom type mapped to the one element (no type/map/rcutsq gathers)
   int *hist;    // nullptr, or the number of atoms with n pairs (n < 64) and with >= 64
 };
 
@@ -545,7 +555,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
   T *u_s = reinterpret_cast<T *>(w_s);                   // sumU [m][k][e] at the start of w
 
   const int gi = a.na.ilist[a.gi1 + i];
-  const int itype = a.na.map[a.na.type[gi]];
+  const int itype = (LMP_POD_MEGA_ONET && a.onetype) ? 0 : a.na.map[a.na.type[gi]];
 
   // pair cache: LDS, or the global spill area
   T *r_s, *rh_s;
@@ -592,6 +602,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     const T xi1 = a.x[gi * a.na.xs0 + a.na.xs1];
     const T xi2 = a.x[gi * a.na.xs0 + 2 * a.na.xs1];
     const int jnum = a.na.numneigh[gi];
+    const T rc2one = (LMP_POD_MEGA_ONET && a.onetype) ? a.rcutsq[0] : T(0);
     const unsigned long long below = (1ull << lane) - 1ull;
     int cnt = 0;
     for (int j0 = 0; j0 < jnum; j0 += 64) {
@@ -599,7 +610,15 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       bool in = false;
       int gj = 0, jtype = 0;
       T dx = T(0), dy = T(0), dz = T(0);
-      if (jj < jnum)
+      if (LMP_POD_MEGA_ONET && a.onetype) {
+        if (jj < jnum) {
+          gj = a.na.neighbors[gi * a.na.ns0 + jj * a.na.ns1] & NEIGHMASK;
+          dx = a.x[gj * a.na.xs0] - xi0;
+          dy = a.x[gj * a.na.xs0 + a.na.xs1] - xi1;
+          dz = a.x[gj * a.na.xs0 + 2 * a.na.xs1] - xi2;
+          in = (dx * dx + dy * dy + dz * dz) < rc2one;
+        }
+      } else if (jj < jnum)
         in = pod_neigh_test<T>(a.na, a.x, a.rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx,
                                dy, dz);
       const unsigned long long mask = __ballot(in);
@@ -1976,6 +1995,29 @@ int mega_persist_launch(hipStream_t stream, const MegaArgs<T, TA> &a, TA *acc, u
   hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_persist_kernel<T, TA, SB, PG>), dim3(nblk), dim3(64),
                      (size_t) lo.total, stream, a, acc, bar, eg, vg);
   return (hipGetLastError() == hipSuccess) ? nblk : 0;
+}
+
+// row-major copy of the neighbor list: out[g*mn + jj] = neighbor jj of atom g (rows 0..nrow-1)
+__global__ void __launch_bounds__(256)
+    mega_transpose_kernel(int *__restrict__ out, const int *__restrict__ nb, const int *__restrict__ numneigh,
+                          const int ns0, const int ns1, const int mn, const int nrow)
+{
+  const long long n = (long long) nrow * mn;
+  for (long long idx = (long long) blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += (long long) gridDim.x * blockDim.x) {
+    const int g = (int) (idx / mn), jj = (int) (idx - (long long) g * mn);
+    out[idx] = (jj < numneigh[g]) ? nb[(long long) g * ns0 + (long long) jj * ns1] : 0;
+  }
+}
+inline bool mega_transpose(hipStream_t stream, int *out, const int *nb, const int *numneigh, int ns0,
+                           int ns1, int mn, int nrow)
+{
+  const long long n = (long long) nrow * mn;
+  const int nb2 = (int) std::min<long long>((n + 255) / 256, 65536);
+  if (nb2 <= 0) return true;
+  hipLaunchKernelGGL(mega_transpose_kernel, dim3(nb2), dim3(256), 0, stream, out, nb, numneigh, ns0, ns1,
+                     mn, nrow);
+  return hipGetLastError() == hipSuccess;
 }
 
 template <typename T, typename TA>
