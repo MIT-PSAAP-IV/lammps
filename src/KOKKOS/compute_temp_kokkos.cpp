@@ -28,6 +28,51 @@ using namespace LAMMPS_NS;
 
 using LightWeight = Kokkos::Experimental::WorkItemProperty::HintLightWeight_t;
 
+namespace {
+
+// the scalar temperature as per-team partial sums of CHUNK atoms each,
+// added up on the host.  This avoids the inter-block step of a Kokkos
+// reduction, which on an MI300A costs about 30 us per call.
+
+static constexpr int CHUNK = 256;
+
+template<class DeviceType, int RMASS, class VType, class MType, class IType, class PType>
+struct ComputeTempScalarPartial {
+  typedef DeviceType device_type;
+  typedef typename Kokkos::TeamPolicy<DeviceType>::member_type member_type;
+  VType v;
+  MType rmass, mass;
+  IType type, mask;
+  PType part;
+  int groupbit, n;
+
+  ComputeTempScalarPartial(const VType &v_, const MType &rmass_, const MType &mass_,
+                           const IType &type_, const IType &mask_, const PType &part_,
+                           int groupbit_, int n_) :
+    v(v_), rmass(rmass_), mass(mass_), type(type_), mask(mask_), part(part_),
+    groupbit(groupbit_), n(n_) {}
+
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const member_type &team) const {
+    const int i0 = team.league_rank() * CHUNK;
+    double sum = 0.0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(team, CHUNK), [&](const int k, double &lsum) {
+      const int i = i0 + k;
+      if ((i < n) && (mask[i] & groupbit)) {
+        if (RMASS)
+          lsum += static_cast<double>((v(i,0)*v(i,0) + v(i,1)*v(i,1) + v(i,2)*v(i,2)) * rmass[i]);
+        else
+          lsum += static_cast<double>((v(i,0)*v(i,0) + v(i,1)*v(i,1) + v(i,2)*v(i,2)) *
+            mass[type[i]]);
+      }
+    }, sum);
+    Kokkos::single(Kokkos::PerTeam(team), [&]() { part(team.league_rank()) = sum; });
+  }
+};
+
+}    // namespace
+
 /* ---------------------------------------------------------------------- */
 
 template<class DeviceType>
@@ -62,16 +107,31 @@ double ComputeTempKokkos<DeviceType>::compute_scalar()
   int nlocal = atom->nlocal;
 
   double t = 0.0;
-  CTEMP t_kk;
 
-  copymode = 1;
-  if (atomKK->rmass)
-    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempScalar<1>, LightWeight>(0,nlocal),*this,t_kk);
-  else
-    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempScalar<0>, LightWeight>(0,nlocal),*this,t_kk);
-  copymode = 0;
-
-  t = t_kk.t0; // could make this more efficient
+  const int nchunk = (nlocal + CHUNK - 1) / CHUNK;
+  if (nchunk > 0) {
+    if ((int) d_part.extent(0) < nchunk) {
+      d_part = Kokkos::View<double*, DeviceType>("temp/kk:part", nchunk);
+      h_part = Kokkos::View<double*, LMPPinnedHostType>("temp/kk:h_part", nchunk);
+    }
+    using VType = decltype(v);
+    using MType = decltype(mass);
+    using IType = decltype(type);
+    using PType = decltype(d_part);
+    if (atomKK->rmass) {
+      ComputeTempScalarPartial<DeviceType,1,VType,MType,IType,PType>
+        f(v,rmass,mass,type,mask,d_part,groupbit,nlocal);
+      Kokkos::parallel_for(Kokkos::TeamPolicy<DeviceType>(nchunk,Kokkos::AUTO),f);
+    } else {
+      ComputeTempScalarPartial<DeviceType,0,VType,MType,IType,PType>
+        f(v,rmass,mass,type,mask,d_part,groupbit,nlocal);
+      Kokkos::parallel_for(Kokkos::TeamPolicy<DeviceType>(nchunk,Kokkos::AUTO),f);
+    }
+    auto d_sub = Kokkos::subview(d_part,std::make_pair(0,nchunk));
+    auto h_sub = Kokkos::subview(h_part,std::make_pair(0,nchunk));
+    Kokkos::deep_copy(h_sub,d_sub);
+    for (int k = 0; k < nchunk; k++) t += h_sub(k);
+  }
 
   MPI_Allreduce(&t,&scalar,1,MPI_DOUBLE,MPI_SUM,world);
   if (dynamic) dof_compute();
@@ -80,21 +140,6 @@ double ComputeTempKokkos<DeviceType>::compute_scalar()
   scalar *= tfactor;
 
   return scalar;
-}
-
-template<class DeviceType>
-template<int RMASS>
-// NOLINTNEXTLINE
-KOKKOS_INLINE_FUNCTION
-void ComputeTempKokkos<DeviceType>::operator()(TagComputeTempScalar<RMASS>, const int &i, CTEMP& t_kk) const {
-  if (RMASS) {
-    if (mask[i] & groupbit)
-      t_kk.t0 += static_cast<double>((v(i,0)*v(i,0) + v(i,1)*v(i,1) + v(i,2)*v(i,2)) * rmass[i]);
-  } else {
-    if (mask[i] & groupbit)
-      t_kk.t0 += static_cast<double>((v(i,0)*v(i,0) + v(i,1)*v(i,1) + v(i,2)*v(i,2)) *
-        mass[type[i]]);
-  }
 }
 
 /* ---------------------------------------------------------------------- */
