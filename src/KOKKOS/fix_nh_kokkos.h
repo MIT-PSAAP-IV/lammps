@@ -30,6 +30,12 @@ struct TagFixNH_nve_x{};
 
 struct TagFixNH_nh_v_temp{};
 
+template<int TRICLINIC_FLAG, int RMASS>
+struct TagFixNH_fused_initial{};
+
+template<int TRICLINIC_FLAG, int RMASS>
+struct TagFixNH_fused_final{};
+
 template<class DeviceType>
 class FixNHKokkos : public FixNH {
  public:
@@ -62,6 +68,16 @@ class FixNHKokkos : public FixNH {
   KOKKOS_INLINE_FUNCTION
   void operator()(TagFixNH_nh_v_temp, const int&) const;
 
+  template<int TRICLINIC_FLAG, int RMASS>
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void operator()(TagFixNH_fused_initial<TRICLINIC_FLAG,RMASS>, const int&) const;
+
+  template<int TRICLINIC_FLAG, int RMASS>
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void operator()(TagFixNH_fused_final<TRICLINIC_FLAG,RMASS>, const int&) const;
+
  protected:
   void remap() override;
 
@@ -70,7 +86,17 @@ class FixNHKokkos : public FixNH {
   void nh_v_press() override;
   void nh_v_temp() override;
 
+  void remap_box();
+  int fuse_ok();
+  void set_press_factor();
+  void fused_initial();
+  void fused_final();
+
+  int fusable;    // 0 if a derived class changes the per-atom updates
   KK_FLOAT factor[3];
+
+  // box before and after each of the two half-step remaps of initial_integrate()
+  KK_FLOAT b0_lo[3], b0_hinv[6], b1_lo[3], b1_h[6], b1_hinv[6], b2_lo[3], b2_h[6];
 
   class DomainKokkos *domainKK;
 

@@ -68,6 +68,7 @@ FixNHKokkos<DeviceType>::FixNHKokkos(LAMMPS *lmp, int narg, char **arg) : FixNH(
 
   datamask_read = EMPTY_MASK;
   datamask_modify = EMPTY_MASK;
+  fusable = 1;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -254,6 +255,14 @@ void FixNHKokkos<DeviceType>::initial_integrate(int /*vflag*/)
   if (pstat_flag) {
     compute_press_target();
     nh_omega_dot();
+
+    // the rest of the step as one kernel when possible
+
+    if (fuse_ok()) {
+      fused_initial();
+      if (kspace_flag) force->kspace->setup();
+      return;
+    }
     nh_v_press();
   }
 
@@ -281,26 +290,31 @@ void FixNHKokkos<DeviceType>::initial_integrate(int /*vflag*/)
 template<class DeviceType>
 void FixNHKokkos<DeviceType>::final_integrate()
 {
-  nve_v();
+  // nve_v() and nh_v_press() as one kernel when possible
 
-  // re-compute temp before nh_v_press()
-  // only needed for temperature computes with BIAS on reneighboring steps:
-  //   b/c some biases store per-atom values (e.g. temp/profile)
-  //   per-atom values are invalid if reneigh/comm occurred
-  //     since temp->compute() in initial_integrate()
+  if (pstat_flag && fuse_ok()) fused_final();
+  else {
+    nve_v();
 
-  if (which == BIAS && neighbor->ago == 0) {
-    if (temperature->kokkosable)
-      t_current = temperature->compute_scalar();
-    else {
-      atomKK->sync(temperature->execution_space,temperature->datamask_read);
-      t_current = temperature->compute_scalar();
-      atomKK->modified(temperature->execution_space,temperature->datamask_modify);
-      atomKK->sync(execution_space,temperature->datamask_modify);
+    // re-compute temp before nh_v_press()
+    // only needed for temperature computes with BIAS on reneighboring steps:
+    //   b/c some biases store per-atom values (e.g. temp/profile)
+    //   per-atom values are invalid if reneigh/comm occurred
+    //     since temp->compute() in initial_integrate()
+
+    if (which == BIAS && neighbor->ago == 0) {
+      if (temperature->kokkosable)
+        t_current = temperature->compute_scalar();
+      else {
+        atomKK->sync(temperature->execution_space,temperature->datamask_read);
+        t_current = temperature->compute_scalar();
+        atomKK->modified(temperature->execution_space,temperature->datamask_modify);
+        atomKK->sync(execution_space,temperature->datamask_modify);
+      }
     }
-  }
 
-  if (pstat_flag) nh_v_press();
+    if (pstat_flag) nh_v_press();
+  }
 
   // compute new T,P after velocities rescaled by nh_v_press()
   // compute appropriately coupled elements of mvv_current
@@ -362,16 +376,7 @@ void FixNHKokkos<DeviceType>::final_integrate()
 template<class DeviceType>
 void FixNHKokkos<DeviceType>::remap()
 {
-  double oldlo,oldhi;
-  double expfac;
-  double isofac;
-
   int nlocal = atom->nlocal;
-  double *h = domain->h;
-
-  // omega is not used, except for book-keeping
-
-  for (int i = 0; i < 6; i++) omega[i] += dto*omega_dot[i];
 
   // convert pertinent atoms and rigid bodies to lamda coords
 
@@ -384,6 +389,33 @@ void FixNHKokkos<DeviceType>::remap()
   if (!rfix.empty())
     error->all(FLERR,"Cannot (yet) use rigid bodies with fix nh and Kokkos");
   // for (auto &ifix : rfix) ifix->deform(0);
+
+  remap_box();
+
+  // convert pertinent atoms and rigid bodies back to box coords
+
+  if (allremap) domainKK->lamda2x(nlocal);
+  else domainKK->lamda2x(nlocal,dilate_group_bit);
+
+  // for (auto &ifix : rfix) ifix->deform(1);
+}
+
+/* ----------------------------------------------------------------------
+   change box size and shape by 1/2 step: box arithmetic only, no atoms
+------------------------------------------------------------------------- */
+
+template<class DeviceType>
+void FixNHKokkos<DeviceType>::remap_box()
+{
+  double oldlo,oldhi;
+  double expfac;
+  double isofac;
+
+  double *h = domain->h;
+
+  // omega is not used, except for book-keeping
+
+  for (int i = 0; i < 6; i++) omega[i] += dto*omega_dot[i];
 
   // reset global and local box to new size/shape
 
@@ -560,13 +592,164 @@ void FixNHKokkos<DeviceType>::remap()
 
   domain->set_global_box();
   domain->set_local_box();
+}
 
-  // convert pertinent atoms and rigid bodies back to box coords
+/* ----------------------------------------------------------------------
+   fused per-atom kernels: they apply the same per-atom operations in the
+   same order as the separate kernels, so the results are the same
+------------------------------------------------------------------------- */
 
-  if (allremap) domainKK->lamda2x(nlocal);
-  else domainKK->lamda2x(nlocal,dilate_group_bit);
+template<class DeviceType>
+int FixNHKokkos<DeviceType>::fuse_ok()
+{
+  if (!fusable) return 0;
+  if (which == BIAS || !allremap || !rfix.empty()) return 0;
+  if (igroup == atomKK->firstgroup) return 0;
+  if (domainKK->detached_atom_x()) return 0;
 
-  // for (auto &ifix : rfix) ifix->deform(1);
+  // in a triclinic box the off-diagonal terms of the x2lamda() and lamda2x()
+  // sums are not zero, and the compiler may contract those sums into fused
+  // multiply-adds in a different order in the fused kernel than in the
+  // separate DomainKokkos kernels, which changes x and y in the last bits.
+  // In an orthogonal box these terms are exact zeros and the results match.
+
+  if (domain->triclinic) return 0;
+  return 1;
+}
+
+template<class DeviceType>
+void FixNHKokkos<DeviceType>::set_press_factor()
+{
+  factor[0] = static_cast<KK_FLOAT>(exp(-dt4*(omega_dot[0]+mtk_term2)));
+  factor[1] = static_cast<KK_FLOAT>(exp(-dt4*(omega_dot[1]+mtk_term2)));
+  factor[2] = static_cast<KK_FLOAT>(exp(-dt4*(omega_dot[2]+mtk_term2)));
+}
+
+/* ----------------------------------------------------------------------
+   nh_v_press(), nve_v(), remap(), nve_x(), remap() of initial_integrate()
+   as one kernel: both box updates are host arithmetic only
+------------------------------------------------------------------------- */
+
+template<class DeviceType>
+void FixNHKokkos<DeviceType>::fused_initial()
+{
+  set_press_factor();
+
+  for (int k = 0; k < 3; k++) b0_lo[k] = static_cast<KK_FLOAT>(domain->boxlo[k]);
+  for (int k = 0; k < 6; k++) b0_hinv[k] = static_cast<KK_FLOAT>(domain->h_inv[k]);
+  remap_box();
+  for (int k = 0; k < 3; k++) b1_lo[k] = static_cast<KK_FLOAT>(domain->boxlo[k]);
+  for (int k = 0; k < 6; k++) b1_h[k] = static_cast<KK_FLOAT>(domain->h[k]);
+  for (int k = 0; k < 6; k++) b1_hinv[k] = static_cast<KK_FLOAT>(domain->h_inv[k]);
+  remap_box();
+  for (int k = 0; k < 3; k++) b2_lo[k] = static_cast<KK_FLOAT>(domain->boxlo[k]);
+  for (int k = 0; k < 6; k++) b2_h[k] = static_cast<KK_FLOAT>(domain->h[k]);
+
+  atomKK->sync(execution_space,X_MASK | V_MASK | F_MASK | MASK_MASK | RMASS_MASK | TYPE_MASK);
+
+  x = atomKK->k_x.view<DeviceType>();
+  v = atomKK->k_v.view<DeviceType>();
+  f = atomKK->k_f.view<DeviceType>();
+  rmass = atomKK->k_rmass.view<DeviceType>();
+  mass = atomKK->k_mass.view<DeviceType>();
+  type = atomKK->k_type.view<DeviceType>();
+  mask = atomKK->k_mask.view<DeviceType>();
+  int nlocal = atomKK->nlocal;
+
+  copymode = 1;
+  if (pstyle == TRICLINIC) {
+    if (rmass.data()) Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_initial<1,1>, LightWeight>(0,nlocal),*this);
+    else Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_initial<1,0>, LightWeight>(0,nlocal),*this);
+  } else {
+    if (rmass.data()) Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_initial<0,1>, LightWeight>(0,nlocal),*this);
+    else Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_initial<0,0>, LightWeight>(0,nlocal),*this);
+  }
+  copymode = 0;
+
+  atomKK->modified(execution_space,X_MASK | V_MASK);
+}
+
+template<class DeviceType>
+template<int TRICLINIC_FLAG, int RMASS>
+// NOLINTNEXTLINE
+KOKKOS_INLINE_FUNCTION
+void FixNHKokkos<DeviceType>::operator()(TagFixNH_fused_initial<TRICLINIC_FLAG,RMASS>, const int &i) const {
+  this->operator()(TagFixNH_nh_v_press<TRICLINIC_FLAG>(), i);
+  this->operator()(TagFixNH_nve_v<RMASS>(), i);
+
+  // same arithmetic as DomainKokkos x2lamda and lamda2x
+
+  KK_FLOAT delta[3];
+  delta[0] = x(i,0) - b0_lo[0];
+  delta[1] = x(i,1) - b0_lo[1];
+  delta[2] = x(i,2) - b0_lo[2];
+  x(i,0) = b0_hinv[0]*delta[0] + b0_hinv[5]*delta[1] + b0_hinv[4]*delta[2];
+  x(i,1) = b0_hinv[1]*delta[1] + b0_hinv[3]*delta[2];
+  x(i,2) = b0_hinv[2]*delta[2];
+  {
+    const KK_FLOAT xi1 = x(i,1);
+    const KK_FLOAT xi2 = x(i,2);
+    x(i,0) = b1_h[0]*x(i,0) + b1_h[5]*xi1 + b1_h[4]*xi2 + b1_lo[0];
+    x(i,1) = b1_h[1]*xi1 + b1_h[3]*xi2 + b1_lo[1];
+    x(i,2) = b1_h[2]*xi2 + b1_lo[2];
+  }
+
+  this->operator()(TagFixNH_nve_x(), i);
+
+  delta[0] = x(i,0) - b1_lo[0];
+  delta[1] = x(i,1) - b1_lo[1];
+  delta[2] = x(i,2) - b1_lo[2];
+  x(i,0) = b1_hinv[0]*delta[0] + b1_hinv[5]*delta[1] + b1_hinv[4]*delta[2];
+  x(i,1) = b1_hinv[1]*delta[1] + b1_hinv[3]*delta[2];
+  x(i,2) = b1_hinv[2]*delta[2];
+  {
+    const KK_FLOAT xi1 = x(i,1);
+    const KK_FLOAT xi2 = x(i,2);
+    x(i,0) = b2_h[0]*x(i,0) + b2_h[5]*xi1 + b2_h[4]*xi2 + b2_lo[0];
+    x(i,1) = b2_h[1]*xi1 + b2_h[3]*xi2 + b2_lo[1];
+    x(i,2) = b2_h[2]*xi2 + b2_lo[2];
+  }
+}
+
+/* ----------------------------------------------------------------------
+   nve_v() and nh_v_press() of final_integrate() as one kernel
+------------------------------------------------------------------------- */
+
+template<class DeviceType>
+void FixNHKokkos<DeviceType>::fused_final()
+{
+  set_press_factor();
+
+  atomKK->sync(execution_space,X_MASK | V_MASK | F_MASK | MASK_MASK | RMASS_MASK | TYPE_MASK);
+
+  v = atomKK->k_v.view<DeviceType>();
+  f = atomKK->k_f.view<DeviceType>();
+  rmass = atomKK->k_rmass.view<DeviceType>();
+  mass = atomKK->k_mass.view<DeviceType>();
+  type = atomKK->k_type.view<DeviceType>();
+  mask = atomKK->k_mask.view<DeviceType>();
+  int nlocal = atomKK->nlocal;
+
+  copymode = 1;
+  if (pstyle == TRICLINIC) {
+    if (rmass.data()) Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_final<1,1>, LightWeight>(0,nlocal),*this);
+    else Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_final<1,0>, LightWeight>(0,nlocal),*this);
+  } else {
+    if (rmass.data()) Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_final<0,1>, LightWeight>(0,nlocal),*this);
+    else Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_fused_final<0,0>, LightWeight>(0,nlocal),*this);
+  }
+  copymode = 0;
+
+  atomKK->modified(execution_space,V_MASK);
+}
+
+template<class DeviceType>
+template<int TRICLINIC_FLAG, int RMASS>
+// NOLINTNEXTLINE
+KOKKOS_INLINE_FUNCTION
+void FixNHKokkos<DeviceType>::operator()(TagFixNH_fused_final<TRICLINIC_FLAG,RMASS>, const int &i) const {
+  this->operator()(TagFixNH_nve_v<RMASS>(), i);
+  this->operator()(TagFixNH_nh_v_press<TRICLINIC_FLAG>(), i);
 }
 
 /* ----------------------------------------------------------------------
@@ -581,9 +764,7 @@ void FixNHKokkos<DeviceType>::nh_v_press()
   int nlocal = atomKK->nlocal;
   if (igroup == atomKK->firstgroup) nlocal = atomKK->nfirst;
 
-  factor[0] = static_cast<KK_FLOAT>(exp(-dt4*(omega_dot[0]+mtk_term2)));
-  factor[1] = static_cast<KK_FLOAT>(exp(-dt4*(omega_dot[1]+mtk_term2)));
-  factor[2] = static_cast<KK_FLOAT>(exp(-dt4*(omega_dot[2]+mtk_term2)));
+  set_press_factor();
 
   if (which == BIAS) {
     if (temperature->kokkosable) temperature->remove_bias_all_kk();
