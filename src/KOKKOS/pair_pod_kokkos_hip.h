@@ -3486,6 +3486,12 @@ __global__ void __launch_bounds__(64)
     }
 }
 
+// LMP_POD_LENV_HFKM: the Hf instance of localenv_wave_kernel is compiled for its 3 active
+// clusters instead of 4 (fewer registers)
+#ifndef LMP_POD_LENV_HFKM
+#define LMP_POD_LENV_HFKM 1
+#endif
+
 template <typename T, typename TA>
 bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<T> &g,
                    const T *sumU, const T *proj, const T *ledges, const T *redges, const T *cent,
@@ -3505,6 +3511,9 @@ bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<
   // the preloaded tables only with up to 4 active clusters: with 8 the kernel needs 110
   // VGPRs (4 waves) instead of 78 (6 waves)
   if (a.nActMax <= 4) {
+    // the Hf instance with KM = nActMax (3): 3 instead of 4 sets of cluster registers
+    if (hf && pre && g.d3 && LMP_POD_LENV_HFKM && (a.nActMax == PodHf::nActMax))
+      LMP_POD_LENV_WAVE1(PodHf::nActMax, true, true);
     if (hf && pre && g.d3) LMP_POD_LENV_WAVE1(4, true, true);
     if (pre && (a.nDes <= 128) && (a.nCls <= 64)) LMP_POD_LENV_WAVE(4, true);
     LMP_POD_LENV_WAVE(4, false);
