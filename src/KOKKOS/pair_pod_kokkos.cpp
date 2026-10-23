@@ -660,19 +660,32 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if (hip_acc_used && (eflag_global || vflag_global)) {
       KK_ACC_FLOAT h_acc[8];
-      int h_flag = 0;
-      const bool mflag = (hip_flags & HIP_MEGA) && ((int) mega_flag.extent(0) > 0);
-      if (mflag && (hipMemcpyAsync(&h_flag, mega_flag.data(), sizeof(int), hipMemcpyDeviceToHost,
+      // flag[0]: largest pair count beyond cap that was not kept; flag[4]: pairs claimed from the
+      // pool in this step
+      int h_all[32] = {0}, h_fl[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+      const bool mflag = (hip_flags & HIP_MEGA) && ((int) mega_flag.extent(0) >= 32);
+      if (mflag && (hipMemcpyAsync(h_all, mega_flag.data(), sizeof(h_all), hipMemcpyDeviceToHost,
                                    Kokkos::HIP().hip_stream()) != hipSuccess))
         error->one(FLERR, "pair pod/kk: reading the mega study flag failed");
       if ((hipMemcpyAsync(h_acc, hip_acc.data(), 8 * sizeof(KK_ACC_FLOAT), hipMemcpyDeviceToHost,
                           Kokkos::HIP().hip_stream()) != hipSuccess) ||
           (hipStreamSynchronize(Kokkos::HIP().hip_stream()) != hipSuccess))
         error->one(FLERR, "pair pod/kk: reading the energy and virial from the GPU failed");
+      // flag[0], then the counters of the last mega step as [4..8]
+      h_fl[0] = h_all[0];
+      for (int q = 0; q < PODHIP::MEGA_NCNT; q++) h_fl[4 + q] = h_all[16 + 8 * mega_clast + q];
+      const int h_flag = h_fl[0];
       if (h_flag > mega_cap)
         error->one(FLERR, "pair pod/kk mega study: an atom has {} pairs, more than LAMMPS_POD_MEGA_CAP={}"
                    " (with LAMMPS_POD_MEGA_SPILL=1: the pair pool was full, raise LAMMPS_POD_MEGA_POOL)",
                    h_flag, mega_cap);
+      // the pool overflowed (those atoms found their pairs again from the neighbor list): grow it
+      if (mflag && mega_spill && (h_fl[4] > (int) mega_gpaj.extent(0))) {
+        mega_pool_need = h_fl[4] + h_fl[4] / 4 + 1024;
+        if (comm->me == 0)
+          utils::logmesg(lmp, "pod mega study: pair pool grown to {} pairs ({} claimed, {} atoms "
+                         "by the overflow kernel)\n", mega_pool_need, h_fl[4], h_fl[8]);
+      }
       if (eflag_global) eng_vdwl += static_cast<double>(h_acc[0]);
       if (vflag_global)
         for (int d = 0; d < 6; ++d) virial[d] -= static_cast<double>(h_acc[1 + d]);
@@ -2807,10 +2820,13 @@ void PairPODKokkos<DeviceType>::mega_print_stats(int Ni)
 #ifdef KOKKOS_ENABLE_HIP
   if constexpr (std::is_same_v<typename DeviceType::execution_space, Kokkos::HIP>) {
     if ((mega_stats <= 0) || (mega_ncall % mega_stats) || (comm->me != 0)) return;
-    int fl[8], hs[65];
-    if ((hipMemcpy(fl, mega_flag.data(), sizeof(fl), hipMemcpyDeviceToHost) != hipSuccess) ||
+    int fa[32], fl[8], hs[65];
+    if ((hipMemcpy(fa, mega_flag.data(), sizeof(fa), hipMemcpyDeviceToHost) != hipSuccess) ||
         (hipMemcpy(hs, mega_hist.data(), sizeof(hs), hipMemcpyDeviceToHost) != hipSuccess))
       error->one(FLERR, "pair pod/kk mega study: reading the statistics failed");
+    // the counters of the last step as fl[4..8]
+    for (int q = 0; q < 4; q++) fl[q] = fa[q];
+    for (int q = 0; q < 4; q++) fl[4 + q] = fa[16 + 8 * mega_clast + q];
     double tot = 0.0, above[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
     const int lim[5] = {24, 28, 32, 36, 40};
     int mx = 0;
@@ -2862,22 +2878,42 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       MemKK::realloc_kokkos(mega_su, "pair_pod:mega_su", Ni * nout);
       MemKK::realloc_kokkos(mega_sf, "pair_pod:mega_sf", Ni * nout);
     }
-    if ((int) mega_flag.extent(0) < 8) MemKK::realloc_kokkos(mega_flag, "pair_pod:mega_flag", 8);
+    // (MemKK::realloc_kokkos does not initialize: the flags, counters and histogram are zeroed here)
+    if ((int) mega_flag.extent(0) < 32) {
+      MemKK::realloc_kokkos(mega_flag, "pair_pod:mega_flag", 32);
+      mega_cclean[0] = mega_cclean[1] = true;
+      if (hipMemsetAsync(mega_flag.data(), 0, 32 * sizeof(int), stream) != hipSuccess)
+        error->one(FLERR, "pair pod/kk mega study: zeroing the flags failed");
+    }
+    // the pair pool: pool_atoms atoms of maxneigh pairs, grown to the pairs claimed in an earlier
+    // step if they did not fit (mega_pool_need, from the pool counter read with the flags)
     const int pool_atoms = (mega_pool > 0) ? mega_pool : std::max(256, Ni / 32);
-    const int pool_n = pool_atoms * std::max(maxneigh, 1);
+    const int pool_n = std::max(pool_atoms * std::max(maxneigh, 1), mega_pool_need);
     if (mega_spill && ((int) mega_gpaj.extent(0) < pool_n)) {
       MemKK::realloc_kokkos(mega_gpr, "pair_pod:mega_gpr", pool_n);
       MemKK::realloc_kokkos(mega_gprh, "pair_pod:mega_gprh", 3 * pool_n);
       MemKK::realloc_kokkos(mega_gpaj, "pair_pod:mega_gpaj", pool_n);
     }
-    if (mega_stats && ((int) mega_hist.extent(0) < 65))
+    if (mega_stats && ((int) mega_hist.extent(0) < 65)) {
       MemKK::realloc_kokkos(mega_hist, "pair_pod:mega_hist", 65);
-    // the pool is claimed anew in each step
-    if (hipMemsetAsync(mega_flag.data() + 4, 0, sizeof(int), stream) != hipSuccess)
+      if (hipMemsetAsync(mega_hist.data(), 0, 65 * sizeof(int), stream) != hipSuccess)
+        error->one(FLERR, "pair pod/kk mega study: zeroing the statistics failed");
+    }
+    // per-step counters (MegaArgs::cnt) at flag[16 + 8 p], p the parity of the step: zeroed by the
+    // overflow kernel of the previous step, else by a memset here
+    const int cpar = mega_cpar;
+    int *cnt = mega_flag.data() + 16 + 8 * cpar;
+    if (!mega_cclean[cpar] &&
+        (hipMemsetAsync(cnt, 0, PODHIP::MEGA_NCNT * sizeof(int), stream) != hipSuccess))
       error->one(FLERR, "pair pod/kk mega study: resetting the pair pool failed");
+    mega_cclean[cpar] = false;
+    mega_clast = cpar;
+    if (mega_spill && ((int) mega_ovf.extent(0) < Ni)) MemKK::realloc_kokkos(mega_ovf, "pair_pod:mega_ovf", Ni);
     if (mega_hybrid && ((int) mega_zero.extent(0) < Ni * cap)) {
       MemKK::realloc_kokkos(mega_pai, "pair_pod:mega_pai", Ni * cap);
-      MemKK::realloc_kokkos(mega_zero, "pair_pod:mega_zero", Ni * cap);    // zero-initialized
+      MemKK::realloc_kokkos(mega_zero, "pair_pod:mega_zero", Ni * cap);
+      if (hipMemsetAsync(mega_zero.data(), 0, (size_t) Ni * cap * sizeof(int), stream) != hipSuccess)
+        error->one(FLERR, "pair pod/kk mega study: zeroing the hybrid element array failed");
     }
     if (vflag_global && ((int) hip_vir.extent(0) < 6 * Ni))
       MemKK::realloc_kokkos(hip_vir, "pair_pod:hip_vir", 6 * Ni);
@@ -2949,8 +2985,13 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.gpr = mega_spill ? mega_gpr.data() : nullptr;
     a.gprh = mega_spill ? mega_gprh.data() : nullptr;
     a.gpaj = mega_spill ? mega_gpaj.data() : nullptr;
-    a.pool_ctr = mega_flag.data() + 4;
+    a.cnt = cnt;
+    a.cntz = nullptr;
+    a.pool_ctr = cnt;
     a.pool_n = mega_spill ? (int) mega_gpaj.extent(0) : 0;
+    a.ovf = (mega_spill && (mega_persist < 0) && !mega_hybrid && !mega_pglobal) ? mega_ovf.data() : nullptr;
+    if ((int) mega_fdum.extent(0) < 8) MemKK::realloc_kokkos(mega_fdum, "pair_pod:mega_fdum", 8);
+    a.fdummy = mega_fdum.data();
     a.hist = mega_stats ? mega_hist.data() : nullptr;
     a.freg = mega_freg;
     a.n_pn3 = nabf3 + 1;
@@ -3154,10 +3195,22 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       pairs_fused = false;
       return true;
     }
+    // (the overflow list is used only by the full-range kernel)
+    const bool full = (mega_nr == 1) && (mega_r0[0] == 0) && (mega_r1[0] == PODHIP::MS_N - 1);
+    if (!full) a.ovf = nullptr;
     for (int r = 0; r < mega_nr; r++)
       if (!PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, mega_r0[r], mega_r1[r]))
         error->one(FLERR, "pair pod/kk mega study: stage range {}-{} failed or not available",
                    mega_r0[r], mega_r1[r]);
+    // the atoms whose pairs did not fit in the pool, if any; the kernel also zeroes the counters
+    // of the next step
+    if (a.ovf) {
+      a.cntz = mega_flag.data() + 16 + 8 * (cpar ^ 1);
+      if (!PODHIP::mega_ovf_launch<KK_FLOAT, KK_ACC_FLOAT>(stream, a, 64))
+        error->one(FLERR, "pair pod/kk mega study: overflow kernel failed");
+      mega_cclean[cpar ^ 1] = true;
+    }
+    mega_cpar ^= 1;
     if (vflag_global &&
         !PODHIP::virial_reduce<KK_ACC_FLOAT>(stream, hip_acc.data(), hip_vir.data(), Ni))
       error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");

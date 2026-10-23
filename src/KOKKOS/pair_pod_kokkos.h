@@ -130,6 +130,11 @@ class PairPODKokkos : public PairPOD {
   t_pod_1i mega_extab, mega_mono;    // round 5 exponent tables (built once)
   t_pod_1i mega_rowmono;    // S6SYM row table of the force stage (built once)
   int mega_rowmono_ok = 0;
+  t_pod_1i mega_ovf;    // atoms whose pairs did not fit in the pool (overflow kernel)
+  Kokkos::View<KK_ACC_FLOAT *, DeviceType> mega_fdum;    // force sink of those atoms in mega_kernel
+  int mega_pool_need = 0;
+  int mega_cpar = 0, mega_clast = 0;    // parity of the per-step mega counters, and of the last step
+  bool mega_cclean[2] = {true, true};    // counters of that parity already zeroed    // pairs claimed from the pool in an earlier step, if more than it held
   bool mega_block(int gi1, int Ni);
   void mega_print_stats(int Ni);
 

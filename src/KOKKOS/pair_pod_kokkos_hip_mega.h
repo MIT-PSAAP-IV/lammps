@@ -41,6 +41,7 @@ namespace PODHIP {
 
 enum { MS_NEIGH = 0, MS_TWOBODY, MS_RAS, MS_DESC, MS_LOCALENV, MS_FC, MS_FORCE, MS_N };
 
+static constexpr int MEGA_NCNT = 5;    // per-step counters of the mega kernel (MegaArgs::cnt)
 static constexpr int MEGA_RTM = 2;    // K3 <= 32 (angular degree <= 3)
 static constexpr int MEGA_CSM = 2;    // nelements * nrbf3 <= 8
 static constexpr int MEGA_FT = 12;                // 4-body terms per monomial (FREG=2 recipe)
@@ -48,7 +49,8 @@ static constexpr int MEGA_FRI = 2 + 3 * MEGA_FT;  // ints per monomial in the re
 static constexpr int MEGA_FRD = 1 + MEGA_FT;      // doubles per monomial in the recipe
 
 // pairs beyond cap (study of the code variants): 0 none (dropped, reported), 1 pool (pool full:
-// dropped, reported), 2 pool, and when it is full the windows found again from the neighbor list
+// the atom is left to the overflow kernel, a.ovf; without a.ovf dropped and reported), 2 pool, and
+// when it is full the windows found again from the neighbor list in every stage
 #ifndef LMP_POD_MEGA_SPILLV
 #define LMP_POD_MEGA_SPILLV 1
 #endif
@@ -426,6 +428,12 @@ template <typename T, typename TA> struct MegaArgs {
   T *gpr, *gprh;
   int *gpaj, *pool_ctr;
   int pool_n, spill;
+  int *ovf;     // nullptr, or the atoms whose pairs did not fit in the pool (count in cnt[4])
+  // per-step counters (MEGA_NCNT ints): [0] pool counter (pool_ctr), [1] atoms beyond cap,
+  // [2] of which pool full, [3] largest pair count beyond cap, [4] overflow atoms; cntz: the
+  // counters of the next step, zeroed by the overflow kernel (or nullptr)
+  int *cnt, *cntz;
+  TA *fdummy;   // force sink of those atoms in mega_kernel (the overflow kernel adds their forces)
   int *hist;    // nullptr, or the number of atoms with n pairs (n < 64) and with >= 64
 };
 
@@ -514,7 +522,8 @@ __host__ __device__ inline MegaLayout mega_layout(const MegaArgs<T, TA> &a)
 
 // stages S0..S1 of atom i.  PERSIST: the energy and virial of the atom are added to eacc and
 // vacc (valid in lane 0) instead of being written per atom
-template <typename T, typename TA, int S0, int S1, bool PERSIST, bool PG, bool HF = false>
+template <typename T, typename TA, int S0, int S1, bool PERSIST, bool PG, bool HF = false,
+          bool RESCAN = false>
 __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const int i, TA &eacc,
                                  TA (&vacc)[6])
 {
@@ -635,10 +644,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
             aj_s[t] = ga[t];
           }
       }
-#if LMP_POD_MEGA_SPILLV > 1
-      else
+      else if constexpr (RESCAN || (LMP_POD_MEGA_SPILLV > 1))
         scan(wb, wb + cap, r_s, rh_s, aj_s, cap);
-#endif
       __syncthreads();
       curw = __builtin_amdgcn_readfirstlane(wb);
     } else
@@ -670,6 +677,10 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     __syncthreads();
   }
 
+  // the atom's pairs did not fit in the pool: it is listed for the overflow kernel and computed
+  // here with its first window only, its forces going to a dummy (wave-uniform)
+  bool ovfskip = false;
+
   // ---- stage 0: the pairs of atom i inside the cutoff, in the order of the neighbor list
   if constexpr (mega_has(S0, S1, MS_NEIGH)) {
     const int cnt = scan(0, cap, r_s, rh_s, aj_s, PN);
@@ -681,20 +692,26 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
         if (lane == 0) {
           const int o = atomicAdd(a.pool_ctr, cnt);
           off = (o + cnt <= a.pool_n) ? o : -1;
-          atomicAdd(a.flag + 5, 1);                 // atoms with pairs beyond cap
-          if (off < 0) atomicAdd(a.flag + 6, 1);    // of which found again (pool full)
-          if (cnt > __hip_atomic_load(a.flag + 7, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
-            atomicMax(a.flag + 7, cnt);
+          atomicAdd(a.cnt + 1, 1);                 // atoms with pairs beyond cap
+          if (off < 0) atomicAdd(a.cnt + 2, 1);    // of which found again (pool full)
+          if (cnt > __hip_atomic_load(a.cnt + 3, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
+            atomicMax(a.cnt + 3, cnt);
         }
         poff = __builtin_amdgcn_readfirstlane(__shfl(off, 0));    // wave-uniform: SGPR
         if (poff >= 0) scan(0, cnt, a.gpr + poff, a.gprh + poff, a.gpaj + poff, a.pool_n);
+        // pool full: the atom is processed by the overflow kernel (its windows found again from
+        // the neighbor list), after this one
+        if ((poff < 0) && !RESCAN && a.ovf) {
+          if (lane == 0) a.ovf[atomicAdd(a.cnt + 4, 1)] = i;
+          ovfskip = true;
+        }
         // pool full: found again window by window (2), or dropped and reported (1)
-        spilled = (poff >= 0) || (LMP_POD_MEGA_SPILLV > 1);
+        spilled = (poff >= 0) || RESCAN || (LMP_POD_MEGA_SPILLV > 1);
         if (spilled) np = cnt;
       }
     }
     if (!spilled) {
-      if ((cnt > cap) && (lane == 0) &&
+      if ((cnt > cap) && (lane == 0) && !ovfskip &&
           (cnt > __hip_atomic_load(a.flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)))
         atomicMax(a.flag, cnt);
       np = min(cnt, cap);
@@ -1258,6 +1275,11 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     int nj = 0;
 
     ForceTally<T, TA> ft = a.ft;
+    if (ovfskip) {    // the overflow kernel adds this atom's forces
+      ft.f = a.fdummy;
+      ft.fs0 = 0;
+      ft.fs1 = 0;
+    }
     ft.ai = gi_s;    // ai[0] = gi
     ft.aj = aj_s;
     ft.cb2 = d_s;
@@ -1800,6 +1822,27 @@ __global__ void __launch_bounds__(64) LMP_POD_MEGA_ATTR mega_kernel(const MegaAr
     mega_atom<T, TA, S0, S1, false, PG>(a, lds_raw, blockIdx.x, e, v);
 }
 
+// overflow kernel: the atoms left by mega_kernel because the pair pool was full (a.ovf, count
+// in flag[8]); their pair windows are found again from the neighbor list in each stage.  Rare
+// (the host grows the pool from the pairs claimed), so a grid-stride loop of a few blocks
+template <typename T, typename TA, bool HF>
+__global__ void __launch_bounds__(64) mega_ovf_kernel(const MegaArgs<T, TA> a)
+{
+  extern __shared__ char lds_raw[];
+  TA e = TA(0), v[6];
+  const int n = __hip_atomic_load(a.cnt + 4, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  // the counters of the next step (the other parity) are zeroed here instead of by a memset
+  if ((blockIdx.x == 0) && a.cntz && (threadIdx.x < MEGA_NCNT)) a.cntz[threadIdx.x] = 0;
+  MegaArgs<T, TA> b = a;
+  if constexpr (HF) mega_hf_sizes(b);
+  b.ovf = nullptr;
+  b.pool_n = 0;
+  for (int k = blockIdx.x; k < n; k += gridDim.x) {
+    __syncthreads();
+    mega_atom<T, TA, 0, MS_N - 1, false, false, HF, true>(b, lds_raw, a.ovf[k], e, v);
+  }
+}
+
 // persistent version: each block loops over the atoms blockIdx.x + k*gridDim.x and adds the
 // energy and virial of its atoms to acc once.  SB < 6: the stages 0..SB of all atoms, a grid
 // barrier (all blocks must be resident), then the stages SB+1..6 (study of a grid-wide
@@ -1882,6 +1925,27 @@ bool mega_launch(hipStream_t stream, const MegaArgs<T, TA> &a, int *query = null
       hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_kernel<T, TA, S0, S1, false>), dim3(a.Ni), dim3(64),
                          (size_t) lo.total, stream, a);
   }
+  return hipGetLastError() == hipSuccess;
+}
+
+// the overflow kernel of a full-range launch (after mega_launch<0, MS_N - 1>)
+template <typename T, typename TA>
+bool mega_ovf_launch(hipStream_t stream, const MegaArgs<T, TA> &a, const int nblk)
+{
+  if (!a.ovf || a.pglobal) return true;
+  const MegaLayout lo = mega_layout<0, MS_N - 1>(a);
+  const int g = std::max(1, std::min(nblk, a.Ni));
+  bool done = false;
+  if constexpr (LMP_POD_MEGA_HF) {
+    if (a.hf) {
+      hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_ovf_kernel<T, TA, true>), dim3(g), dim3(64),
+                         (size_t) lo.total, stream, a);
+      done = true;
+    }
+  }
+  if (!done)
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mega_ovf_kernel<T, TA, false>), dim3(g), dim3(64),
+                       (size_t) lo.total, stream, a);
   return hipGetLastError() == hipSuccess;
 }
 
