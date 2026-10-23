@@ -1259,12 +1259,12 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
 // tallied, ft.f != nullptr), with the distance r and the direction (u, v, w) of the pair given
 // (N: the number of pairs): subtracts it from f_j and returns it in fd, with the virial terms
 // vd = r_d f_d and vo (xy, xz, yz for d = 0, 1, 2) of the pair
-template <typename T, typename TA>
+template <typename T, typename TA, bool LDS2 = false>
 __device__ inline void pod_pair_force_dg(const ForceTally<T, TA> &ft, const int N, const int i,
                                          const int j, const int e, const TA SA, const TA SU,
                                          const TA SV, const TA SW, const int d, const T r,
                                          const T u, const T v, const T w, TA &fd, TA &vd,
-                                         TA &vo)
+                                         TA &vo, const T *cb2_s = nullptr)
 {
   const T invr = static_cast<T>(1.0) / r;
   const T g0 = (v * v + w * w) * invr, g1 = -(u * v) * invr, g2 = -(u * w) * invr;
@@ -1280,9 +1280,11 @@ __device__ inline void pod_pair_force_dg(const ForceTally<T, TA> &ft, const int 
     if (ft.bs.r0v) {
       T Bq[4], dBq[4];
       const int pair = (ft.bs.ne > 1) ? ft.bs.ti[j] * ft.bs.ne + ft.bs.tj[j] : 0;
-      const int ii = i * ft.ca + ft.cm * (pod_bspline_eval(ft.bs, pair, r, Bq, dBq) + ft.nrbf2 * e);
+      const int gb = pod_bspline_eval(ft.bs, pair, r, Bq, dBq);
+      const int ii = i * ft.ca + ft.cm * (gb + ft.nrbf2 * e);
 #pragma unroll
-      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * dBq[m]);
+      for (int m = 0; m < 4; ++m)
+        cR += static_cast<TA>((LDS2 ? cb2_s[gb + m] : ft.cb2[ii + ft.cm * m]) * dBq[m]);
     } else {
       const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
       for (int m = 0; m < ft.nm2; ++m)
@@ -1458,6 +1460,12 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #ifndef LMP_POD_HF_SYM
 #define LMP_POD_HF_SYM 1
 #endif
+// LMP_POD_HF_CB2S (with SYM): the 2-body B-spline force coefficients of atom i (one element, cm 1)
+// are copied into the LDS of the power table, which SYM does not use, before the pair loop and
+// read there by the force epilogue instead of global memory
+#ifndef LMP_POD_HF_CB2S
+#define LMP_POD_HF_CB2S 1
+#endif
 __device__ inline int pod_opaque(int x)
 {
   asm volatile("" : "+v"(x));
@@ -1588,6 +1596,11 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     }
   };
   if constexpr (PREFETCH && !SYM) fetch(0);
+  // CB2S: the 2-body coefficients of atom i in LDS (Hf: B-splines evaluated here, cm 1)
+  constexpr bool CB2S = SYM && LMP_POD_HF_CB2S;
+  const bool cb2l = CB2S && ft.cb2 && ft.bs.r0v && (ft.cm == 1) && (ft.nrbf2 <= JT * PD);
+  if (cb2l)
+    for (int t = lane; t < ft.nrbf2; t += 64) pd_s[t] = ft.cb2[i * ft.ca + t];
 
   for (int j0 = 0; j0 < nj; j0 += JT) {
     const int nt = min(JT, nj - j0);
@@ -1797,7 +1810,10 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         if ((lqe < 3) && (jbe < nt)) {
           TA fd, vd, vo;
           const T *pde = PDT ? pd_s + jbe : pd_s + jbe * PD;
-          if constexpr (EREG)
+          if (EREG && cb2l)
+            pod_pair_force_dg<T, TA, true>(ft, pg.N, i, start + j0 + jbe, 0, SA, SU, SV, SW, lqe,
+                                           pg.r(start + j0 + jbe), eu, ev, ew, fd, vd, vo, pd_s);
+          else if constexpr (EREG)
             pod_pair_force_dg<T, TA>(
                 ft, pg.N, i, start + j0 + jbe, SYM ? 0 : tj_s[jbe], SA, SU, SV, SW, lqe,
                 pg.r(start + j0 + jbe), SYM ? eu : pde[PS], SYM ? ev : pde[PS * (L1 + 1)],
