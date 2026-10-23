@@ -328,7 +328,7 @@ class PairPODKokkos : public PairPOD {
   // Fused pair forces + force tally + global/per-atom virial
   void allbody_forces(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
 
-  template<bool BSPLINE, bool VGLOBAL>
+  template<bool BSPLINE, bool VGLOBAL, int NR, int MD>
   void allbody_forces_impl(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
 
   void blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij);

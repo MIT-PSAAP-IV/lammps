@@ -390,7 +390,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
       const T inv_i = static_cast<T>(1.0) / static_cast<T>(i);
       const T isinax = inv_i * static_cast<T>(sin(ix));
       const T drbftdr = bg1 * isinax + Kf1dx * cosax;
-      add(bf1 * isinax, drbftdr * invdij);
+      add(bf1 * isinax, drbftdr);
       ix += static_cast<TA>(xpi);
     }
   }
@@ -402,7 +402,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
   for (int i = 1; i <= inversedegree; ++i) {
     dterm -= fcut_invd;
     inva *= invdij;
-    add(fcut * inva, dterm * inva * invdij);
+    add(fcut * inva, dterm * inva);
   }
 
 #pragma unroll
@@ -480,13 +480,15 @@ __device__ inline void pair_radial_r(const RadialSrc<T> &s, const T r, const int
 {
   constexpr int MR = (MAXR > 0) ? MAXR : 1;
   if (s.coef == nullptr) {
+    // the stored drbf is R'(r); the consumers take R'(r)/r
+    const T ir = s.drbf ? static_cast<T>(1.0) / r : T(0);
     if (MAXR > 0) {
 #pragma unroll
       for (int m = 0; m < MR; m++)
-        if (m < nrbf3) emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] : T(0));
+        if (m < nrbf3) emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] * ir : T(0));
     } else {
       for (int m = 0; m < nrbf3; m++)
-        emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] : T(0));
+        emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] * ir : T(0));
     }
     return;
   }
@@ -519,21 +521,24 @@ template <int MAXR, typename T, typename F>
 __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg, const int j,
                                    const int nrbf3, F &&emit)
 {
-  pair_radial_r<MAXR>(s, s.coef ? pg.r(j) : T(0), j, nrbf3, emit);
+  pair_radial_r<MAXR>(s, (s.coef || s.drbf) ? pg.r(j) : T(1), j, nrbf3, emit);
 }
 
 // the radial functions of one pair, evaluated one m at a time: the Hermite bin of the
 // pair is found once, or the stored rbf/drbf are read
 template <typename T> struct PairRadial {
   const T *c;    // Hermite coefficients of the bin, [m][4]; nullptr: stored rbf/drbf
-  T t, s;        // position in the bin and d(t)/dr / r
+  T t, s;        // position in the bin and d(t)/dr / r (stored basis: 1/r)
   const T *rbf, *drbf;
   int j, Nij;
 
   __device__ PairRadial(const RadialSrc<T> &rs, const PairGeom<T> &pg, const int jj) :
       c(nullptr), t(T(0)), s(T(0)), rbf(rs.rbf), drbf(rs.drbf), j(jj), Nij(rs.Nij)
   {
-    if (rs.coef == nullptr) return;
+    if (rs.coef == nullptr) {
+      if (rs.drbf) s = static_cast<T>(1.0) / pg.r(j);    // the stored drbf is R'(r)
+      return;
+    }
     const int pair = (rs.ne > 1) ? rs.ti[j] * rs.ne + rs.tj[j] : 0;
     const T r = pg.r(j);
     const T invdr = rs.invdrv[pair];
@@ -550,7 +555,7 @@ template <typename T> struct PairRadial {
   {
     if (c == nullptr) {
       f = rbf[j + Nij * m];
-      df = drbf ? drbf[j + Nij * m] : T(0);
+      df = drbf ? drbf[j + Nij * m] * s : T(0);
       return;
     }
     const T *cm = c + 4 * m;
@@ -1225,12 +1230,13 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
           i * ft.ca + ft.cm * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
 #pragma unroll
       for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * dBq[m]);
+      cR *= static_cast<TA>(r);    // dBq is R'(r)/r
     } else {
+      // the stored drbf2 is R'(r)
       const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
       for (int m = 0; m < ft.nm2; ++m)
         cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + pg.N * m]);
     }
-    cR *= static_cast<TA>(r);
     fx += cR * static_cast<TA>(u);
     fy += cR * static_cast<TA>(v);
     fz += cR * static_cast<TA>(w);
@@ -1285,12 +1291,13 @@ __device__ inline void pod_pair_force_dg(const ForceTally<T, TA> &ft, const int 
 #pragma unroll
       for (int m = 0; m < 4; ++m)
         cR += static_cast<TA>((LDS2 ? cb2_s[gb + m] : ft.cb2[ii + ft.cm * m]) * dBq[m]);
+      cR *= static_cast<TA>(r);    // dBq is R'(r)/r
     } else {
+      // the stored drbf2 is R'(r)
       const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
       for (int m = 0; m < ft.nm2; ++m)
         cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + N * m]);
     }
-    cR *= static_cast<TA>(r);
     fx += cR * static_cast<TA>(u);
     fy += cR * static_cast<TA>(v);
     fz += cR * static_cast<TA>(w);
@@ -2726,7 +2733,6 @@ __global__ void __launch_bounds__(256)
   const T r = pg.r(n);
   const T r0 = r0v[pair];
   const T invdr = invdrv[pair];
-  const T invdrr = invdr / r;
   const T tg = (r - r0) * invdr;
   int b = (int) tg;
   if (b < 0) b = 0;
@@ -2755,7 +2761,7 @@ __global__ void __launch_bounds__(256)
     const T f = c0 + t * (c1 + t * (c2 + t * c3));
     const T dfdt = c1 + t * (static_cast<T>(2.0) * c2 + static_cast<T>(3.0) * c3 * t);
     rbf[n + N * k] = f;
-    drbf[n + N * k] = dfdt * invdrr;
+    drbf[n + N * k] = dfdt * invdr;    // R'(r)
     if (PERATOM && (k < nrbf2))
       atomicAdd(d2_s + ((ne > 1) ? tj[n] : 0) * nrbf2 + k, static_cast<TA>(f));
   }
@@ -2786,10 +2792,11 @@ __global__ void __launch_bounds__(256)
   if (n >= N) return;
   T Bq[4], dBq[4];
   base[n] = pod_bspline_pair(g, pg, n, Bq, dBq);
+  const T r = pg.r(n);    // dBq is R'(r)/r, the stored basis R'(r)
 #pragma unroll
   for (int q = 0; q < 4; q++) {
     rbf2[n + q * N] = Bq[q];
-    drbf2[n + q * N] = dBq[q];
+    drbf2[n + q * N] = dBq[q] * r;
   }
 }
 
@@ -2815,14 +2822,15 @@ __global__ void __launch_bounds__(256)
     const int ii = idxi[n] + Ni * (pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * tj[n]);
 #pragma unroll
     for (int m = 0; m < 4; ++m) cR += static_cast<TA>(cb2[ii + Ni * m] * dBq[m]);
+    cR *= static_cast<TA>(pg.r(n));    // dBq is R'(r)/r
   } else {
-    // base == nullptr: all nm = nrbf2 radial functions; otherwise nm = 4 B-splines from base[n]
+    // base == nullptr: all nm = nrbf2 radial functions; otherwise nm = 4 B-splines from base[n];
+    // the stored drbf2 is R'(r)
     const int ii = idxi[n] + Ni * ((base ? base[n] : 0) + nrbf2 * tj[n]);
     for (int m = 0; m < nm; ++m) cR += static_cast<TA>(cb2[ii + Ni * m] * drbf2[n + Nij * m]);
   }
   T u, v, w;
   pg.uvw(n, u, v, w);
-  cR *= static_cast<TA>(pg.r(n));
   fij[3 * n + 0] += static_cast<T>(cR * static_cast<TA>(u));
   fij[3 * n + 1] += static_cast<T>(cR * static_cast<TA>(v));
   fij[3 * n + 2] += static_cast<T>(cR * static_cast<TA>(w));

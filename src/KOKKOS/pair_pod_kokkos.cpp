@@ -197,8 +197,14 @@ PODHIP::BsplineArgs<KK_FLOAT> pod_bspline_args(bool otf, const VD &r0, const VD 
 }    // namespace
 #endif
 
-KOKKOS_INLINE_FUNCTION int npa(int d)   { return d*(d+1)*(d+2)/6; }  // # monomials of degree < d
-KOKKOS_INLINE_FUNCTION int nmono(int d) { return (d+1)*(d+2)/2;   }  // # monomials of degree == d
+KOKKOS_FORCEINLINE_FUNCTION constexpr int npa(int d)   { return d*(d+1)*(d+2)/6; }  // # monomials of degree < d
+KOKKOS_FORCEINLINE_FUNCTION constexpr int nmono(int d) { return (d+1)*(d+2)/2;   }  // # monomials of degree == d
+
+// Linear index of monomial u^p v^q w^r, d = p+q+r.
+KOKKOS_FORCEINLINE_FUNCTION constexpr int pod_mono_index(int p, int q, int r) {
+  const int d = p + q + r;
+  return (d*(d+1)*(d+2))/6 + (d+1)*r - (r*(r-1))/2 + q;
+}
 
 /* ----------------------------------------------------------------------
    compile-time index usable on host and device
@@ -1417,7 +1423,7 @@ void PairPODKokkos<DeviceType>::radialbasis(
         const KK_FLOAT drbftdr = bg1 * isinax + Kf1dx * cosax;
 
         rbft (nij) = rbfv;
-        drbft(nij) = drbftdr * invdij;  // R'/r
+        drbft(nij) = drbftdr;  // R'(r)
 
         ix  += static_cast<KK_ACC_FLOAT>(xpi);
         nij += Nij;
@@ -1435,7 +1441,7 @@ void PairPODKokkos<DeviceType>::radialbasis(
       dterm -= fcut_invd;
       inva  *= invdij;
       rbft (nij) = fcut * inva;
-      drbft(nij) = dterm * inva * invdij;  // R'/r
+      drbft(nij) = dterm * inva;  // R'(r)
       nij += Nij;
     }
   });
@@ -1498,9 +1504,9 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
   const int nb = nhermite_bins;
   const int nr = nrbfmax;
 
-  auto s_r0    = hermite_r0;
-  auto s_invdr = hermite_invdr;
-  auto s_coef  = rbf_hermite_coeffs;
+  auto s_r0   = hermite_r0;
+  auto s_invh = hermite_invdr;
+  auto s_coef = rbf_hermite_coeffs;
 
   Kokkos::parallel_for("radialbasis_hermite",
     Kokkos::RangePolicy<DeviceType>(0, N),
@@ -1512,11 +1518,10 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
 
       const KK_FLOAT r = l_rr(n);
 
-      const KK_FLOAT r0    = s_r0(pair);
-      const KK_FLOAT invdr = s_invdr(pair);
-      const KK_FLOAT invdrr = invdr / r;
+      const KK_FLOAT r0   = s_r0(pair);
+      const KK_FLOAT invh = s_invh(pair);
 
-      const KK_FLOAT tg = (r - r0) * invdr;
+      const KK_FLOAT tg = (r - r0) * invh;
       int b = (int) tg;
       if (b < 0) b = 0;
       else if (b > nb-1) b = nb-1;
@@ -1537,7 +1542,7 @@ void PairPODKokkos<DeviceType>::radialbasis_hermite(
 
         const int idx = n + N*k;
         l_rbf (idx) = f;
-        l_drbf(idx) = dfdt * invdrr;   // f'(r)/r
+        l_drbf(idx) = dfdt * invh;   // R'(r)
       }
     });
 }
@@ -1637,7 +1642,7 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
       // for r <= r_in the basis is extended as a constant, so forces vanish
       // fold that into the derivative scale instead of zeroing dB afterwards
       const bool     inside = (tg >= (KK_FLOAT)0.0);
-      const KK_FLOAT dscale = inside ? invh / r : (KK_FLOAT)0.0;
+      const KK_FLOAT dscale = inside ? invh : (KK_FLOAT)0.0;
       if (!inside) tg = (KK_FLOAT)0.0;
 
       int b = (int) tg;
@@ -1660,7 +1665,7 @@ void PairPODKokkos<DeviceType>::radialbasis_bspline(
       l_rbf2 (n + 2*N) = sel4(sh + 2, B0, B1, B2, B3);
       l_rbf2 (n + 3*N) = sel4(sh + 3, B0, B1, B2, B3);
 
-      l_drbf2(n      ) = sel4(sh    , dB0, dB1, dB2, dB3);   // R'(r)/r
+      l_drbf2(n      ) = sel4(sh    , dB0, dB1, dB2, dB3);   // R'(r)
       l_drbf2(n +   N) = sel4(sh + 1, dB0, dB1, dB2, dB3);
       l_drbf2(n + 2*N) = sel4(sh + 2, dB0, dB1, dB2, dB3);
       l_drbf2(n + 3*N) = sel4(sh + 3, dB0, dB1, dB2, dB3);
@@ -1734,9 +1739,8 @@ void PairPODKokkos<DeviceType>::radialangularsum(
   pod_dispatch_int<1, POD_MAX_NELEM>(l_nelements, [&](auto NE) {
     pod_dispatch_int<1, POD_MAX_NRBF>(nrbf3, [&](auto NR) {
       pod_dispatch_int<1, POD_MAX_DEG>(P3, [&](auto MD) {
-        this->template radialangularsum_impl<decltype(NE)::value,
-                                             decltype(NR)::value,
-                                             decltype(MD)::value>(
+        constexpr int ne = decltype(NE)::value, nr = decltype(NR)::value, md = decltype(MD)::value;
+        this->template radialangularsum_impl<ne, nr, md>(
             l_sumU, l_rbf, l_rhat, l_tj, l_numij, K3, Ni, Nij);
       });
     });
@@ -1792,10 +1796,8 @@ void PairPODKokkos<DeviceType>::twobody_forces(
       const int ii = l_idxi(n) + Ni * l_nrbf2 * l_tj(n);
 
       KK_ACC_FLOAT cR = 0.0;
-      for (int m = 0; m < l_nrbf2; ++m) {
+      for (int m = 0; m < l_nrbf2; ++m)
         cR += static_cast<KK_ACC_FLOAT>(cb2(ii + Ni * m) * l_drbf2(n + Nij * m));
-      }
-      cR *= static_cast<KK_ACC_FLOAT>(l_rr(n));
 
       const int i1 = 3 * n;
       fij(i1 + 0) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rhat(n)));
@@ -1862,7 +1864,6 @@ void PairPODKokkos<DeviceType>::twobody_forces_bspline(
       KK_ACC_FLOAT cR = 0.0;
       for (int s = 0; s < 4; ++s)
         cR += cb2(ii + Ni * s) * l_drbf2(n + Nij * s);
-      cR *= static_cast<KK_ACC_FLOAT>(l_rr(n));
 
       const int i1 = 3 * n;
       fij(i1 + 0) += static_cast<KK_FLOAT>(cR * static_cast<KK_ACC_FLOAT>(l_rhat(n)));
@@ -2077,7 +2078,9 @@ struct PODVirial {
   KK_ACC_FLOAT v[6];
 };
 
-template<class DeviceType, bool BSPLINE, bool FUSEF, bool VGLOBAL>
+// NR = nrbf3 and MD = P3 are compile-time, so the radial arrays have their exact size
+// and the loops over them and over the monomial degrees unroll completely
+template<class DeviceType, bool BSPLINE, bool FUSEF, bool VGLOBAL, int NR, int MD>
 struct PODAllBodyForceFunctor {
   typedef DeviceType device_type;
   typedef PODVirial value_type;
@@ -2118,15 +2121,13 @@ struct PODAllBodyForceFunctor {
     const KK_FLOAT w    = rhat(j + 2*Nij);
     const KK_FLOAT invr = (KK_FLOAT) 1.0 / dij;
 
-    KK_FLOAT rb[POD_MAX_NRBF], drb[POD_MAX_NRBF];
-    #pragma unroll
-    for (int m = 0; m < POD_MAX_NRBF; ++m) {
-      const bool on = (m < nr3);
-      rb[m]  = on ? rbf (j + Nij*m) : (KK_FLOAT) 0.0;
-      drb[m] = on ? drbf(j + Nij*m) : (KK_FLOAT) 0.0;
-    }
+    KK_FLOAT rb[NR > 0 ? NR : 1], drb[NR > 0 ? NR : 1];
+    pod_static_for<NR>([&](auto m) {
+      rb[m]  = rbf (j + Nij*m);
+      drb[m] = drbf(j + Nij*m);
+    });
 
-    // two-body (drbf = R'/r): A00 = 1 -> accumulate to fcAdR
+    // two-body (drbf = R'): A00 = 1 -> accumulate to fcAdR
     KK_ACC_FLOAT fcAdR = 0.0;
     if constexpr (BSPLINE) {
       const int i2 = ia + Ni*(base(j) + nr2*te);
@@ -2135,60 +2136,88 @@ struct PODAllBodyForceFunctor {
         fcAdR += cb2(i2 + Ni*s) * drbf2(j + Nij*s);
     } else {
       const int i2 = ia + Ni*nr2*te;
-      #pragma unroll
-      for (int m = 0; m < POD_MAX_NRBF; ++m)
-        if (m < nr3) fcAdR += cb2(i2 + Ni*m) * drb[m];
-      for (int m = nr3; m < nr2; ++m)
+      pod_static_for<NR>([&](auto m) { fcAdR += cb2(i2 + Ni*m) * drb[m]; });
+      for (int m = NR; m < nr2; ++m)
         fcAdR += cb2(i2 + Ni*m) * drbf2(j + Nij*m);
     }
 
     // many-body: fcRdA + fcAdR
+    // fcAdR = sum dR     u^(p  ) v^(q  ) w^(r  )
+    // Du    = sum  R  p  u^(p-1) v^(q  ) w^(r  )
+    // Dv    = sum  R  q  u^(p  ) v^(q-1) w^(r  )
+    // Dw    = sum  R  r  u^(p  ) v^(q  ) w^(r-1)
+    // Nested Horner in decreasing polynomial degree (w -> v -> u)
     const int NeK3 = ne * K3;
-    const int ii   = te + NeK3 * nr3 * ia;
+    const int ii   = te + NeK3 * NR * ia;
 
-    KK_ACC_FLOAT Du = 0.0, Dv = 0.0, Dw = 0.0;
-    KK_FLOAT wr = 1.0, wrm1 = 0.0;
-    for (int r = 0; r <= P3; ++r) {
-      KK_FLOAT vq = 1.0, vqm1 = 0.0;
-      for (int q = 0; q + r <= P3; ++q) {
-        const KK_FLOAT vw  = vq * wr;
-        const KK_FLOAT vwv = (KK_FLOAT) q * vqm1 * wr;
-        const KK_FLOAT vww = (KK_FLOAT) r * vq * wrm1;
+    // w-dir: value(dR) / value(R) / d/du / d/dv / d/dw
+    KK_ACC_FLOAT E3 = 0.0, F3 = 0.0, Du = 0.0, Dv = 0.0, Dw = 0.0;
 
-        int d  = q + r;
-        int k  = npa(d) + (d+1)*r - (r*(r-1))/2 + q;
-        int nm = nmono(d);
-        KK_FLOAT up = 1.0, upm1 = 0.0;
+    #pragma unroll
+    for (int r = MD; r >= 0; --r) {
+      const int QM = MD - r;
+      // v-dir: value(dR) / value(R) / d/du / d/dv
+      KK_ACC_FLOAT E2 = 0.0, F2 = 0.0, Gu2 = 0.0, Gv2 = 0.0;
 
-        for (int p = 0; p + q + r <= P3; ++p) {
-          const int b = ii + ne * k;
+      #pragma unroll
+      for (int q = QM; q >= 0; --q) {
+        const int PM = QM - q;
+        // u-dir: value(dR) / value(R) / d/du
+        KK_ACC_FLOAT E1 = 0.0, F1 = 0.0, Gu1 = 0.0;
+
+        #pragma unroll
+        for (int p = PM; p >= 0; --p) {
+          const int b = ii + ne * pod_mono_index(p, q, r);
           KK_ACC_FLOAT fcR = 0.0, fcdR = 0.0;
-          #pragma unroll
-          for (int m = 0; m < POD_MAX_NRBF; ++m) {
-            if (m < nr3) {
-              const KK_FLOAT c = fc(b + NeK3*m);
-              fcR  += c * rb[m];
-              fcdR += c * drb[m];
-            }
-          }
-          fcAdR += fcdR * (up * vw);
-          Du += fcR * ((KK_FLOAT) p * upm1 * vw);
-          Dv += fcR * (up * vwv);
-          Dw += fcR * (up * vww);
+          pod_static_for<NR>([&](auto m) {
+            const KK_FLOAT c = fc(b + NeK3*m);
+            fcR  += c * rb[m];
+            fcdR += c * drb[m];
+          });
 
-          upm1 = up;  up *= u;
-          k += nm + r;  nm += d + 2;  ++d;
+          if (p == PM) {                 // leading term: no multiply
+            E1 = fcdR;
+            F1 = fcR;                    // Gu1 = 0
+          } else {                       // derivative first (reuse F1)
+            Gu1 = (p == PM-1) ? F1 : Gu1*u + F1;
+            F1  = F1*u + fcR;
+            E1  = E1*u + fcdR;
+          }
         }
-        vqm1 = vq;  vq *= v;
+
+        // fold u- into v- polynomial
+        if (q == QM) {                   // leading term (PM == 0 -> Gu1 = 0)
+          E2 = E1;
+          F2 = F1;                       // Gu2, Gv2 = 0
+        } else {
+          const bool second = (q == QM-1);
+          Gv2 = second ? F2  : Gv2*v + F2;    // d/dv, reuse F2
+          Gu2 = second ? Gu1 : Gu2*v + Gu1;
+          F2  = F2*v + F1;
+          E2  = E2*v + E1;
+        }
       }
-      wrm1 = wr;  wr *= w;
+
+      // fold v- into w- polynomial
+      if (r == MD) {                     // leading term (QM == 0 -> Gu2, Gv2 = 0)
+        E3 = E2;
+        F3 = F2;                         // Du, Dv, Dw = 0
+      } else {
+        const bool third = (r == MD-1);
+        Dw = third ? F3  : Dw*w + F3;    // d/dw, reuse F3
+        Du = third ? Gu2 : Du*w + Gu2;
+        Dv = third ? Gv2 : Dv*w + Gv2;
+        F3 = F3*w + F2;
+        E3 = E3*w + E2;
+      }
     }
+    fcAdR += E3;
 
     // Jacobian: J = d(u,v,w) / d(x,y,z) = (I - rhat rhat^T) / r
     // f_ij = fc * d(R * A) = J * Dr_hat + fc * A * r_hat
-    //      = D/r + (fcAdR r - (D*u)/r) u
+    //      = Dr_hat/r + (fcAdR - (Dr_hat*r_hat)/r) r_hat
     const KK_ACC_FLOAT g  = Du*u + Dv*v + Dw*w;
-    const KK_ACC_FLOAT sr = fcAdR*dij - g*invr;
+    const KK_ACC_FLOAT sr = fcAdR - g*invr;
     const KK_ACC_FLOAT fx = Du*invr + sr*u;
     const KK_ACC_FLOAT fy = Dv*invr + sr*v;
     const KK_ACC_FLOAT fz = Dw*invr + sr*w;
@@ -2240,21 +2269,26 @@ void PairPODKokkos<DeviceType>::allbody_forces(t_pod_1d l_fij, t_pod_1d l_cb2, i
     error->one(FLERR, "Pair style pod/kk supports at most {} three-body radial basis functions "
                "without the native AMD GPU kernels", POD_MAX_NRBF);
   const bool vg = (vflag_global != 0);
-  if (use_bspline) {
-    if (vg) allbody_forces_impl<true,  true >(l_fij, l_cb2, Ni, Nij);
-    else    allbody_forces_impl<true,  false>(l_fij, l_cb2, Ni, Nij);
-  } else {
-    if (vg) allbody_forces_impl<false, true >(l_fij, l_cb2, Ni, Nij);
-    else    allbody_forces_impl<false, false>(l_fij, l_cb2, Ni, Nij);
-  }
+  pod_dispatch_int<0, POD_MAX_NRBF>(nrbf3, [&](auto NR) {
+    pod_dispatch_int<0, POD_MAX_DEG>(P3, [&](auto MD) {
+      constexpr int nr = decltype(NR)::value, md = decltype(MD)::value;
+      if (use_bspline) {
+        if (vg) this->template allbody_forces_impl<true,  true,  nr, md>(l_fij, l_cb2, Ni, Nij);
+        else    this->template allbody_forces_impl<true,  false, nr, md>(l_fij, l_cb2, Ni, Nij);
+      } else {
+        if (vg) this->template allbody_forces_impl<false, true,  nr, md>(l_fij, l_cb2, Ni, Nij);
+        else    this->template allbody_forces_impl<false, false, nr, md>(l_fij, l_cb2, Ni, Nij);
+      }
+    });
+  });
 }
 
 template<class DeviceType>
-template<bool BSPLINE, bool VGLOBAL>
+template<bool BSPLINE, bool VGLOBAL, int NR, int MD>
 void PairPODKokkos<DeviceType>::allbody_forces_impl(t_pod_1d l_fij, t_pod_1d l_cb2,
                                                     const int Ni, const int Nij)
 {
-  PODAllBodyForceFunctor<DeviceType, BSPLINE, POD_FUSE_FORCE_TALLY, VGLOBAL> fn;
+  PODAllBodyForceFunctor<DeviceType, BSPLINE, POD_FUSE_FORCE_TALLY, VGLOBAL, NR, MD> fn;
   fn.rr = rr;       fn.rhat = rhat;
   fn.rbf = rbf;     fn.drbf = drbf;   fn.drbf2 = drbf2;
   fn.fc = forcecoeff;
