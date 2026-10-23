@@ -41,6 +41,15 @@ static constexpr double DELTAFLIP = 0.1;
 static constexpr double TILTMAX = 1.5;
 static constexpr double EPSILON = 1.0e-6;
 
+// the per-atom kernels use the whole fix as functor, which is larger than
+// what Kokkos passes as kernel argument by default (512 bytes).  Larger
+// functors are copied to constant memory before each launch, and the next
+// such launch waits on the host for the kernel, so the host can not queue
+// work ahead of the GPU.  The light weight hint passes functors of up to
+// 4 KB as kernel arguments instead.
+
+using LightWeight = Kokkos::Experimental::WorkItemProperty::HintLightWeight_t;
+
 enum{NOBIAS,BIAS};
 enum{NONE,XYZ,XY,YZ,XZ};
 enum{ISO,ANISO,TRICLINIC};
@@ -590,9 +599,9 @@ void FixNHKokkos<DeviceType>::nh_v_press()
 
   copymode = 1;
   if (pstyle == TRICLINIC)
-    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nh_v_press<1> >(0,nlocal),*this);
+    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nh_v_press<1>, LightWeight>(0,nlocal),*this);
   else
-    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nh_v_press<0> >(0,nlocal),*this);
+    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nh_v_press<0>, LightWeight>(0,nlocal),*this);
   copymode = 0;
 
   atomKK->modified(execution_space,V_MASK);
@@ -651,9 +660,9 @@ void FixNHKokkos<DeviceType>::nve_v()
 
   copymode = 1;
   if (rmass.data())
-    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nve_v<1> >(0,nlocal),*this);
+    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nve_v<1>, LightWeight>(0,nlocal),*this);
   else
-    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nve_v<0> >(0,nlocal),*this);
+    Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nve_v<0>, LightWeight>(0,nlocal),*this);
   copymode = 0;
 
   atomKK->modified(execution_space,V_MASK);
@@ -700,7 +709,7 @@ void FixNHKokkos<DeviceType>::nve_x()
   // x update by full step only for atoms in group
 
   copymode = 1;
-  Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nve_x>(0,nlocal),*this);
+  Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nve_x, LightWeight>(0,nlocal),*this);
   copymode = 0;
 
   // claim the coordinates after the kernel has written them, not before: a
@@ -747,7 +756,7 @@ void FixNHKokkos<DeviceType>::nh_v_temp()
   atomKK->sync(execution_space,V_MASK | MASK_MASK);
 
   copymode = 1;
-  Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nh_v_temp>(0,nlocal),*this);
+  Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType, TagFixNH_nh_v_temp, LightWeight>(0,nlocal),*this);
   copymode = 0;
 
   atomKK->modified(execution_space,V_MASK);

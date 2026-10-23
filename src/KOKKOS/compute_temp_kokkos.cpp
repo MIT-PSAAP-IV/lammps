@@ -23,6 +23,11 @@
 
 using namespace LAMMPS_NS;
 
+// the reductions use the whole compute as functor; see fix_nh_kokkos.cpp
+// for why it is passed as kernel argument
+
+using LightWeight = Kokkos::Experimental::WorkItemProperty::HintLightWeight_t;
+
 /* ---------------------------------------------------------------------- */
 
 template<class DeviceType>
@@ -61,9 +66,9 @@ double ComputeTempKokkos<DeviceType>::compute_scalar()
 
   copymode = 1;
   if (atomKK->rmass)
-    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempScalar<1> >(0,nlocal),*this,t_kk);
+    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempScalar<1>, LightWeight>(0,nlocal),*this,t_kk);
   else
-    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempScalar<0> >(0,nlocal),*this,t_kk);
+    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempScalar<0>, LightWeight>(0,nlocal),*this,t_kk);
   copymode = 0;
 
   t = t_kk.t0; // could make this more efficient
@@ -119,9 +124,9 @@ void ComputeTempKokkos<DeviceType>::compute_vector()
 
   copymode = 1;
   if (atomKK->rmass)
-    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempVector<1> >(0,nlocal),*this,t_kk);
+    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempVector<1>, LightWeight>(0,nlocal),*this,t_kk);
   else
-    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempVector<0> >(0,nlocal),*this,t_kk);
+    Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagComputeTempVector<0>, LightWeight>(0,nlocal),*this,t_kk);
   copymode = 0;
 
   t[0] = t_kk.t0;
