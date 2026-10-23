@@ -740,6 +740,14 @@ __device__ inline void pod_exponents_table(int *ex_s, const int *pq_ex, const in
   for (int k = threadIdx.x; k < K3; k += blockDim.x) ex_s[k] = pq_ex[k];
 }
 
+// LMP_POD_RAS_X0 (HF instance): the power table keeps one x^0 = 1 entry per pair instead of one per
+// direction ([1, u..u^L, v..v^L, w..w^L], 10 instead of 12 values with L = 3) and the exponents
+// are read from pq_ex instead of an LDS copy, so that the block needs at most 2048 bytes of LDS
+// (8 waves per SIMD instead of 6)
+#ifndef LMP_POD_RAS_X0
+#define LMP_POD_RAS_X0 1
+#endif
+
 // RTM x CTM output tiles (RTM >= ceil(K3/16), CTM >= ceil(Ne*nrbf3/16)) are kept in registers
 // PF 1: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
 // loaded while the current tile is on the matrix cores, and all lanes fill the tile.
@@ -762,9 +770,11 @@ __global__ void __launch_bounds__(64)
   const int jtile = HF ? PodHf::jtile : jtile_in;
   extern __shared__ char lds_raw[];
   const int L1 = L + 1;
-  T *pow_s = reinterpret_cast<T *>(lds_raw);      // [jtile][3][L1]
+  constexpr bool X0 = HF && (PF == 2) && LMP_POD_RAS_X0;
+  const int PW = X0 ? 1 + 3 * L : 3 * L1;         // power table entries per pair
+  T *pow_s = reinterpret_cast<T *>(lds_raw);      // [jtile][3][L1] (X0: [jtile][1 + 3 L])
   const int ldr = jtile + 1;                      // padded row: functions m of a pair in different banks
-  T *rbf_s = pow_s + jtile * 3 * L1;              // [nrbf3][ldr]
+  T *rbf_s = pow_s + jtile * PW;                  // [nrbf3][ldr]
   int *tj_s = reinterpret_cast<int *>(rbf_s + nrbf3 * ldr);    // [jtile]
   int *ex_s = tj_s + jtile;                                      // [K3] packed a | b<<8 | c<<16
 
@@ -777,8 +787,10 @@ __global__ void __launch_bounds__(64)
   const int lr = lane & 15, lq = lane >> 4;
   const int RT = (K3 + 15) / 16, CT = (NC + 15) / 16;
 
-  pod_exponents_table(ex_s, pq_ex, K3);
-  __syncthreads();
+  if constexpr (!X0) {
+    pod_exponents_table(ex_s, pq_ex, K3);
+    __syncthreads();
+  }
 
   // exponents of the A rows owned by this lane (offsets into pow_s), and the
   // (m, e) of the B columns owned by this lane
@@ -786,10 +798,11 @@ __global__ void __launch_bounds__(64)
 #pragma unroll
   for (int rt = 0; rt < RTM; rt++) {
     const int k = rt * 16 + lr;
-    const int ex = (k < K3) ? ex_s[k] : 0;
-    oa[rt] = ex & 255;
-    ob[rt] = L1 + ((ex >> 8) & 255);
-    oc[rt] = 2 * L1 + ((ex >> 16) & 255);
+    const int ex = (k < K3) ? (X0 ? pq_ex[k] : ex_s[k]) : 0;
+    const int ea = ex & 255, eb = (ex >> 8) & 255, ec = (ex >> 16) & 255;
+    oa[rt] = ea;
+    ob[rt] = X0 ? (eb ? L + eb : 0) : L1 + eb;
+    oc[rt] = X0 ? (ec ? 2 * L + ec : 0) : 2 * L1 + ec;
   }
   int bm[CTM], be[CTM];
 #pragma unroll
@@ -839,15 +852,24 @@ __global__ void __launch_bounds__(64)
           if (m == 0) tj_s[jj] = (jj < nt) ? ((nelements > 1) ? tj[start + j0 + jj] : 0) : -1;
         } else {
           const int q = t - nr, jj = q / 3, d = q - 3 * jj;
-          T *pw = pow_s + jj * 3 * L1 + d * L1;
           T x = T(0), p = T(0);
           if (jj < nt) {
             x = pg.rhat[start + j0 + jj + d * pg.N];
             p = static_cast<T>(1.0);
           }
-          for (int n = 0; n < L1; n++) {
-            pw[n] = p;
-            p *= x;
+          if constexpr (X0) {
+            T *pw = pow_s + jj * PW;
+            if (d == 0) pw[0] = p;
+            for (int n = 1; n <= L; n++) {
+              p *= x;
+              pw[d * L + n] = p;
+            }
+          } else {
+            T *pw = pow_s + jj * 3 * L1 + d * L1;
+            for (int n = 0; n < L1; n++) {
+              pw[n] = p;
+              p *= x;
+            }
           }
         }
       }
@@ -898,7 +920,7 @@ __global__ void __launch_bounds__(64)
 
     for (int q = 0; q < nt4; q += 4) {
       const int jj = q + lq;
-      const T *pw = pow_s + jj * 3 * L1;
+      const T *pw = pow_s + jj * PW;
       const int tjj = tj_s[jj];
       TA a[RTM], b[CTM];
 #pragma unroll
@@ -960,7 +982,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     int L = 0;
     while ((L + 1) * (L + 2) * (L + 3) / 6 < K3) L++;
     if ((L + 1) * (L + 2) * (L + 3) / 6 != K3) return false;
-    const size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
+    size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
         ((size_t) jtile + K3) * sizeof(int);
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
     const int pf = spread ? 2 : ((prefetch && (4 * jtile <= 64)) ? 1 : 0);
@@ -971,6 +993,8 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     // the Hf instance: one element, K3 20, the spread fill with a tile of 16 pairs
     const bool hfi = hf && (nelements == 1) && (K3 == PodHf::K3) && (L == PodHf::L) &&
         (jtile == PodHf::jtile) && (pf == 2);
+    if (hfi && LMP_POD_RAS_X0)
+      lds2 = ((size_t) (1 + 3 * L + nrbf3) * jtile + nrbf3) * sizeof(T) + (size_t) jtile * sizeof(int);
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
   do {                                                                                           \
     if (pf == 2) LMP_POD_RAS_MFMA1(R, C, 2, false);                                              \
