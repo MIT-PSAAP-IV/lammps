@@ -67,29 +67,30 @@ class PairPODKokkos : public PairPOD {
   typedef Kokkos::View<KK_FLOAT**, DeviceType> t_fparams;
   t_fparams d_cutsq, d_scale;
   typename AT::t_int_1d d_map;
+  typename AT::t_int_1d d_ks;
+  typename AT::t_int_1d d_kn;
 
   friend void pair_virial_fdotr_compute<PairPODKokkos>(PairPODKokkos*);
 
   void grow(int, int);
   void copy_from_pod_class(EAPOD *podptr);
-  void divideInterval(int *intervals, int N, int M) override;
-  int calculateNumberOfIntervals(int N, int intervalSize) override;
-  void grow_atoms(int Ni) override;
-  void grow_pairs(int Nij) override;
+  void divideInterval(int *intervals, int N, int M);
+  int calculateNumberOfIntervals(int N, int intervalSize);
+  void grow_atoms(int Ni);
+  void grow_pairs(int Nij);
 
   void allocate() override;
   double memory_usage() override;
 
   typedef Kokkos::View<int*, DeviceType> t_pod_1i;
   typedef Kokkos::View<KK_FLOAT*, DeviceType> t_pod_1d;
-//   typedef Kokkos::View<int**, DeviceType> t_pod_2i;
-//   typedef Kokkos::View<KK_FLOAT**, DeviceType> t_pod_2d;
+//  typedef Kokkos::View<int**, DeviceType> t_pod_2i;
+  typedef Kokkos::View<KK_FLOAT**, DeviceType> t_pod_2d;
 //   typedef Kokkos::View<KK_FLOAT**[3], DeviceType> t_pod_3d3;
 
   int atomBlockSize;        // size of each atom block
   int nAtomBlocks;          // number of atoms blocks
   int atomBlocks[101];      // atom blocks
-  double comptime[100];
   int timing;
 
   int ni;            // number of atoms i in the current atom block
@@ -102,82 +103,161 @@ class PairPODKokkos : public PairPOD {
   int besseldegree; // degree of Bessel functions
   int inversedegree; // degree of inverse functions
   int nbesselpars;  // number of Bessel parameters
-  int nCoeffPerElement; // number of coefficients per element = (nl1 + Mdesc*nClusters)
-  int ns;      // number of snapshots for radial basis functions
-  int nl1, nl2, nl3, nl4, nl23, nl33, nl34, nl44, nl;   // number of local descriptors
-  int nrbf2, nrbf3, nrbf4, nrbfmax;            // number of radial basis functions
-  int nabf3, nabf4;                            // number of angular basis functions
-  int K3, K4, Q4;                                  // number of monomials
+  int nCoeffPerElement; // number of coefficients per element (nl1 + Mdesc*nClusters)
+  int ns;               // number of snapshots for Bessel radial basis functions
+  int nrbfmax;          // number of orthogonal radial basis functions to keep (<=ns)
+  int nl1, nl2, nl3, nl4, nl33, nl34, nl44, nl;   // number of local descriptors
+  int nrbf2, nrbf3, nrbf4;            // number of radial basis functions
+  int nabf3, nabf4;                   // number of angular basis functions
+  int K3, K4, Q4;                     // number of monomials
+  int P3, P4;                         // angular polynomial degrees
+  int nabf3_active, nabf4_active;
 
   // environmental variables
   int nClusters; // number of environment clusters
   int nComponents; // number of principal components
   int Mdesc; // number of base descriptors
 
-  double rin;  // inner cut-off radius
-  double rcut; // outer cut-off radius
-  double rmax; // rcut - rin
-  double rcutsq;
+  // local environmental variables
+  bool eapod;
+  bool localeapod;
+  KK_FLOAT nActiveClusters; // average number of active clusters
+  int nMaxActiveClusters; // maximum (possible) number of active clusters
 
-  t_pod_1d rij;         // (xj - xi) for all pairs (I, J)
-  t_pod_1d fij;         // force for all pairs (I, J)
+  int hat_p;   // order of hat basis function
+  int hat_q;   // order of hat function
+  int hat_q1;   // order of hat function
+  int hat_pq;    // hat_p * hat_q
+
+  bool use_hermite;
+  int nhermite_bins;
+  t_pod_1d hermite_r0, hermite_invdr, rbf_hermite_coeffs;
+
+  bool use_bspline;         // flag for two-body cubic B-splines RBF
+  int bs_ileft;             // 0 if left open (knots=nrbf2), +3 if clamped both ends (knots=nrbf2+3)
+  int bs_nb;                // knots + bs_ileft intervals
+  t_pod_1d bs_r0, bs_invh;  // grid origin (rin), and knot spacing per pair
+  t_pod_1i bs_base;         // index of the first active B-splines per neighbor
+
+  t_pod_2d rin;  // inner cut-off radius
+  t_pod_2d rcut; // outer cut-off radius
+  t_pod_2d rdiff; // rcut - rin
+  t_pod_2d invrdiff; // 1 / rdiff
+  t_pod_2d rcutsq; // rcut*rcut
+
+  t_pod_1d rr;          // r = norm(rj - ri) for all pairs (I,J)
+  t_pod_1d rhat;        // (rj - ri)/r for all pairs (I, J), SoA: rhat(n + Nij*d), d = 0,1,2
+  t_pod_1d fij;         // force for all pairs (I, J) only allocated if POD_FUSE_FORCE_TALLY == false
+
   t_pod_1d ei;          // energy for each atom I
-  t_pod_1i typeai;         // types of atoms I only
-  t_pod_1i numij;          // number of pairs (I, J) for each atom I
-  t_pod_1i idxi;           // storing linear indices of atom I for all pairs (I, J)
-  t_pod_1i ai;             // IDs of atoms I for all pairs (I, J)
-  t_pod_1i aj;             // IDs of atoms J for all pairs (I, J)
-  t_pod_1i ti;             // types of atoms I for all pairs (I, J)
-  t_pod_1i tj;             // types of atoms J for all pairs (I, J)
+  t_pod_1i typeai;      // types of atoms I only
+  t_pod_1i numij;       // number of pairs (I, J) for each atom I
+  t_pod_1i idxi;        // storing linear indices of atom I for all pairs (I, J)
+  t_pod_1i ai;          // IDs of atoms I for all pairs (I, J)
+  t_pod_1i aj;          // IDs of atoms J for all pairs (I, J)
+  t_pod_1i ti;          // types of atoms I for all pairs (I, J)
+  t_pod_1i tj;          // types of atoms J for all pairs (I, J)
 
-  t_pod_1d besselparams;
+  t_pod_1d bessel_neg_alpha;
+  t_pod_1d bessel_pi_inv_t1;
+  t_pod_1d bessel_dx_factor;
   t_pod_1d Phi;  // eigenvectors matrix ns x ns
-  t_pod_1d rbf;  // radial basis functions nij x nrbfmax
-  t_pod_1d rbfx; // x-derivatives of radial basis functions nij x nrbfmax
-  t_pod_1d rbfy; // y-derivatives of radial basis functions nij x nrbfmax
-  t_pod_1d rbfz; // z-derivatives of radial basis functions nij x nrbfmax
-  t_pod_1d abf;  // angular basis functions nij x K3
-  t_pod_1d abfx; // x-derivatives of angular basis functions nij x K3
-  t_pod_1d abfy; // y-derivatives of angular basis functions nij x K3
-  t_pod_1d abfz; // z-derivatives of angular basis functions nij x K3
+  t_pod_1d rbf;   // many-body radial basis functions   nij x nrbfmax
+  t_pod_1d drbf;  // dR/dr / r of the above             nij x nrbfmax
+  t_pod_1d rbf2;  // two-body radial basis: alias of rbf, or 4 B-spline
+  t_pod_1d drbf2; // dR/dr / r of the above
+  t_pod_1d rbft, drbft;  // scratch for the Bessel snapshots  nij x ns
+
   t_pod_1d sumU; // sum of radial basis functions ni x K3 x nrbfmax x nelements
   t_pod_1d forcecoeff; // force coefficients ni x K3 x nrbfmax x nelements
   t_pod_1d Proj; // PCA Projection matrix
   t_pod_1d Centroids; // centroids of the clusters
+  t_pod_1d invLeftClusterRcut2; // // Left-hand side squared cutoff redius for each cluster (nClusters x nelements)
+  t_pod_1d invRightClusterRcut2;  // Right-hand side squared cutoff redius for each cluster (nClusters x nelements)
+  t_pod_1d leftClusterEdges;   // Left-hand side edge activation position for each cluster (nClusters x nelements)
+  t_pod_1d rightClusterEdges;  // Right-hand side edge activation position for each cluster (nClusters x nelements)
+
   t_pod_1d bd;   // base descriptors ni x Mdesc
   t_pod_1d cb;   // force coefficients for base descriptors ni x Mdesc
   t_pod_1d pd;   // environment probability descriptors ni x (1 + nComponents + 3*nClusters)
   t_pod_1d coefficients; // coefficients nCoeffPerElement x nelements
-  t_pod_1i pq3, pn3, pc3; // arrays to compute 3-body angular basis functions
+  t_pod_1i pq_m, pq_d, pn3, pc3; // arrays to compute 3-body angular basis functions
   t_pod_1i pa4, pb4, pc4; // arrays to compute 4-body angular basis functions
   t_pod_1i ind33l, ind33r; // nl33
   t_pod_1i ind34l, ind34r; // nl34
   t_pod_1i ind44l, ind44r; // nl44
-  t_pod_1i elemindex;
+  t_pod_1i p3_active, p4_active;
+
+  t_pod_1i pq_f;         // [P3*K3] directions in {0,1,2,3}: 0->1.0, 1->u, 2->v, 3->w
+
+  void build_monomial_factors(t_pod_1i d_pq_m, t_pod_1i d_pq_d, const int K3);
+
+  void radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf, t_pod_1d l_rhat,
+                        t_pod_1i l_tj, t_pod_1i l_numij, const int l_nelements,
+                        const int nrbf3, const int K3, const int P3, int Ni, int Nij);
+
+  template<int NE, int NR, int MD>
+  void radialangularsum_impl(t_pod_1d l_sumU, t_pod_1d l_rbf, t_pod_1d l_rhat,
+                             t_pod_1i l_tj, t_pod_1i l_numij,
+                             const int K3, int Ni, int Nij);
+
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  static void cutoff_exp(const KK_FLOAT, const KK_FLOAT, const KK_FLOAT, KK_FLOAT &, KK_FLOAT &);
+
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  static void cluster_cutoff_poly_sq(const KK_FLOAT, const KK_FLOAT, KK_FLOAT &, KK_FLOAT &);
+
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  static void cluster_cutoff_hat(const KK_FLOAT, const KK_FLOAT, KK_FLOAT &, KK_FLOAT &);
+
+  KOKKOS_INLINE_FUNCTION
+  static void bspline4(const KK_FLOAT t, const KK_FLOAT dscale,
+                       KK_FLOAT &B0,  KK_FLOAT &B1,  KK_FLOAT &B2,  KK_FLOAT &B3,
+                       KK_FLOAT &dB0, KK_FLOAT &dB1, KK_FLOAT &dB2, KK_FLOAT &dB3);
+
+  KOKKOS_INLINE_FUNCTION
+  static KK_FLOAT sel4(const int i, const KK_FLOAT v0, const KK_FLOAT v1,
+                                    const KK_FLOAT v2, const KK_FLOAT v3);
 
   void set_array_to_zero(t_pod_1d a, int N);
 
-  int NeighborCount(t_pod_1i, double, int, int);
+  int NeighborCount(t_pod_1i, int, int);
 
-  void NeighborList(t_pod_1d l_rij, t_pod_1i l_numij,  t_pod_1i l_typeai, t_pod_1i l_idxi,
-    t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj, double l_rcutsq, int gi1, int Ni);
+  void NeighborList(t_pod_1d l_rr, t_pod_1d l_rhat, t_pod_1i l_numij, t_pod_1i l_typeai,
+    t_pod_1i l_idxi, t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj,
+    int gi1, int Ni, int Nij);
 
-  void radialbasis(t_pod_1d rbft, t_pod_1d rbftx, t_pod_1d rbfty, t_pod_1d rbftz,
-    t_pod_1d rij, t_pod_1d l_besselparams, double l_rin, double l_rmax, int l_besseldegree,
-    int l_inversedegree, int l_nbesselpars, int Nij);
+  void radialbasis(
+    t_pod_1d rbft, t_pod_1d drbft,
+    t_pod_1d rr, t_pod_2d l_rin, t_pod_2d l_invrdiff,
+    t_pod_1d l_neg_alpha, t_pod_1d l_pi_inv_t1, t_pod_1d l_dx_factor,
+    t_pod_1i l_ti, t_pod_1i l_tj,
+    int l_nelements, int l_besseldegree, int l_inversedegree, int l_nbesselpars, int Nij);
 
-  void matrixMultiply(t_pod_1d a, t_pod_1d b, t_pod_1d c, int r1, int c1, int c2);
+  void radialPhi(t_pod_1d rbft, t_pod_1d drbft, t_pod_1d Phi,
+                 t_pod_1d rbf, t_pod_1d drbf, int Nij, int ns, int nrbfmax);
 
-  void angularbasis(t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
-        t_pod_1d l_rij, t_pod_1i l_pq3, int l_K3, int N);
+  void radialbasis_hermite(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rr, t_pod_1i ti, t_pod_1i tj, int N);
 
-  void radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf, t_pod_1d l_abf, t_pod_1i l_tj,
-    t_pod_1i l_numij, const int l_nelements, const int l_nrbf3, const int l_K3, const int Ni, const int Nij);
+  void radialbasis_bspline(t_pod_1d l_rbf2, t_pod_1d l_drbf2, t_pod_1d l_rr,
+                           t_pod_1i l_base, t_pod_1i ti, t_pod_1i tj, int N);
 
-  void twobodydesc(t_pod_1d d2, t_pod_1d l_rbf, t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
+  void twobodydesc_bspline(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_1i l_base,
+                           t_pod_1i l_idxi, t_pod_1i l_tj,
+                           int l_nrbf2, const int Ni, const int Nij);
 
-  void threebodydesc(t_pod_1d d3, t_pod_1d l_sumU, t_pod_1i l_pc3, t_pod_1i l_pn3,
-        int l_nelements, int l_nrbf3, int l_nabf3, int l_K3, const int Ni);
+  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
+                              t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj,
+                              int l_nrbf2, const int Ni, const int Nij);
+
+  void twobodydesc(t_pod_1d d2, t_pod_1d l_rbf2, t_pod_1i l_idxi, t_pod_1i l_tj,
+                   int l_nrbf2, const int Ni, const int Nij);
+
+  void threebodydesc(t_pod_1d d3, t_pod_1d l_sumU, t_pod_1i l_pc3, t_pod_1i l_pn3, t_pod_1i p3_active,
+        int l_nelements, int l_nrbf3, int l_nabf3_active, int l_K3, const int Ni);
 
   void fourbodydesc(t_pod_1d d4,  t_pod_1d l_sumU, t_pod_1i l_pa4, t_pod_1i l_pb4, t_pod_1i l_pc4,
       int l_nelements, int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni);
@@ -189,33 +269,28 @@ class PairPODKokkos : public PairPOD {
   void blockatom_base_descriptors(t_pod_1d bd, int Ni, int Nij);
   void blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
+  void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
-  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_rbfx, t_pod_1d l_rbfy, t_pod_1d l_rbfz,
-          t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
-  void threebody_forces(t_pod_1d fij, t_pod_1d cb3, t_pod_1d l_rbf, t_pod_1d l_rbfx,
-    t_pod_1d l_rbfy, t_pod_1d l_rbfz, t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
-    t_pod_1d l_sumU, t_pod_1i l_idxi, t_pod_1i l_tj, t_pod_1i l_pc3, t_pod_1i l_pn3, t_pod_1i l_elemindex,
-    int l_nelements, int l_nrbf3, int l_nabf3, int l_K3, int Ni, int Nij);
-  void fourbody_forces(t_pod_1d fij, t_pod_1d cb4, t_pod_1d l_rbf, t_pod_1d l_rbfx, t_pod_1d l_rbfy,
-    t_pod_1d l_rbfz, t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz, t_pod_1d l_sumU,
-    t_pod_1i l_idxi, t_pod_1i l_tj, t_pod_1i l_pa4, t_pod_1i l_pb4, t_pod_1i l_pc4,
-    int l_nelements, int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni, int Nij);
+  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
+                      t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3, t_pod_1d l_sumU, t_pod_1i l_pc3,
-    t_pod_1i l_pn3, t_pod_1i l_elemindex, int l_nelements, int l_nrbf3, int l_nabf3, int l_K3, int Ni);
+    t_pod_1i l_pn3, t_pod_1i p3_active, int l_nelements, int l_nrbf3, int l_nabf3_active, int l_K3, int Ni);
 
   void fourbody_forcecoeff(t_pod_1d fb4, t_pod_1d cb4, t_pod_1d l_sumU, t_pod_1i l_pa4,
     t_pod_1i l_pb4, t_pod_1i l_pc4, int l_nelements, int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni);
 
-  void allbody_forces(t_pod_1d fij, t_pod_1d l_forcecoeff, t_pod_1d l_rbf, t_pod_1d l_rbfx,
-    t_pod_1d l_rbfy, t_pod_1d l_rbfz, t_pod_1d l_abf, t_pod_1d l_abfx, t_pod_1d l_abfy, t_pod_1d l_abfz,
-    t_pod_1i l_idxi, t_pod_1i l_tj, int l_nelements, int l_nrbf3, int l_K3, int Nij);
+  // Fused pair forces + force tally + global/per-atom virial
+  void allbody_forces(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
+
+  template<bool BSPLINE, bool VGLOBAL, int NR, int MD>
+  void allbody_forces_impl(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
 
   void blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij);
   void tallyenergy(t_pod_1d l_ei, int istart, int Ni);
   void tallyforce(t_pod_1d l_fij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij);
-  void tallystress(t_pod_1d l_fij, t_pod_1d l_rij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij);
 
+  int getStreamingProcessorCount();
 };
 }    // namespace LAMMPS_NS
 

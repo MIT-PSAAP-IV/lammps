@@ -56,7 +56,7 @@ ComputePODLocal::ComputePODLocal(LAMMPS *lmp, int narg, char **arg) :
   int numdesc = podptr->Mdesc * podptr->nClusters;
   size_array_rows = 1 + 3*atom->natoms;
   size_array_cols = atom->natoms*numdesc;
-  cutmax = podptr->rcut;
+  cutmax = podptr->rcutmax;
 
   nijmax = 0;
 }
@@ -127,10 +127,11 @@ void ComputePODLocal::compute_array()
   int *type = atom->type;
   int *ilist = list->ilist;
   int inum = list->inum;
+  int nelements = podptr->nelements;
   int nClusters = podptr->nClusters;
   int Mdesc = podptr->Mdesc;
-
-  double rcutsq = podptr->rcut*podptr->rcut;
+  bool localeapod = podptr->localeapod;
+  double **rcutsq = podptr->rcutsq;
 
   // determine the maximum number of neighbor list candidates for all local atoms
   // and allocate temporary memory accordingly.  a minimum of one guarantees that
@@ -156,19 +157,23 @@ void ComputePODLocal::compute_array()
     int i = ilist[ii];
 
     // get neighbor list for atom i
-    lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, i);
+    lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, nelements, i);
 
     if (nij > 0) {
       // peratom base descriptors
       double *bd = &podptr->bd[0];
       double *bdd = &podptr->bdd[0];
-      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, tj, nij);
+      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
 
       if (nClusters>1) {
         // peratom env descriptors
         double *pd = &podptr->pd[0];
         double *pdd = &podptr->pdd[0];
-        podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0] - 1,  nij);
+        if (localeapod) {
+          podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+        } else {
+          podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+        }
         for (int k = 0; k < nClusters; k++)
           for (int m = 0; m < Mdesc; m++) {
             int imk = m + Mdesc*k +  Mdesc*nClusters*i;
@@ -221,26 +226,27 @@ double ComputePODLocal::memory_usage()
 
 
 void ComputePODLocal::lammpsNeighborList(double **x, int **firstneigh, tagint *atomid, int *atomtypes,
-                               int *numneigh, double rcutsq, int gi)
+                               int *numneigh, double **rcutsq, int nelements, int gi)
 {
   nij = 0;
-  int itype = map[atomtypes[gi]] + 1;
+  int itype = map[atomtypes[gi]];
   ti[nij] = itype;
   int m = numneigh[gi];
   for (int l = 0; l < m; l++) {           // loop over each atom around atom i
     int gj = firstneigh[gi][l];           // atom j
+    int jtype = map[atomtypes[gj]];   // type of neighboring atom j
     double delx = x[gj][0] - x[gi][0];    // xj - xi
     double dely = x[gj][1] - x[gi][1];    // xj - xi
     double delz = x[gj][2] - x[gi][2];    // xj - xi
     double rsq = delx * delx + dely * dely + delz * delz;
-    if (rsq < rcutsq && rsq > 1e-20) {
+    if (rsq < rcutsq[itype][jtype] && rsq > 1e-20) {
       rij[nij * 3 + 0] = delx;
       rij[nij * 3 + 1] = dely;
       rij[nij * 3 + 2] = delz;
       ai[nij] = atomid[gi]-1;
       aj[nij] = atomid[gj]-1;
       ti[nij] = itype;
-      tj[nij] = map[atomtypes[gj]] + 1;
+      tj[nij] = jtype;
       nij++;
     }
   }
