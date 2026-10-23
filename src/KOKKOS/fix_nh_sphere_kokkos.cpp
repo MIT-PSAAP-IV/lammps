@@ -31,6 +31,7 @@ template <class DeviceType>
 FixNHSphereKokkos<DeviceType>::FixNHSphereKokkos(LAMMPS *lmp, int narg, char **arg) :
     FixNHKokkos<DeviceType>(lmp, narg, arg)
 {
+  this->fusable = 0;    // own nve_v(), nve_x(), nh_v_temp()
   if (!this->atom->omega_flag)
     this->error->all(FLERR, "Fix {} requires atom attribute omega", this->style);
   if (!this->atom->radius_flag)

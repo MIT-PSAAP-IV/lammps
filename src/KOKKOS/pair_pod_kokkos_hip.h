@@ -31,7 +31,6 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 
 namespace LAMMPS_NS {
@@ -42,39 +41,12 @@ static constexpr int MAX_RADIAL = 16;       // radial functions kept in register
 static constexpr int MAX_THREADS = 1024;    // HIP block size limit
 static constexpr int LDS_BUDGET = 32768;    // bytes of LDS used for neighbor tiles
 
-// study: LAMMPS_POD_OCC_WAVES = W > 0 adds LDS to the blocks of the native kernels launched
-// through launch() and the matrix core launch macros, so that about W waves per SIMD fit
-// (LDS is allocated in 512-byte granules, so the result is the nearest count above W)
-inline int occ_target()
-{
-  static int w = -1;
-  if (w < 0) {
-    const char *e = getenv("LAMMPS_POD_OCC_WAVES");
-    w = e ? atoi(e) : 0;
-  }
-  return w;
-}
-
-inline size_t occ_lds(const void *kernel, int nthreads, size_t lds)
-{
-  const int W = occ_target();
-  if (W <= 0) return lds;
-  hipFuncAttributes at;
-  if (hipFuncGetAttributes(&at, kernel) != hipSuccess) return lds;
-  const int wpb = (nthreads + 63) / 64;
-  const int bpc = std::max(1, 4 * W / wpb);
-  const size_t want = ((size_t) 65536 / bpc) & ~(size_t) 511;
-  const size_t have = at.sharedSizeBytes + lds;
-  return (want > have) ? lds + (want - have) : lds;
-}
-
 // launch helper: returns false if the launch failed; nothing to launch is success
 template <typename... P, typename... A>
 inline bool launch(void (*kernel)(P...), int nblocks, int nthreads, size_t lds, hipStream_t stream,
                    A... args)
 {
   if (nblocks <= 0) return true;
-  lds = occ_lds(reinterpret_cast<const void *>(kernel), nthreads, lds);
   hipLaunchKernelGGL(kernel, dim3(nblocks), dim3(nthreads), lds, stream, static_cast<P>(args)...);
   return hipGetLastError() == hipSuccess;
 }
@@ -86,10 +58,24 @@ inline int nblocks_for(long n, int nthreads)
 
 // geometry of the pairs (i, j) of a block: distance r and unit vector (u, v, w) = (rj - ri)/r,
 // stored as rhat[j + N*d], d = 0, 1, 2
+// the pairs of atom i are start .. start+nj-1: with ps == 0 numij holds the prefix sums of
+// the pair counts (start = numij[i]); with ps > 0 the pairs of atom i start at i*ps and
+// numij[i + 1] is their number (fixed-stride list of neighbor_fixed_kernel)
 template <typename T> struct PairGeom {
   const T *rr, *rhat;
   int N;
+  int ps;
   __device__ T r(const int j) const { return rr[j]; }
+  __device__ void range(const int *numij, const int i, int &start, int &nj) const
+  {
+    if (ps > 0) {
+      start = i * ps;
+      nj = numij[i + 1];
+    } else {
+      start = numij[i];
+      nj = numij[i + 1] - start;
+    }
+  }
   __device__ void uvw(const int j, T &u, T &v, T &w) const
   {
     u = rhat[j];
@@ -117,6 +103,9 @@ template <typename T> struct FcArgs {
   const T *cb3, *cb4, *sumU;    // sumU == nullptr: nothing to compute
   const int *pc3, *pn3, *p3_active, *pa4, *pb4, *pc4;
   int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
+  int ca, cm;    // coefficient k of atom i: cb3[i*ca + cm*k] (likewise cb4)
+  const int *qa, *qp;    // or nullptr: tables of the active index a of each 3-body term q
+                         // (or -1) and of the 4-body channel p of each 4-body term q
 };
 
 // force coefficients of atom i into f_s, with u_s (nelements * K3 * nrbf3 values), qa_s (K3)
@@ -126,7 +115,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
                                          int *qp_s, const int i)
 {
   const int nelements = g.nelements, nrbf3 = g.nrbf3, nabf3_active = g.nabf3_active;
-  const int K3 = g.K3, Q4 = g.Q4, Ni = g.Ni;
+  const int K3 = g.K3, Q4 = g.Q4, ca = g.ca, cm = g.cm;
   const int S = nelements * K3 * nrbf3;
   const int base = S * i;
   const int NeK3 = nelements * K3;
@@ -135,28 +124,33 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
     u_s[t] = g.sumU[base + t];
     f_s[t] = T(0);
   }
-  for (int q = threadIdx.x; q < K3; q += blockDim.x) qa_s[q] = -1;
-  __syncthreads();
-  for (int a = threadIdx.x; a < nabf3_active; a += blockDim.x) {
-    const int p = g.p3_active[a];
-    for (int q = g.pn3[p]; q < g.pn3[p + 1]; q++) qa_s[q] = a;
+  // the index tables: precomputed (g.qa), or built here
+  const int *qa = g.qa ? g.qa : qa_s;
+  const int *qp = g.qp ? g.qp : qp_s;
+  if (!g.qa) {
+    for (int q = threadIdx.x; q < K3; q += blockDim.x) qa_s[q] = -1;
+    __syncthreads();
+    for (int a = threadIdx.x; a < nabf3_active; a += blockDim.x) {
+      const int p = g.p3_active[a];
+      for (int q = g.pn3[p]; q < g.pn3[p + 1]; q++) qa_s[q] = a;
+    }
+    if (g.do4)
+      for (int p = threadIdx.x; p < g.nabf4; p += blockDim.x)
+        for (int q = g.pa4[p]; q < g.pa4[p + 1]; q++) qp_s[q] = p;
   }
-  if (g.do4)
-    for (int p = threadIdx.x; p < g.nabf4; p += blockDim.x)
-      for (int q = g.pa4[p]; q < g.pa4[p + 1]; q++) qp_s[q] = p;
   __syncthreads();
 
-  // three-body: cb3 index i + Ni*(a + nabf3_active*m) + N3*(element pair)
+  // three-body: cb3 index i*ca + cm*(a + nabf3_active*m) + N3*(element pair)
 
-  const int N3 = Ni * nabf3_active * nrbf3;
+  const int N3 = cm * nabf3_active * nrbf3;
   for (int item = threadIdx.x; item < nrbf3 * K3; item += blockDim.x) {
     const int q = item % K3;
     const int m = item / K3;
-    const int a = qa_s[q];
+    const int a = qa[q];
     if (a < 0) continue;
     const T pk = static_cast<T>(g.pc3[q]);
     const int iu = NeK3 * m + nelements * q;
-    int em = i + Ni * (a + nabf3_active * m);
+    int em = i * ca + cm * (a + nabf3_active * m);
     for (int i1 = 0; i1 < nelements; i1++) {
       const T u1 = u_s[iu + i1];
       for (int i2 = i1; i2 < nelements; i2++, em += N3) {
@@ -168,20 +162,20 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
   }
   __syncthreads();
 
-  // four-body: cb4 index i + Ni*(p + nabf4*m) + N4*(element triple)
+  // four-body: cb4 index i*ca + cm*(p + nabf4*m) + N4*(element triple)
 
   if (g.do4) {
-    const int N4 = Ni * g.nabf4 * g.nrbf4;
+    const int N4 = cm * g.nabf4 * g.nrbf4;
     for (int item = threadIdx.x; item < g.nrbf4 * Q4; item += blockDim.x) {
       const int q = item % Q4;
       const int m = item / Q4;
-      const int p = qp_s[q];
+      const int p = qp[q];
       const T c = static_cast<T>(g.pc4[q]);
       const int iu = NeK3 * m;
       const int idx1 = iu + nelements * g.pb4[q];
       const int idx2 = iu + nelements * g.pb4[q + Q4];
       const int idx3 = iu + nelements * g.pb4[q + 2 * Q4];
-      int k = i + Ni * (p + g.nabf4 * m);
+      int k = i * ca + cm * (p + g.nabf4 * m);
       for (int i1 = 0; i1 < nelements; i1++) {
         const T c1 = u_s[idx1 + i1];
         for (int i2 = i1; i2 < nelements; i2++) {
@@ -396,7 +390,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
       const T inv_i = static_cast<T>(1.0) / static_cast<T>(i);
       const T isinax = inv_i * static_cast<T>(sin(ix));
       const T drbftdr = bg1 * isinax + Kf1dx * cosax;
-      add(bf1 * isinax, drbftdr * invdij);
+      add(bf1 * isinax, drbftdr);
       ix += static_cast<TA>(xpi);
     }
   }
@@ -408,7 +402,7 @@ __global__ void __launch_bounds__(256) radialbasis_phi_kernel(T *__restrict__ rb
   for (int i = 1; i <= inversedegree; ++i) {
     dterm -= fcut_invd;
     inva *= invdij;
-    add(fcut * inva, dterm * inva * invdij);
+    add(fcut * inva, dterm * inva);
   }
 
 #pragma unroll
@@ -451,6 +445,16 @@ bool radialbasis_phi(hipStream_t stream, T *rbf, T *drbf, const PairGeom<T> &pg,
 ------------------------------------------------------------------------- */
 
 static constexpr int MFMA_MAX_RT = 4;    // K3 <= 64 (angular degree <= 5)
+
+// sizes of the Hf benchmark model (one element), compile-time constants in the HF instances of
+// the matrix core and local EA-POD kernels; the host checks that the model has them.  the
+// number of many-body radial functions stays a run-time value (as a constant it costs
+// registers)
+struct PodHf {
+  static constexpr int K3 = 20, L = 3, nrbf2 = 40, nDes = 66, nl2 = 40, nl3 = 20, nl4 = 6;
+  static constexpr int nCls = 50, nActMax = 3, nCoeff = 3301, nabf3_active = 4, nrbf4 = 3;
+  static constexpr int nabf4 = 2, Q4 = 4, jtile = 16;
+};
 static constexpr int MFMA_MAX_CT = 2;    // nelements * nrbf3 <= 32
 
 /* ----------------------------------------------------------------------
@@ -469,24 +473,26 @@ template <typename T> struct RadialSrc {
 
 // calls emit(m, rbf(j, m), drbf(j, m)) for m < nrbf3; MAXR > 0 unrolls the
 // loop to MAXR (nrbf3 <= MAXR) so that emit may index register arrays
+// as pair_radial() below, with the distance r of pair j given (used with the Hermite table)
 template <int MAXR, typename T, typename F>
-__device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg, const int j,
-                                   const int nrbf3, F &&emit)
+__device__ inline void pair_radial_r(const RadialSrc<T> &s, const T r, const int j,
+                                     const int nrbf3, F &&emit)
 {
   constexpr int MR = (MAXR > 0) ? MAXR : 1;
   if (s.coef == nullptr) {
+    // the stored drbf is R'(r); the consumers take R'(r)/r
+    const T ir = s.drbf ? static_cast<T>(1.0) / r : T(0);
     if (MAXR > 0) {
 #pragma unroll
       for (int m = 0; m < MR; m++)
-        if (m < nrbf3) emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] : T(0));
+        if (m < nrbf3) emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] * ir : T(0));
     } else {
       for (int m = 0; m < nrbf3; m++)
-        emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] : T(0));
+        emit(m, s.rbf[j + s.Nij * m], s.drbf ? s.drbf[j + s.Nij * m] * ir : T(0));
     }
     return;
   }
-  const int pair = s.ti ? s.ti[j] * s.ne + s.tj[j] : 0;    // ti == nullptr: one element
-  const T r = pg.r(j);
+  const int pair = (s.ne > 1) ? s.ti[j] * s.ne + s.tj[j] : 0;
   const T r0 = s.r0v[pair];
   const T invdr = s.invdrv[pair];
   const T invdrr = invdr / r;
@@ -511,19 +517,29 @@ __device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg,
   }
 }
 
+template <int MAXR, typename T, typename F>
+__device__ inline void pair_radial(const RadialSrc<T> &s, const PairGeom<T> &pg, const int j,
+                                   const int nrbf3, F &&emit)
+{
+  pair_radial_r<MAXR>(s, (s.coef || s.drbf) ? pg.r(j) : T(1), j, nrbf3, emit);
+}
+
 // the radial functions of one pair, evaluated one m at a time: the Hermite bin of the
 // pair is found once, or the stored rbf/drbf are read
 template <typename T> struct PairRadial {
   const T *c;    // Hermite coefficients of the bin, [m][4]; nullptr: stored rbf/drbf
-  T t, s;        // position in the bin and d(t)/dr / r
+  T t, s;        // position in the bin and d(t)/dr / r (stored basis: 1/r)
   const T *rbf, *drbf;
   int j, Nij;
 
   __device__ PairRadial(const RadialSrc<T> &rs, const PairGeom<T> &pg, const int jj) :
       c(nullptr), t(T(0)), s(T(0)), rbf(rs.rbf), drbf(rs.drbf), j(jj), Nij(rs.Nij)
   {
-    if (rs.coef == nullptr) return;
-    const int pair = rs.ti ? rs.ti[j] * rs.ne + rs.tj[j] : 0;
+    if (rs.coef == nullptr) {
+      if (rs.drbf) s = static_cast<T>(1.0) / pg.r(j);    // the stored drbf is R'(r)
+      return;
+    }
+    const int pair = (rs.ne > 1) ? rs.ti[j] * rs.ne + rs.tj[j] : 0;
     const T r = pg.r(j);
     const T invdr = rs.invdrv[pair];
     const T tg = (r - rs.r0v[pair]) * invdr;
@@ -539,7 +555,7 @@ template <typename T> struct PairRadial {
   {
     if (c == nullptr) {
       f = rbf[j + Nij * m];
-      df = drbf ? drbf[j + Nij * m] : T(0);
+      df = drbf ? drbf[j + Nij * m] * s : T(0);
       return;
     }
     const T *cm = c + 4 * m;
@@ -567,8 +583,8 @@ __global__ void radialangularsum_otf_kernel(T *__restrict__ sumU, const RadialSr
   int *pqd_s = pqm_s + K3;                                    // [K3]
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
   const int nout = nrbf3 * K3;
 
   for (int t = threadIdx.x; t < K3; t += blockDim.x) {
@@ -627,7 +643,18 @@ template <typename T> struct DescArgs {
   const int *pc3, *pn3, *p3_active, *pa4, *pb4, *pc4;
   const int2 *qrange3;    // (pn3[p3_active[a]], pn3[p3_active[a] + 1]) for each a
   int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
+  int split;    // 1: a descriptor may be summed by up to 8 threads (desc34_atom)
 };
+
+// threads per descriptor in desc34_atom(): the power of 2 (<= 8) that spreads n items over the
+// block, or 1
+__device__ inline int desc34_lpi(const int split, const int n)
+{
+  if (!split || (n <= 0)) return 1;
+  int l = 1;
+  while ((l < 8) && (2 * l * n <= (int) blockDim.x)) l *= 2;
+  return l;
+}
 
 // 3- and 4-body descriptors of atom i from its sumU block u_s (in LDS),
 // computed by the threads of the calling block
@@ -637,29 +664,36 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
   const int nelements = g.nelements, Ni = g.Ni;
   const int NeK3 = nelements * g.K3;
 
-  // three-body: d3 index i + Ni*(a + nabf3_active*m) + N3*(element pair)
+  // three-body: d3 index i + Ni*(a + nabf3_active*m) + N3*(element pair).  lpi threads per
+  // descriptor sum every lpi-th term and combine their partial sums
   const int N3 = Ni * g.nabf3_active * g.nrbf3;
-  for (int item = threadIdx.x; item < g.nrbf3 * g.nabf3_active; item += blockDim.x) {
+  const int lpi3 = desc34_lpi(g.split, g.nrbf3 * g.nabf3_active);
+  const int sub3 = threadIdx.x % lpi3;
+  for (int item = threadIdx.x / lpi3; item < g.nrbf3 * g.nabf3_active;
+       item += blockDim.x / lpi3) {
     const int a = item % g.nabf3_active;
     const int m = item / g.nabf3_active;
-    const int p = g.p3_active[a];
-    const int n1 = g.pn3[p], n2 = g.pn3[p + 1];
+    const int2 qr = g.qrange3[a];    // = pn3[p3_active[a]], pn3[p3_active[a] + 1]
+    const int n1 = qr.x, n2 = qr.y;
     const T *u = u_s + NeK3 * m;
     int k = i + Ni * (a + g.nabf3_active * m);
     for (int i1 = 0; i1 < nelements; i1++)
       for (int i2 = i1; i2 < nelements; i2++, k += N3) {
         TA tmp = TA(0);
-        for (int q = n1; q < n2; q++)
+        for (int q = n1 + sub3; q < n2; q += lpi3)
           tmp += static_cast<TA>(static_cast<T>(g.pc3[q]) * u[i1 + nelements * q] *
                                  u[i2 + nelements * q]);
-        g.d3[k] = static_cast<T>(tmp);
+        for (int o = 1; o < lpi3; o <<= 1) tmp += __shfl_xor(tmp, o);
+        if (sub3 == 0) g.d3[k] = static_cast<T>(tmp);
       }
   }
 
   // four-body: d4 index i + Ni*(p + nabf4*m) + N4*(element triple)
   if (g.do4) {
     const int N4 = Ni * g.nabf4 * g.nrbf4;
-    for (int item = threadIdx.x; item < g.nrbf4 * g.nabf4; item += blockDim.x) {
+    const int lpi4 = desc34_lpi(g.split, g.nrbf4 * g.nabf4);
+    const int sub4 = threadIdx.x % lpi4;
+    for (int item = threadIdx.x / lpi4; item < g.nrbf4 * g.nabf4; item += blockDim.x / lpi4) {
       const int p = item % g.nabf4;
       const int m = item / g.nabf4;
       const int n1 = g.pa4[p], n2 = g.pa4[p + 1];
@@ -669,13 +703,14 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
         for (int i2 = i1; i2 < nelements; i2++)
           for (int i3 = i2; i3 < nelements; i3++, k += N4) {
             TA tmp = TA(0);
-            for (int q = n1; q < n2; q++) {
+            for (int q = n1 + sub4; q < n2; q += lpi4) {
               const int c = g.pc4[q];
               const int j1 = g.pb4[q], j2 = g.pb4[q + g.Q4], j3 = g.pb4[q + 2 * g.Q4];
               tmp += static_cast<TA>(static_cast<T>(c) * u[i1 + nelements * j1] *
                                      u[i2 + nelements * j2] * u[i3 + nelements * j3]);
             }
-            g.d4[k] = static_cast<T>(tmp);
+            for (int o = 1; o < lpi4; o <<= 1) tmp += __shfl_xor(tmp, o);
+            if (sub4 == 0) g.d4[k] = static_cast<T>(tmp);
           }
     }
   }
@@ -694,38 +729,73 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
    powers.
 ------------------------------------------------------------------------- */
 
+// packed exponents a | b << 8 | c << 16 of the monomials k < K3 into ex_s, from the pq recursion
+template <typename T>
+__device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d, const int K3)
+{
+  if (threadIdx.x == 0) {
+    ex_s[0] = 0;
+    for (int k = 1; k < K3; k++) ex_s[k] = ex_s[pq_m[k]] + (1 << (8 * (pq_d[k] - 1)));
+  }
+}
+
+// the same, from the table pq_ex built on the host, copied by all threads
+__device__ inline void pod_exponents_table(int *ex_s, const int *pq_ex, const int K3)
+{
+  for (int k = threadIdx.x; k < K3; k += blockDim.x) ex_s[k] = pq_ex[k];
+}
+
+// LMP_POD_RAS_X0 (HF instance): the power table keeps one x^0 = 1 entry per pair instead of one per
+// direction ([1, u..u^L, v..v^L, w..w^L], 10 instead of 12 values with L = 3) and the exponents
+// are read from pq_ex instead of an LDS copy, so that the block needs at most 2048 bytes of LDS
+// (8 waves per SIMD instead of 6)
+#ifndef LMP_POD_RAS_X0
+#define LMP_POD_RAS_X0 1
+#endif
+
 // RTM x CTM output tiles (RTM >= ceil(K3/16), CTM >= ceil(Ne*nrbf3/16)) are kept in registers
-template <typename T, typename TA, int RTM, int CTM>
+// PF 1: the geometry of the next tile (one of u, v, w or r of a pair per lane, jtile <= 16) is
+// loaded while the current tile is on the matrix cores, and all lanes fill the tile.
+// PF 2: the tile is filled by all lanes, one (pair, radial function) or (pair, direction) each
+// HF: the sizes of the Hf model (PodHf) as constants
+template <typename T, typename TA, int RTM, int CTM, int PF, bool HF>
 __global__ void __launch_bounds__(64)
-    radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs,
+    radialangularsum_mfma_kernel(T *__restrict__ sumU, const RadialSrc<T> rs_in,
                                  const PairGeom<T> pg, const int *__restrict__ tj,
                                  const int *__restrict__ numij, const int *__restrict__ pq_m,
-                                 const int *__restrict__ pq_d, const int nelements,
-                                 const int nrbf3, const int K3, const int L, const int Nij,
-                                 const int jtile)
+                                 const int *__restrict__ pq_d, const int nelements_in,
+                                 const int nrbf3, const int K3_in, const int L_in, const int Nij,
+                                 const int jtile_in, const int *__restrict__ pq_ex)
 {
+  RadialSrc<T> rs = rs_in;
+  if constexpr (HF) rs.ne = 1;
+  const int nelements = HF ? 1 : nelements_in;
+  const int K3 = HF ? PodHf::K3 : K3_in;
+  const int L = HF ? PodHf::L : L_in;
+  const int jtile = HF ? PodHf::jtile : jtile_in;
   extern __shared__ char lds_raw[];
   const int L1 = L + 1;
-  T *pow_s = reinterpret_cast<T *>(lds_raw);      // [jtile][3][L1]
+  constexpr bool X0 = HF && (PF == 2) && LMP_POD_RAS_X0;
+  const int PW = X0 ? 1 + 3 * L : 3 * L1;         // power table entries per pair
+  T *pow_s = reinterpret_cast<T *>(lds_raw);      // [jtile][3][L1] (X0: [jtile][1 + 3 L])
   const int ldr = jtile + 1;                      // padded row: functions m of a pair in different banks
-  T *rbf_s = pow_s + jtile * 3 * L1;              // [nrbf3][ldr]
+  T *rbf_s = pow_s + jtile * PW;                  // [nrbf3][ldr]
   int *tj_s = reinterpret_cast<int *>(rbf_s + nrbf3 * ldr);    // [jtile]
   int *ex_s = tj_s + jtile;                                      // [K3] packed a | b<<8 | c<<16
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
   const int nout = nrbf3 * K3;
   const int NC = nelements * nrbf3;
   const int lane = threadIdx.x;
   const int lr = lane & 15, lq = lane >> 4;
   const int RT = (K3 + 15) / 16, CT = (NC + 15) / 16;
 
-  if (lane == 0) {
-    ex_s[0] = 0;
-    for (int k = 1; k < K3; k++) ex_s[k] = ex_s[pq_m[k]] + (1 << (8 * (pq_d[k] - 1)));
+  if constexpr (!X0) {
+    pod_exponents_table(ex_s, pq_ex, K3);
+    __syncthreads();
   }
-  __syncthreads();
 
   // exponents of the A rows owned by this lane (offsets into pow_s), and the
   // (m, e) of the B columns owned by this lane
@@ -733,10 +803,11 @@ __global__ void __launch_bounds__(64)
 #pragma unroll
   for (int rt = 0; rt < RTM; rt++) {
     const int k = rt * 16 + lr;
-    const int ex = (k < K3) ? ex_s[k] : 0;
-    oa[rt] = ex & 255;
-    ob[rt] = L1 + ((ex >> 8) & 255);
-    oc[rt] = 2 * L1 + ((ex >> 16) & 255);
+    const int ex = (k < K3) ? (X0 ? pq_ex[k] : ex_s[k]) : 0;
+    const int ea = ex & 255, eb = (ex >> 8) & 255, ec = (ex >> 16) & 255;
+    oa[rt] = ea;
+    ob[rt] = X0 ? (eb ? L + eb : 0) : L1 + eb;
+    oc[rt] = X0 ? (ec ? 2 * L + ec : 0) : 2 * L1 + ec;
   }
   int bm[CTM], be[CTM];
 #pragma unroll
@@ -753,10 +824,80 @@ __global__ void __launch_bounds__(64)
 #pragma unroll
     for (int ct = 0; ct < CTM; ct++) acc[rt][ct] = acc_t{0, 0, 0, 0};
 
+  T xh = T(0);
+  int tjh = 0;
+  const int pjj = lane % jtile, pd = lane / jtile;    // PF: pair and component of this lane
+  auto fetch = [&](const int jbase) {
+    if ((pd < 4) && (jbase + pjj < nj)) {
+      const int j = start + jbase + pjj;
+      if (pd < 3) xh = pg.rhat[j + pd * pg.N];
+      else {
+        xh = pg.r(j);
+        tjh = (nelements > 1) ? tj[j] : 0;
+      }
+    }
+  };
+  if constexpr (PF == 1) fetch(0);
+
   for (int j0 = 0; j0 < nj; j0 += jtile) {
     const int nt = min(jtile, nj - j0);
     const int nt4 = (nt + 3) & ~3;
     __syncthreads();
+    if constexpr (PF == 2) {
+      const int nr = nt4 * nrbf3;
+      for (int t = lane; t < nt4 * (nrbf3 + 3); t += 64) {
+        if (t < nr) {
+          const int jj = t / nrbf3, m = t - jj * nrbf3;
+          T f = T(0), df;
+          if (jj < nt) {
+            const PairRadial<T> prad(rs, pg, start + j0 + jj);
+            prad(m, f, df);
+          }
+          rbf_s[m * ldr + jj] = f;
+          if (m == 0) tj_s[jj] = (jj < nt) ? ((nelements > 1) ? tj[start + j0 + jj] : 0) : -1;
+        } else {
+          const int q = t - nr, jj = q / 3, d = q - 3 * jj;
+          T x = T(0), p = T(0);
+          if (jj < nt) {
+            x = pg.rhat[start + j0 + jj + d * pg.N];
+            p = static_cast<T>(1.0);
+          }
+          if constexpr (X0) {
+            T *pw = pow_s + jj * PW;
+            if (d == 0) pw[0] = p;
+            for (int n = 1; n <= L; n++) {
+              p *= x;
+              pw[d * L + n] = p;
+            }
+          } else {
+            T *pw = pow_s + jj * 3 * L1 + d * L1;
+            for (int n = 0; n < L1; n++) {
+              pw[n] = p;
+              p *= x;
+            }
+          }
+        }
+      }
+    } else if constexpr (PF == 1) {
+      if ((pd < 4) && (pjj < nt4)) {
+        T *pw = pow_s + pjj * 3 * L1;
+        if (pd < 3) {
+          T p = (pjj < nt) ? static_cast<T>(1.0) : T(0);
+          for (int n = 0; n < L1; n++) {
+            pw[pd * L1 + n] = p;
+            p *= xh;
+          }
+        } else if (pjj < nt) {
+          pair_radial_r<0>(rs, xh, start + j0 + pjj, nrbf3,
+                           [&](int m, T f, T) { rbf_s[m * ldr + pjj] = f; });
+          tj_s[pjj] = tjh;
+        } else {
+          for (int m = 0; m < nrbf3; m++) rbf_s[m * ldr + pjj] = T(0);
+          tj_s[pjj] = -1;
+        }
+      }
+      if (j0 + jtile < nj) fetch(j0 + jtile);
+    } else
     for (int jj = lane; jj < nt4; jj += 64) {
       T *pw = pow_s + jj * 3 * L1;
       if (jj < nt) {
@@ -784,7 +925,7 @@ __global__ void __launch_bounds__(64)
 
     for (int q = 0; q < nt4; q += 4) {
       const int jj = q + lq;
-      const T *pw = pow_s + jj * 3 * L1;
+      const T *pw = pow_s + jj * PW;
       const int tjj = tj_s[jj];
       TA a[RTM], b[CTM];
 #pragma unroll
@@ -820,8 +961,12 @@ template <typename T, typename TA>
 bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, const PairGeom<T> &pg,
                           const int *tj,
                           const int *numij, const int *pq_m, const int *pq_d, int nelements,
-                          int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile)
+                          int nrbf3, int K3, int Ni, int Nij, bool use_mfma, int jtile,
+                          bool prefetch = false, bool spread = false, const int *pq_ex = nullptr,
+                          bool hf = false)
 {
+  // pq_ex: packed exponents of the monomials (pod_exponents()), needed by the matrix cores
+  if (!pq_ex) use_mfma = false;
   const int nout = nrbf3 * K3;
   if ((Ni <= 0) || (nelements > MAX_ELEMENTS) || (K3 < 1)) return false;
   if (use_mfma) {
@@ -842,18 +987,27 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
     int L = 0;
     while ((L + 1) * (L + 2) * (L + 3) / 6 < K3) L++;
     if ((L + 1) * (L + 2) * (L + 3) / 6 != K3) return false;
-    const size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
+    size_t lds2 = ((size_t) (3 * (L + 1) + nrbf3) * jtile + nrbf3) * sizeof(T) +
         ((size_t) jtile + K3) * sizeof(int);
     const int RT = (K3 + 15) / 16, CT = (nelements * nrbf3 + 15) / 16;
+    const int pf = spread ? 2 : ((prefetch && (4 * jtile <= 64)) ? 1 : 0);
+#define LMP_POD_RAS_MFMA1(R, C, P, H)                                                            \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C, P, H>), dim3(Ni), \
+                     dim3(threads), lds2, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,         \
+                     nelements, nrbf3, K3, L, Nij, jtile, pq_ex)
+    // the Hf instance: one element, K3 20, the spread fill with a tile of 16 pairs
+    const bool hfi = hf && (nelements == 1) && (K3 == PodHf::K3) && (L == PodHf::L) &&
+        (jtile == PodHf::jtile) && (pf == 2);
+    if (hfi && LMP_POD_RAS_X0)
+      lds2 = ((size_t) (1 + 3 * L + nrbf3) * jtile + nrbf3) * sizeof(T) + (size_t) jtile * sizeof(int);
 #define LMP_POD_RAS_MFMA(R, C)                                                                   \
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_mfma_kernel<T, TA, R, C>), dim3(Ni),      \
-                     dim3(threads),                                                            \
-                     occ_lds(reinterpret_cast<const void *>(                                   \
-                                 radialangularsum_mfma_kernel<T, TA, R, C>),                   \
-                             threads, lds2),                                                   \
-                     stream, sumU, rs, pg, tj, numij, pq_m, pq_d,                              \
-                     nelements, nrbf3, K3, L, Nij, jtile)
-    if (CT == 1) {
+  do {                                                                                           \
+    if (pf == 2) LMP_POD_RAS_MFMA1(R, C, 2, false);                                              \
+    else if (pf == 1) LMP_POD_RAS_MFMA1(R, C, 1, false);                                         \
+    else LMP_POD_RAS_MFMA1(R, C, 0, false);                                                      \
+  } while (0)
+    if (hfi) LMP_POD_RAS_MFMA1(2, 1, 2, true);
+    else if (CT == 1) {
       if (RT == 1) LMP_POD_RAS_MFMA(1, 1);
       else if (RT == 2) LMP_POD_RAS_MFMA(2, 1);
       else if (RT == 3) LMP_POD_RAS_MFMA(3, 1);
@@ -865,6 +1019,7 @@ bool radialangularsum_otf(hipStream_t stream, T *sumU, const RadialSrc<T> &rs, c
       else LMP_POD_RAS_MFMA(4, 2);
     }
 #undef LMP_POD_RAS_MFMA
+#undef LMP_POD_RAS_MFMA1
   } else
     hipLaunchKernelGGL(HIP_KERNEL_NAME(radialangularsum_otf_kernel<T, TA>), dim3(Ni),
                        dim3(threads), lds, stream, sumU, rs, pg, tj, numij, pq_m, pq_d,
@@ -939,13 +1094,18 @@ __device__ inline void pod_monomial(const T *pd, const int ex, const int L1, T &
   Pw = static_cast<T>(c) * pa * pb * pd[2 * L1 + (c > 0 ? c - 1 : 0)];
 }
 
-template <typename T>
-__device__ inline void pod_exponents(int *ex_s, const int *pq_m, const int *pq_d, const int K3)
+// as pod_monomial(), with the powers of pd at stride S: pd[S*n] (layout [direction][power][pair])
+template <typename T, int S>
+__device__ inline void pod_monomial_s(const T *pd, const int ex, const int L1, T &P, T &Pu, T &Pv,
+                                      T &Pw)
 {
-  if (threadIdx.x == 0) {
-    ex_s[0] = 0;
-    for (int k = 1; k < K3; k++) ex_s[k] = ex_s[pq_m[k]] + (1 << (8 * (pq_d[k] - 1)));
-  }
+  const int a = ex & 255, b = (ex >> 8) & 255, c = (ex >> 16) & 255;
+  const T pa = pd[S * a], pb = pd[S * (L1 + b)], pc = pd[S * (2 * L1 + c)];
+  const T pbc = pb * pc;
+  P = pa * pbc;
+  Pu = static_cast<T>(a) * pd[S * (a > 0 ? a - 1 : 0)] * pbc;
+  Pv = static_cast<T>(b) * pa * pd[S * (L1 + (b > 0 ? b - 1 : 0))] * pc;
+  Pw = static_cast<T>(c) * pa * pb * pd[S * (2 * L1 + (c > 0 ? c - 1 : 0))];
 }
 
 template <typename T> __device__ inline T pod_sel4(int i, T v0, T v1, T v2, T v3)
@@ -968,11 +1128,9 @@ template <typename T> struct BsplineArgs {
 // the 4 nonzero B-splines of pair n and their derivatives (times 1/r), in the slots
 // of the window that starts at the returned base index, as in PairPODKokkos::bspline4()
 template <typename T>
-__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
-                                       const int n, T (&Bq)[4], T (&dBq)[4])
+__device__ inline int pod_bspline_eval(const BsplineArgs<T> &g, const int pair, const T r,
+                                       T (&Bq)[4], T (&dBq)[4])
 {
-  const int pair = g.ti ? g.ti[n] * g.ne + g.tj[n] : 0;    // ti == nullptr: one element
-  const T r = pg.r(n);
   const T invh = g.invhv[pair];
   T tg = (r - g.r0v[pair]) * invh;
   const bool inside = (tg >= T(0));
@@ -1007,6 +1165,13 @@ __device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T
   return gb;
 }
 
+template <typename T>
+__device__ inline int pod_bspline_pair(const BsplineArgs<T> &g, const PairGeom<T> &pg,
+                                       const int n, T (&Bq)[4], T (&dBq)[4])
+{
+  return pod_bspline_eval(g, (g.ne > 1) ? g.ti[n] * g.ne + g.tj[n] : 0, pg.r(n), Bq, dBq);
+}
+
 
 /* ----------------------------------------------------------------------
    the 2-body force of a pair and the tally of the pair forces into the
@@ -1025,11 +1190,13 @@ template <typename T, typename TA> struct ForceTally {
   TA *vatom;                   // per-atom virial vatom[a*vs0 + d*vs1], or nullptr
   int vs0, vs1;
   const int *ai, *aj;          // atom indices of the pairs
+  const int *gia;              // atom index of atom i of the block, or nullptr: ai[first pair]
   const T *cb2;                // 2-body force coefficients [i + Ni*m]; nullptr: no 2-body part
   const T *drbf2;              // stored 2-body basis derivatives (used when bs.r0v == nullptr)
   const int *base2;            // stored B-spline base index, or nullptr
   BsplineArgs<T> bs;           // bs.r0v != nullptr: B-splines evaluated here
   int nrbf2, nm2, Ni;
+  int ca, cm;                  // cb2 of atom i, coefficient m: cb2[i*ca + cm*m]
 };
 
 // adds the force (SA, SU, SV, SW contracted with the gradients g) of pair j of atom i,
@@ -1059,15 +1226,17 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
     TA cR = TA(0);
     if (ft.bs.r0v) {
       T Bq[4], dBq[4];
-      const int ii = i + ft.Ni * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
+      const int ii =
+          i * ft.ca + ft.cm * (pod_bspline_pair(ft.bs, pg, j, Bq, dBq) + ft.nrbf2 * e);
 #pragma unroll
-      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * dBq[m]);
+      for (int m = 0; m < 4; ++m) cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * dBq[m]);
+      cR *= static_cast<TA>(r);    // dBq is R'(r)/r
     } else {
-      const int ii = i + ft.Ni * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
+      // the stored drbf2 is R'(r)
+      const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
       for (int m = 0; m < ft.nm2; ++m)
-        cR += static_cast<TA>(ft.cb2[ii + ft.Ni * m] * ft.drbf2[j + pg.N * m]);
+        cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + pg.N * m]);
     }
-    cR *= static_cast<TA>(r);
     fx += cR * static_cast<TA>(u);
     fy += cR * static_cast<TA>(v);
     fz += cR * static_cast<TA>(w);
@@ -1092,6 +1261,74 @@ __device__ inline void pod_pair_finish(const ForceTally<T, TA> &ft, const PairGe
   }
 }
 
+// component d (0, 1, 2) of the force of pair j of atom i as pod_pair_finish() (atom forces
+// tallied, ft.f != nullptr), with the distance r and the direction (u, v, w) of the pair given
+// (N: the number of pairs): subtracts it from f_j and returns it in fd, with the virial terms
+// vd = r_d f_d and vo (xy, xz, yz for d = 0, 1, 2) of the pair
+template <typename T, typename TA, bool LDS2 = false>
+__device__ inline void pod_pair_force_dg(const ForceTally<T, TA> &ft, const int N, const int i,
+                                         const int j, const int e, const TA SA, const TA SU,
+                                         const TA SV, const TA SW, const int d, const T r,
+                                         const T u, const T v, const T w, TA &fd, TA &vd,
+                                         TA &vo, const T *cb2_s = nullptr)
+{
+  const T invr = static_cast<T>(1.0) / r;
+  const T g0 = (v * v + w * w) * invr, g1 = -(u * v) * invr, g2 = -(u * w) * invr;
+  const T g3 = (u * u + w * w) * invr, g4 = -(v * w) * invr, g5 = (u * u + v * v) * invr;
+  TA fx = SU * static_cast<TA>(g0) + SV * static_cast<TA>(g1) + SW * static_cast<TA>(g2) +
+      SA * static_cast<TA>(r * u);
+  TA fy = SU * static_cast<TA>(g1) + SV * static_cast<TA>(g3) + SW * static_cast<TA>(g4) +
+      SA * static_cast<TA>(r * v);
+  TA fz = SU * static_cast<TA>(g2) + SV * static_cast<TA>(g4) + SW * static_cast<TA>(g5) +
+      SA * static_cast<TA>(r * w);
+  if (ft.cb2) {
+    TA cR = TA(0);
+    if (ft.bs.r0v) {
+      T Bq[4], dBq[4];
+      const int pair = (ft.bs.ne > 1) ? ft.bs.ti[j] * ft.bs.ne + ft.bs.tj[j] : 0;
+      const int gb = pod_bspline_eval(ft.bs, pair, r, Bq, dBq);
+      const int ii = i * ft.ca + ft.cm * (gb + ft.nrbf2 * e);
+#pragma unroll
+      for (int m = 0; m < 4; ++m)
+        cR += static_cast<TA>((LDS2 ? cb2_s[gb + m] : ft.cb2[ii + ft.cm * m]) * dBq[m]);
+      cR *= static_cast<TA>(r);    // dBq is R'(r)/r
+    } else {
+      // the stored drbf2 is R'(r)
+      const int ii = i * ft.ca + ft.cm * ((ft.base2 ? ft.base2[j] : 0) + ft.nrbf2 * e);
+      for (int m = 0; m < ft.nm2; ++m)
+        cR += static_cast<TA>(ft.cb2[ii + ft.cm * m] * ft.drbf2[j + N * m]);
+    }
+    fx += cR * static_cast<TA>(u);
+    fy += cR * static_cast<TA>(v);
+    fz += cR * static_cast<TA>(w);
+  }
+  fd = (d == 0) ? fx : ((d == 1) ? fy : fz);
+  atomicAdd(ft.f + ft.aj[j] * ft.fs0 + d * ft.fs1, -fd);
+  vd = vo = TA(0);
+  if (ft.vir || ft.vatom) {
+    const TA rx = static_cast<TA>(r * u), ry = static_cast<TA>(r * v), rz = static_cast<TA>(r * w);
+    vd = ((d == 0) ? rx : ((d == 1) ? ry : rz)) * fd;
+    vo = (d == 0) ? rx * fy : ((d == 1) ? rx * fz : ry * fz);
+    if (ft.vatom) {
+      TA *vj = ft.vatom + ft.aj[j] * ft.vs0;
+      atomicAdd(vj + d * ft.vs1, static_cast<TA>(-0.5) * vd);
+      atomicAdd(vj + (3 + d) * ft.vs1, static_cast<TA>(-0.5) * vo);
+    }
+  }
+}
+
+// as pod_pair_force_dg(), with the geometry of pair j read from pg
+template <typename T, typename TA>
+__device__ inline void pod_pair_force_d(const ForceTally<T, TA> &ft, const PairGeom<T> &pg,
+                                        const int i, const int j, const int e, const TA SA,
+                                        const TA SU, const TA SV, const TA SW, const int d,
+                                        TA &fd, TA &vd, TA &vo)
+{
+  T u, v, w;
+  pg.uvw(j, u, v, w);
+  pod_pair_force_dg<T, TA>(ft, pg.N, i, j, e, SA, SU, SV, SW, d, pg.r(j), u, v, w, fd, vd, vo);
+}
+
 // adds the sums of atom i (pairs start .. start+nj-1) to its force and virial; called by
 // all threads of the block after the last pair
 template <typename T, typename TA>
@@ -1100,12 +1337,13 @@ __device__ inline void pod_atom_finish(const ForceTally<T, TA> &ft, const int i,
 {
   if ((ft.f == nullptr) || (threadIdx.x != 0)) return;
   if (nj > 0) {
-    TA *fi = ft.f + ft.ai[start] * ft.fs0;
+    const int ga = ft.gia ? ft.gia[i] : ft.ai[start];
+    TA *fi = ft.f + ga * ft.fs0;
     atomicAdd(fi, acc_s[0]);
     atomicAdd(fi + ft.fs1, acc_s[1]);
     atomicAdd(fi + 2 * ft.fs1, acc_s[2]);
     if (ft.vatom) {
-      TA *vi = ft.vatom + ft.ai[start] * ft.vs0;
+      TA *vi = ft.vatom + ga * ft.vs0;
       for (int d = 0; d < 6; ++d) atomicAdd(vi + d * ft.vs1, static_cast<TA>(-0.5) * acc_s[3 + d]);
     }
   }
@@ -1136,8 +1374,8 @@ __global__ void __launch_bounds__(64)
   __shared__ TA acc_s[9];    // force and virial sums of atom i
 
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int nj = numij[i + 1] - start;
+  int start, nj;
+  pg.range(numij, i, start, nj);
 
   for (int t = threadIdx.x; t < nfc; t += blockDim.x) fc_s[t] = forcecoeff[t + nfc * i];
   if (threadIdx.x < 9) acc_s[threadIdx.x] = TA(0);
@@ -1199,6 +1437,48 @@ __global__ void __launch_bounds__(64)
 static constexpr int MFMA_MAX_CS = 8;    // nelements * nrbf3 <= 32
 static constexpr int MFMA_PAIR_TILE = 16;
 
+#ifndef LMP_POD_HF_SPREAD
+#define LMP_POD_HF_SPREAD 1
+#endif
+// LMP_POD_HF_EREG (HF spread epilogue): the direction of the pair is taken from the powers of
+// the tile in LDS instead of global memory
+#ifndef LMP_POD_HF_EREG
+#define LMP_POD_HF_EREG 1
+#endif
+// LMP_POD_HF_PDT (HF instance): the power table of the tile is stored [direction][power][pair]
+// instead of [pair][direction][power], so that the 16 lanes of a row group (16 pairs, same
+// monomial) read consecutive entries (no LDS bank conflicts)
+#ifndef LMP_POD_HF_PDT
+#define LMP_POD_HF_PDT 1
+#endif
+// LMP_POD_HF_REMAT (HF instance, bits): the lane-dependent indices of a region of the tile loop
+// are derived from a copy of the lane index the compiler cannot see through, so that it
+// recomputes them there instead of keeping them in registers over the whole loop (1 force
+// epilogue, 2 tile setup, 4 matrix core part)
+#ifndef LMP_POD_HF_REMAT
+#define LMP_POD_HF_REMAT 7
+#endif
+// LMP_POD_HF_SYM (HF instance): lane group g of the matrix core output evaluates the 8 template
+// monomials 1, X, X^2, XY, X^3, X^2 Y, X Y^2, XYZ of (X, Y, Z) = sigma_g(u, v, w) (identity, the
+// two cyclic shifts, the swap of u and v) in registers; the host table pq_ex[K3 + q] gives the
+// monomial of A row q (or -1 for a repeat), so that the 32 rows cover the 20 monomials of degree
+// <= 3.  No power table, no tile fill and no barriers in the pair loop (after the mega study's
+// S6SYM, from the nested Horner rewrite in leapod2 243dda528f)
+#ifndef LMP_POD_HF_SYM
+#define LMP_POD_HF_SYM 1
+#endif
+// LMP_POD_HF_CB2S (with SYM): the 2-body B-spline force coefficients of atom i (one element, cm 1)
+// are copied into the LDS of the power table, which SYM does not use, before the pair loop and
+// read there by the force epilogue instead of global memory
+#ifndef LMP_POD_HF_CB2S
+#define LMP_POD_HF_CB2S 1
+#endif
+__device__ inline int pod_opaque(int x)
+{
+  asm volatile("" : "+v"(x));
+  return x;
+}
+
 // register budget of the matrix core force kernel: without it the compiler keeps the
 // accumulators in separate AGPRs, which costs occupancy
 #ifndef LMP_POD_ALLBODY_VGPR
@@ -1210,15 +1490,40 @@ static constexpr int MFMA_PAIR_TILE = 16;
 #define LMP_POD_ALLBODY_ATTR
 #endif
 
-template <typename T, typename TA, int CSM, int JT, bool GROUP>
+// HF: the sizes of the Hf model (PodHf) as constants (descriptors stored per atom)
+template <typename T, typename TA, int CSM, int JT, bool GROUP, bool HF>
 __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
-    allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft,
-                               const T *__restrict__ forcecoeff, const FcArgs<T> fca,
-                               const RadialSrc<T> rs, const PairGeom<T> pg, const int *__restrict__ tj,
-                               const int *__restrict__ numij, const int *__restrict__ pq_m,
-                               const int *__restrict__ pq_d, const int nelements,
-                               const int nrbf3, const int K3, const int L, const int Nij)
+    allbody_forces_mfma_kernel(T *__restrict__ fij, const ForceTally<T, TA> ft_in,
+                               const T *__restrict__ forcecoeff, const FcArgs<T> fca_in,
+                               const RadialSrc<T> rs_in, const PairGeom<T> pg,
+                               const int *__restrict__ tj, const int *__restrict__ numij,
+                               const int *__restrict__ pq_m, const int *__restrict__ pq_d,
+                               const int nelements_in, const int nrbf3, const int K3_in,
+                               const int L_in, const int Nij, const int *__restrict__ pq_ex)
 {
+  ForceTally<T, TA> ft = ft_in;
+  FcArgs<T> fca = fca_in;
+  RadialSrc<T> rs = rs_in;
+  if constexpr (HF) {
+    ft.nrbf2 = PodHf::nrbf2;
+    ft.nm2 = 4;
+    ft.ca = PodHf::nDes;
+    ft.cm = 1;
+    ft.bs.ne = 1;
+    rs.ne = 1;
+    fca.nelements = 1;
+    fca.nabf3_active = PodHf::nabf3_active;
+    fca.nrbf4 = PodHf::nrbf4;
+    fca.nabf4 = PodHf::nabf4;
+    fca.K3 = PodHf::K3;
+    fca.Q4 = PodHf::Q4;
+    fca.do4 = 1;
+    fca.ca = PodHf::nDes;
+    fca.cm = 1;
+  }
+  const int nelements = HF ? 1 : nelements_in;
+  const int K3 = HF ? PodHf::K3 : K3_in;
+  const int L = HF ? PodHf::L : L_in;
   const int L1 = L + 1;
   const int PD = 3 * L1;    // only the powers; the gradients are recomputed per pair
   const int NeK3 = nelements * K3;
@@ -1233,9 +1538,8 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
   int *ex_s = tj_s + JT;                                     // [K3]
 
   const int i = blockIdx.x;
-  // study (mega hybrid): Nij < 0 means -Nij pair slots per atom and numij[i] = number of pairs
-  const int start = (Nij >= 0) ? numij[i] : i * (-Nij);
-  const int nj = (Nij >= 0) ? numij[i + 1] - start : numij[i];
+  int start, nj;
+  pg.range(numij, i, start, nj);
   const int lane = threadIdx.x;
   const int lr = lane & 15, lq = lane >> 4;
 
@@ -1247,7 +1551,12 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     for (int t = lane; t < nfc; t += 64) fc_s[t] = forcecoeff[t + nfc * i];
   }
   if (lane < 9) acc_s[lane] = TA(0);
-  pod_exponents<T>(ex_s, pq_m, pq_d, K3);
+  // the HF instance copies the table built on the host (the generic one would need 2 more
+  // VGPRs for it, one occupancy step)
+  if constexpr (HF)
+    pod_exponents_table(ex_s, pq_ex, K3);
+  else
+    pod_exponents<T>(ex_s, pq_m, pq_d, K3);
 
   // (m, e) of the inner index c = 4*cs + lq owned by this lane.  with GROUP the slices are
   // processed in groups of CG = 4 (see below), which recompute (m, e)
@@ -1261,6 +1570,21 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
     ce[cs] = (c < NC) ? c / nrbf3 : -1;
   }
   typedef typename Mfma<TA>::acc_t acc_t;
+
+  // LMP_POD_HF_SPREAD (HF instance): the force of a pair is finished by three lane groups, one
+  // component each, summed per lane (af, avd, avo) and reduced once per atom, instead of one
+  // lane group and per-pair LDS atomics
+  constexpr bool SPREAD = HF && LMP_POD_HF_SPREAD;
+  constexpr bool EREG = SPREAD && LMP_POD_HF_EREG;
+  constexpr bool PDT = HF && (JT == 16) && (CSM == 2) && !GROUP && LMP_POD_HF_PDT;
+  constexpr int PS = PDT ? JT : 1;    // stride of the powers of a pair in pd_s
+  constexpr bool SYM = HF && (JT == 16) && (CSM == 2) && !GROUP && LMP_POD_HF_SYM;
+  int rk[2] = {0, 0};    // SYM: monomial of the A rows 16 kt + lr of this lane, or -1
+  if constexpr (SYM) {
+    rk[0] = pq_ex[K3 + lr];
+    rk[1] = pq_ex[K3 + 16 + lr];
+  }
+  TA af = TA(0), avd = TA(0), avo = TA(0);
 
   // the direction (u, v or w) and element of the pairs of the next tile are loaded while the
   // current tile is computed.  only where the 2 registers this takes do not lower the
@@ -1278,20 +1602,27 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
       }
     }
   };
-  if constexpr (PREFETCH) fetch(0);
+  if constexpr (PREFETCH && !SYM) fetch(0);
+  // CB2S: the 2-body coefficients of atom i in LDS (Hf: B-splines evaluated here, cm 1)
+  constexpr bool CB2S = SYM && LMP_POD_HF_CB2S;
+  const bool cb2l = CB2S && ft.cb2 && ft.bs.r0v && (ft.cm == 1) && (ft.nrbf2 <= JT * PD);
+  if (cb2l)
+    for (int t = lane; t < ft.nrbf2; t += 64) pd_s[t] = ft.cb2[i * ft.ca + t];
 
   for (int j0 = 0; j0 < nj; j0 += JT) {
     const int nt = min(JT, nj - j0);
-    __syncthreads();
+    if constexpr (!SYM) __syncthreads();
     // powers of u, v and w of the pairs of the tile, one direction per lane
-    if constexpr (PREFETCH) {
-      if (lane < 3 * JT) {
-        const int jj = lane % JT, d = lane / JT;
-        T *pd = pd_s + jj * PD + d * L1;
+    if constexpr (SYM) {
+    } else if constexpr (PREFETCH) {
+      const int ls = (HF && (LMP_POD_HF_REMAT & 2)) ? pod_opaque(lane) : lane;
+      if (ls < 3 * JT) {
+        const int jj = ls % JT, d = ls / JT;
+        T *pd = PDT ? pd_s + d * L1 * JT + jj : pd_s + jj * PD + d * L1;
         const bool in = (jj < nt);
         T p = in ? static_cast<T>(1.0) : T(0);
         for (int n = 0; n < L1; n++) {
-          pd[n] = p;
+          pd[PS * n] = p;
           p *= xh;
         }
         if (d == 0) tj_s[jj] = in ? tjh : -1;
@@ -1317,7 +1648,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         if (d == 0) tj_s[jj] = -1;
       }
     }
-    __syncthreads();
+    if constexpr (!SYM) __syncthreads();
 
     // C^T (k x pairs) = F^T R^T on the matrix cores: lane column lr is pair s0 + lr and
     // its four accumulators are rows k = 16 kt + row(lane, v), so each lane sums over its own
@@ -1327,10 +1658,13 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
 
       // B operands of this pair tile: column s0 + lr, inner index 4*cs + lq; each lane
       // evaluates the radial functions of its own entries
-      const int jb = s0 + lr;
-      const int tjb = tj_s[jb];
+      const int lb = (HF && (LMP_POD_HF_REMAT & 4)) ? pod_opaque(lane) : lane;
+      const int lrb = lb & 15;
+      const int jb = s0 + lrb;
+      const int tjb = SYM ? ((jb < nt) ? 0 : -1) : tj_s[jb];
+      T eu = T(0), ev = T(0), ew = T(0);    // SYM: direction of pair jb
       const PairRadial<T> prad(rs, pg, start + j0 + min(jb, nt - 1));
-      const T *pd = pd_s + jb * PD;
+      const T *pd = PDT ? pd_s + jb : pd_s + jb * PD;
       if constexpr (!GROUP) {
         TA br[CSM], bdr[CSM];
 #pragma unroll
@@ -1344,8 +1678,57 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
           }
         }
 
+        if constexpr (SYM) {
+          pg.uvw(start + j0 + min(jb, nt - 1), eu, ev, ew);
+          const int g = lb >> 4;
+          const T X = (g == 0) ? eu : ((g == 2) ? ew : ev);
+          const T Y = (g == 0) ? ev : ((g == 1) ? ew : eu);
+          const T Z = (g == 1) ? eu : ((g == 2) ? ev : ew);
+          const T X2 = X * X, XY = X * Y;
+          TA SX = TA(0), SY = TA(0), SZ = TA(0);
+#pragma unroll
+          for (int kt = 0; kt < 2; kt++) {
+            acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
+#pragma unroll
+            for (int cs = 0; cs < CSM; cs++)
+              if (cs < CS) {
+                const TA a = ((rk[kt] >= 0) && (ce[cs] >= 0))
+                    ? static_cast<TA>(fc_s[ce[cs] + nelements * rk[kt] + NeK3 * cm[cs]])
+                    : TA(0);
+                accG = Mfma<TA>::mma(a, br[cs], accG);
+                accH = Mfma<TA>::mma(a, bdr[cs], accH);
+              }
+            if (kt == 0) {    // slots 0-3: 1, X, X^2, XY
+              SA += accH[0];
+              SA += accH[1] * X;
+              SX += accG[1];
+              SA += accH[2] * X2;
+              SX += accG[2] * (X + X);
+              SA += accH[3] * XY;
+              SX += accG[3] * Y;
+              SY += accG[3] * X;
+            } else {          // slots 4-7: X^3, X^2 Y, X Y^2, XYZ
+              SA += accH[0] * (X2 * X);
+              SX += accG[0] * (static_cast<T>(3.0) * X2);
+              SA += accH[1] * (X2 * Y);
+              SX += accG[1] * (XY + XY);
+              SY += accG[1] * X2;
+              SA += accH[2] * (XY * Y);
+              SX += accG[2] * (Y * Y);
+              SY += accG[2] * (XY + XY);
+              SA += accH[3] * (XY * Z);
+              SX += accG[3] * (Y * Z);
+              SY += accG[3] * (X * Z);
+              SZ += accG[3] * XY;
+            }
+          }
+          // back to (u, v, w)
+          SU = (g == 0) ? SX : ((g == 1) ? SZ : SY);
+          SV = (g == 0) ? SY : ((g == 2) ? SZ : SX);
+          SW = (g == 1) ? SY : ((g == 2) ? SX : SZ);
+        } else
         for (int kt = 0; kt < KT; kt++) {
-          const int k = 16 * kt + lr;
+          const int k = 16 * kt + lrb;
           acc_t accG = acc_t{0, 0, 0, 0}, accH = acc_t{0, 0, 0, 0};
 #pragma unroll
           for (int cs = 0; cs < CSM; cs++)
@@ -1358,10 +1741,10 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
             }
 #pragma unroll
           for (int v = 0; v < 4; v++) {
-            const int kv = 16 * kt + Mfma<TA>::row(lane, v);
+            const int kv = 16 * kt + Mfma<TA>::row(lb, v);
             if (kv < K3) {
               T P, Pu, Pv, Pw;
-              pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+              pod_monomial_s<T, PS>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
               SA += accH[v] * static_cast<TA>(P);
               SU += accG[v] * static_cast<TA>(Pu);
               SV += accG[v] * static_cast<TA>(Pv);
@@ -1409,7 +1792,7 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
               const int kv = 16 * kt + Mfma<TA>::row(lane, v);
               if (kv < K3) {
                 T P, Pu, Pv, Pw;
-                pod_monomial<T>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
+                pod_monomial_s<T, PS>(pd, ex_s[kv], L1, P, Pu, Pv, Pw);
                 SA += accH[v] * static_cast<TA>(P);
                 SU += accG[v] * static_cast<TA>(Pu);
                 SV += accG[v] * static_cast<TA>(Pv);
@@ -1428,11 +1811,46 @@ __global__ void __launch_bounds__(64) LMP_POD_ALLBODY_ATTR
         SV += __shfl_xor(SV, off);
         SW += __shfl_xor(SW, off);
       }
-      if ((lq == 0) && (jb < nt)) {
+      if constexpr (SPREAD) {
+        const int le = (HF && (LMP_POD_HF_REMAT & 1)) ? pod_opaque(lane) : lane;
+        const int lqe = le >> 4, jbe = s0 + (le & 15);
+        if ((lqe < 3) && (jbe < nt)) {
+          TA fd, vd, vo;
+          const T *pde = PDT ? pd_s + jbe : pd_s + jbe * PD;
+          if (EREG && cb2l)
+            pod_pair_force_dg<T, TA, true>(ft, pg.N, i, start + j0 + jbe, 0, SA, SU, SV, SW, lqe,
+                                           pg.r(start + j0 + jbe), eu, ev, ew, fd, vd, vo, pd_s);
+          else if constexpr (EREG)
+            pod_pair_force_dg<T, TA>(
+                ft, pg.N, i, start + j0 + jbe, SYM ? 0 : tj_s[jbe], SA, SU, SV, SW, lqe,
+                pg.r(start + j0 + jbe), SYM ? eu : pde[PS], SYM ? ev : pde[PS * (L1 + 1)],
+                SYM ? ew : pde[PS * (2 * L1 + 1)], fd, vd, vo);
+          else
+            pod_pair_force_d<T, TA>(ft, pg, i, start + j0 + jb, tjb, SA, SU, SV, SW, lq, fd, vd,
+                                    vo);
+          af += fd;
+          avd += vd;
+          avo += vo;
+        }
+      } else if ((lq == 0) && (jb < nt)) {
         T g[9];
         pod_pair_gradients<T>(g, pg, start + j0 + jb);
         pod_pair_finish<T, TA>(ft, pg, fij, i, start + j0 + jb, tjb, g, SA, SU, SV, SW, acc_s);
       }
+    }
+  }
+  if constexpr (SPREAD) {
+#pragma unroll
+    for (int off = 1; off < 16; off <<= 1) {
+      af += __shfl_xor(af, off);
+      avd += __shfl_xor(avd, off);
+      avo += __shfl_xor(avo, off);
+    }
+    __syncthreads();
+    if ((lr == 0) && (lq < 3)) {
+      acc_s[lq] = af;
+      acc_s[3 + lq] = avd;
+      acc_s[6 + lq] = avo;
     }
   }
   __syncthreads();
@@ -1446,7 +1864,8 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
                         T *forcecoeff, const FcArgs<T> *fca, const RadialSrc<T> &rs,
                         const PairGeom<T> &pg, const int *tj, const int *numij,
                         const int *pq_m, const int *pq_d, int nelements, int nrbf3, int K3,
-                        int Ni, int Nij, bool use_mfma)
+                        int Ni, int Nij, bool use_mfma, bool hf = false,
+                        const int *pq_ex = nullptr)
 {
   if ((Ni <= 0) || (nrbf3 > MAX_RADIAL) || (nelements > MAX_ELEMENTS)) return false;
   int L = 0;
@@ -1470,17 +1889,16 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
     const size_t lds = nfc * sizeof(T) + tile;
     const FcArgs<T> g = fuse ? *fca : FcArgs<T>{};
     if (lds <= 65536) {
-#define LMP_POD_ALLBODY_MFMA(CSM, GROUP)                                                           \
-  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP>),           \
-                     dim3(Ni), dim3(64),                                                           \
-                     occ_lds(reinterpret_cast<const void *>(                                       \
-                                 allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP>),               \
-                             64, lds),                                                             \
-                     stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,                            \
-                     pq_m, pq_d, nelements, nrbf3, K3, L, Nij)
+#define LMP_POD_ALLBODY_MFMA1(CSM, GROUP, H)                                                       \
+  hipLaunchKernelGGL(HIP_KERNEL_NAME(allbody_forces_mfma_kernel<T, TA, CSM, JT, GROUP, H>),        \
+                     dim3(Ni), dim3(64), lds, stream, fij, ft, forcecoeff, g, rs, pg, tj, numij,   \
+                     pq_m, pq_d, nelements, nrbf3, K3, L, Nij, pq_ex)
+#define LMP_POD_ALLBODY_MFMA(CSM, GROUP) LMP_POD_ALLBODY_MFMA1(CSM, GROUP, false)
       // 5 or 6 slices: two groups (90 instead of 208 registers) is faster; with 7 or 8 the
       // second pass over the monomials costs more than the occupancy gains
-      if (CS <= 2)
+      if (hf && pq_ex && (CS <= 2))
+        LMP_POD_ALLBODY_MFMA1(2, false, true);
+      else if (CS <= 2)
         LMP_POD_ALLBODY_MFMA(2, false);
       else if (CS <= 4)
         LMP_POD_ALLBODY_MFMA(4, false);
@@ -1489,6 +1907,7 @@ bool allbody_forces_otf(hipStream_t stream, T *fij, const ForceTally<T, TA> &ft,
       else
         LMP_POD_ALLBODY_MFMA(8, false);
 #undef LMP_POD_ALLBODY_MFMA
+#undef LMP_POD_ALLBODY_MFMA1
       return hipGetLastError() == hipSuccess;
     }
   }
@@ -1646,13 +2065,13 @@ template <typename T, typename TA>
 __global__ void __launch_bounds__(64)
     twobodydesc_kernel(T *__restrict__ d2, const T *__restrict__ rbf2, const int *__restrict__ tj,
                        const int *__restrict__ numij, const int nelements, const int nrbf2,
-                       const int Ni, const int Nij)
+                       const int Ni, const int Nij, const int ps, const int da, const int dm)
 {
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
   const int i = blockIdx.x;
-  const int start = numij[i];
-  const int end = numij[i + 1];
+  const int start = (ps > 0) ? i * ps : numij[i];
+  const int end = (ps > 0) ? start + numij[i + 1] : numij[i + 1];
   const int nd = nelements * nrbf2;
   for (int t = threadIdx.x; t < nd; t += blockDim.x) s_s[t] = TA(0);
   __syncthreads();
@@ -1661,18 +2080,19 @@ __global__ void __launch_bounds__(64)
     for (int m = 0; m < nrbf2; m++) atomicAdd(se + m, static_cast<TA>(rbf2[n + Nij * m]));
   }
   __syncthreads();
-  for (int t = threadIdx.x; t < nd; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(s_s[t]);
+  for (int t = threadIdx.x; t < nd; t += blockDim.x)
+    d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
 }
 
 template <typename T, typename TA>
 bool twobodydesc(hipStream_t stream, T *d2, const T *rbf2, const int *tj, const int *numij,
-                 int nelements, int nrbf2, int Ni, int Nij)
+                 int nelements, int nrbf2, int Ni, int Nij, int ps, int da, int dm)
 {
   if (Ni <= 0) return false;
   const size_t lds = (size_t) nelements * nrbf2 * sizeof(TA);
   if (lds > 65536) return false;
   hipLaunchKernelGGL(HIP_KERNEL_NAME(twobodydesc_kernel<T, TA>), dim3(Ni), dim3(64), lds, stream,
-                     d2, rbf2, tj, numij, nelements, nrbf2, Ni, Nij);
+                     d2, rbf2, tj, numij, nelements, nrbf2, Ni, Nij, ps, da, dm);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -1683,6 +2103,43 @@ bool twobodydesc(hipStream_t stream, T *d2, const T *rbf2, const int *tj, const 
 ====================================================================== */
 
 // wavefront and block sums; blockDim.x must be a multiple of 64 and at most 1024
+// sum over the 64 lanes with DPP row operations (no LDS permutes), the result in every lane
+// (read from lane 63).  CDNA (gfx9) DPP controls: quad_perm, row_half_mirror, row_mirror,
+// row_bcast15, row_bcast31
+template <int CTRL, int ROWMASK> __device__ inline double dpp_move(const double v)
+{
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_update_dpp(0, (int) (b & 0xffffffffll), CTRL, ROWMASK, 0xf, false);
+  const int hi = __builtin_amdgcn_update_dpp(0, (int) (b >> 32), CTRL, ROWMASK, 0xf, false);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+}
+template <int CTRL, int ROWMASK> __device__ inline float dpp_move(const float v)
+{
+  return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v),
+                                                                CTRL, ROWMASK, 0xf, false));
+}
+__device__ inline double lane63(const double v)
+{
+  const long long b = __builtin_bit_cast(long long, v);
+  const int lo = __builtin_amdgcn_readlane((int) (b & 0xffffffffll), 63);
+  const int hi = __builtin_amdgcn_readlane((int) (b >> 32), 63);
+  return __builtin_bit_cast(double, ((long long) hi << 32) | (unsigned int) lo);
+}
+__device__ inline float lane63(const float v)
+{
+  return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, v), 63));
+}
+template <typename V> __device__ inline V wave_sum_dpp(V v)
+{
+  v += dpp_move<0xb1, 0xf>(v);     // quad_perm [1,0,3,2]
+  v += dpp_move<0x4e, 0xf>(v);     // quad_perm [2,3,0,1]
+  v += dpp_move<0x141, 0xf>(v);    // row_half_mirror
+  v += dpp_move<0x140, 0xf>(v);    // row_mirror
+  v += dpp_move<0x142, 0xa>(v);    // row_bcast15 to rows 1 and 3
+  v += dpp_move<0x143, 0xc>(v);    // row_bcast31 to rows 2 and 3
+  return lane63(v);
+}
+
 template <typename V> __device__ inline V wave_sum(V v)
 {
   for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off);
@@ -2085,6 +2542,142 @@ bool neighbor_fused(hipStream_t stream, T *rr, T *rhat, int *typeai, int *idxi, 
                 tj, numij, status, reinterpret_cast<int *>(status + nb), x, rcutsq, a, gi1, Ni, N);
 }
 
+/* ----------------------------------------------------------------------
+   the pairs of the block with a fixed stride: the pairs of atom i inside the
+   cutoff, in the order of its neighbor list, go to i*ps .. i*ps + numij[i+1]-1
+   (ps >= the largest neighbor count), so that every wavefront writes its
+   pairs without waiting for the counts of the other atoms.  one wavefront per
+   atom, four atoms per block.  idxi, ai and ti are not written (the consumers
+   know the atom of a pair); tj is written only with more than one element.
+   with d2 != nullptr the B-spline 2-body descriptors of the atom are also
+   summed (as twobodydesc_bspline_kernel) and written to d2[i*da + dm*t].
+   HALF: two atoms per wavefront, 32 lanes each (most lists are shorter than 64).
+------------------------------------------------------------------------- */
+
+// HF: the sizes of the Hf model (one element, all atom types element 0, 40 B-splines summed
+// into the per-atom rows of 66 descriptors) as constants
+template <typename T, typename TA, bool HALF, bool HF>
+__global__ void __launch_bounds__(256)
+    neighbor_fixed_kernel(T *__restrict__ rr, T *__restrict__ rhat, int *__restrict__ typeai,
+                          int *__restrict__ aj, int *__restrict__ ti, int *__restrict__ tj,
+                          int *__restrict__ numij, const T *__restrict__ x,
+                          const T *__restrict__ rcutsq, const NeighArgs a, const int gi1,
+                          const int Ni, const int N, const int ps, const int ne_in,
+                          T *__restrict__ d2, const BsplineArgs<T> bs_in, const int nrbf2_in,
+                          const int da_in, const int dm_in, const int one_in)
+{
+  BsplineArgs<T> bs = bs_in;
+  if constexpr (HF) {
+    bs.ne = 1;
+    bs.gmax = PodHf::nrbf2 - 4;
+  }
+  const int ne = HF ? 1 : ne_in, nrbf2 = HF ? PodHf::nrbf2 : nrbf2_in;
+  const int da = HF ? PodHf::nDes : da_in, dm = HF ? 1 : dm_in, one = HF ? 1 : one_in;
+  extern __shared__ char lds_raw[];
+  constexpr int LPA = HALF ? 32 : 64;    // lanes per atom
+  const int slot = threadIdx.x / LPA;    // atom of the block
+  const int i = blockIdx.x * (blockDim.x / LPA) + slot;
+  const int lane = threadIdx.x & (LPA - 1);
+  const int hsel = (threadIdx.x & 63) / LPA;    // half of the wavefront
+  const int nd = ne * nrbf2;
+  TA *s_s = reinterpret_cast<TA *>(lds_raw) + slot * nd;    // [e][m] of atom i
+  if (d2) {
+    for (int t = lane; t < nd; t += LPA) s_s[t] = TA(0);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+  }
+  if (i >= Ni) return;
+  const int gi = a.ilist[gi1 + i];
+  // one != 0: every atom type is element 0, the types need not be read
+  const int itype = one ? 0 : a.map[a.type[gi]];
+  const T rc0 = one ? rcutsq[0] : T(0);
+  const T xi0 = x[gi * a.xs0];
+  const T xi1 = x[gi * a.xs0 + a.xs1];
+  const T xi2 = x[gi * a.xs0 + 2 * a.xs1];
+  const int jnum = a.numneigh[gi];
+  const unsigned long long below = (1ull << lane) - 1ull;
+  int offset = i * ps;
+  for (int j0 = 0; j0 < jnum; j0 += LPA) {
+    const int jj = j0 + lane;
+    bool in = false;
+    int gj = 0, jtype = 0;
+    T dx = T(0), dy = T(0), dz = T(0);
+    if (jj < jnum) {
+      if (one) {
+        gj = a.neighbors[gi * a.ns0 + jj * a.ns1] & NEIGHMASK;
+        dx = x[gj * a.xs0] - xi0;
+        dy = x[gj * a.xs0 + a.xs1] - xi1;
+        dz = x[gj * a.xs0 + 2 * a.xs1] - xi2;
+        in = dx * dx + dy * dy + dz * dz < rc0;
+      } else
+        in = pod_neigh_test<T>(a, x, rcutsq, gi, itype, xi0, xi1, xi2, jj, gj, jtype, dx, dy, dz);
+    }
+    unsigned long long mask = __ballot(in);
+    if (HALF) mask = (mask >> (32 * hsel)) & 0xffffffffull;
+    if (in) {
+      const int n = offset + __popcll(mask & below);
+      // as in neighbor_list_kernel
+      const T r = sqrt(dx * dx + dy * dy + dz * dz);
+      const T sinv = static_cast<T>(1.0) / r;
+      rr[n] = r;
+      rhat[n] = dx * sinv;
+      rhat[n + N] = dy * sinv;
+      rhat[n + 2 * N] = dz * sinv;
+      aj[n] = gj;
+      if (ne > 1) {
+        ti[n] = itype;
+        tj[n] = jtype;
+      }
+      if (d2) {
+        T Bq[4], dBq[4];
+        TA *se = s_s + pod_bspline_eval(bs, (ne > 1) ? itype * ne + jtype : 0, r, Bq, dBq) +
+            nrbf2 * ((ne > 1) ? jtype : 0);
+#pragma unroll
+        for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
+      }
+    }
+    offset += __popcll(mask);
+  }
+  if (lane == 0) {
+    numij[i + 1] = offset - i * ps;
+    typeai[i] = itype;
+  }
+  if (d2) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
+    for (int t = lane; t < nd; t += LPA)
+      d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
+  }
+}
+
+template <typename T, typename TA>
+bool neighbor_fixed(hipStream_t stream, T *rr, T *rhat, int *typeai, int *aj, int *ti, int *tj,
+                    int *numij, const T *x, const T *rcutsq, const NeighArgs &a, int gi1, int Ni,
+                    int N, int ps, int ne, T *d2 = nullptr, const BsplineArgs<T> &bs = {},
+                    int nrbf2 = 0, int da = 0, int dm = 0, int one = 0, bool half = false,
+                    bool hf = false)
+{
+  if (Ni <= 0) return false;
+  const int apb = half ? 8 : 4;    // atoms per block
+  const size_t lds = d2 ? (size_t) apb * ne * nrbf2 * sizeof(TA) : 0;
+  if (lds > 32768) return false;
+  // the Hf instance: one element and type, B-spline descriptors in the per-atom rows
+  if (hf && half && d2 && one && (ne == 1) && (nrbf2 == PodHf::nrbf2) && (bs.gmax == nrbf2 - 4) &&
+      (da == PodHf::nDes) && (dm == 1))
+    return launch(neighbor_fixed_kernel<T, TA, true, true>, nblocks_for(Ni, apb), 256, lds, stream,
+                  rr, rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2, bs,
+                  nrbf2, da, dm, one);
+  if (half)
+    return launch(neighbor_fixed_kernel<T, TA, true, false>, nblocks_for(Ni, apb), 256, lds,
+                  stream, rr, rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne,
+                  d2, bs, nrbf2, da, dm, one);
+  return launch(neighbor_fixed_kernel<T, TA, false, false>, nblocks_for(Ni, apb), 256, lds,
+                stream, rr, rhat, typeai, aj, ti, tj, numij, x, rcutsq, a, gi1, Ni, N, ps, ne, d2,
+                bs, nrbf2, da, dm, one);
+}
+
 // maximum number of neighbors of the atoms in ilist, or -1 on failure
 
 static __global__ void __launch_bounds__(256) max_neighs_kernel(int *__restrict__ out,
@@ -2128,7 +2721,7 @@ __global__ void __launch_bounds__(256)
                                const T *__restrict__ invdrv, const T *__restrict__ coef,
                                const int ne, const int nb, const int nr, const int N,
                                const int *__restrict__ numij, T *__restrict__ d2,
-                               const int nrbf2, const int Ni)
+                               const int nrbf2, const int Ni, const int da, const int dm)
 {
   __shared__ TA d2_s[PERATOM ? 256 : 1];    // PERATOM: 2-body descriptors of atom i, [e][m]
   if (PERATOM) {
@@ -2136,11 +2729,10 @@ __global__ void __launch_bounds__(256)
     __syncthreads();
   }
   auto pair = [&](const int n) {
-  const int pair = ti[n] * ne + tj[n];
+  const int pair = (ne > 1) ? ti[n] * ne + tj[n] : 0;
   const T r = pg.r(n);
   const T r0 = r0v[pair];
   const T invdr = invdrv[pair];
-  const T invdrr = invdr / r;
   const T tg = (r - r0) * invdr;
   int b = (int) tg;
   if (b < 0) b = 0;
@@ -2169,16 +2761,20 @@ __global__ void __launch_bounds__(256)
     const T f = c0 + t * (c1 + t * (c2 + t * c3));
     const T dfdt = c1 + t * (static_cast<T>(2.0) * c2 + static_cast<T>(3.0) * c3 * t);
     rbf[n + N * k] = f;
-    drbf[n + N * k] = dfdt * invdrr;
-    if (PERATOM && (k < nrbf2)) atomicAdd(d2_s + tj[n] * nrbf2 + k, static_cast<TA>(f));
+    drbf[n + N * k] = dfdt * invdr;    // R'(r)
+    if (PERATOM && (k < nrbf2))
+      atomicAdd(d2_s + ((ne > 1) ? tj[n] : 0) * nrbf2 + k, static_cast<TA>(f));
   }
   };
 
   if (PERATOM) {
     const int i = blockIdx.x;
-    for (int n = numij[i] + threadIdx.x; n < numij[i + 1]; n += blockDim.x) pair(n);
+    int start, nj;
+    pg.range(numij, i, start, nj);
+    for (int n = start + threadIdx.x; n < start + nj; n += blockDim.x) pair(n);
     __syncthreads();
-    for (int t = threadIdx.x; t < ne * nrbf2; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(d2_s[t]);
+    for (int t = threadIdx.x; t < ne * nrbf2; t += blockDim.x)
+      d2[(long) i * da + (long) dm * t] = static_cast<T>(d2_s[t]);
   } else {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n < N) pair(n);
@@ -2196,10 +2792,11 @@ __global__ void __launch_bounds__(256)
   if (n >= N) return;
   T Bq[4], dBq[4];
   base[n] = pod_bspline_pair(g, pg, n, Bq, dBq);
+  const T r = pg.r(n);    // dBq is R'(r)/r, the stored basis R'(r)
 #pragma unroll
   for (int q = 0; q < 4; q++) {
     rbf2[n + q * N] = Bq[q];
-    drbf2[n + q * N] = dBq[q];
+    drbf2[n + q * N] = dBq[q] * r;
   }
 }
 
@@ -2225,14 +2822,15 @@ __global__ void __launch_bounds__(256)
     const int ii = idxi[n] + Ni * (pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * tj[n]);
 #pragma unroll
     for (int m = 0; m < 4; ++m) cR += static_cast<TA>(cb2[ii + Ni * m] * dBq[m]);
+    cR *= static_cast<TA>(pg.r(n));    // dBq is R'(r)/r
   } else {
-    // base == nullptr: all nm = nrbf2 radial functions; otherwise nm = 4 B-splines from base[n]
+    // base == nullptr: all nm = nrbf2 radial functions; otherwise nm = 4 B-splines from base[n];
+    // the stored drbf2 is R'(r)
     const int ii = idxi[n] + Ni * ((base ? base[n] : 0) + nrbf2 * tj[n]);
     for (int m = 0; m < nm; ++m) cR += static_cast<TA>(cb2[ii + Ni * m] * drbf2[n + Nij * m]);
   }
   T u, v, w;
   pg.uvw(n, u, v, w);
-  cR *= static_cast<TA>(pg.r(n));
   fij[3 * n + 0] += static_cast<T>(cR * static_cast<TA>(u));
   fij[3 * n + 1] += static_cast<T>(cR * static_cast<TA>(v));
   fij[3 * n + 2] += static_cast<T>(cR * static_cast<TA>(w));
@@ -2244,12 +2842,15 @@ __global__ void __launch_bounds__(64)
                                const int *__restrict__ base, const int *__restrict__ tj,
                                const int *__restrict__ numij, const int nelements,
                                const int nrbf2, const int Ni, const int Nij,
-                               const BsplineArgs<T> bs, const PairGeom<T> pg)
+                               const BsplineArgs<T> bs, const PairGeom<T> pg, const int da,
+                               const int dm)
 {
   extern __shared__ char lds_raw[];
   TA *s_s = reinterpret_cast<TA *>(lds_raw);    // [e][m]
   const int i = blockIdx.x;
-  const int start = numij[i], end = numij[i + 1];
+  int start, nj;
+  pg.range(numij, i, start, nj);
+  const int end = start + nj;
   const int nd = nelements * nrbf2;
   for (int t = threadIdx.x; t < nd; t += blockDim.x) s_s[t] = TA(0);
   __syncthreads();
@@ -2257,16 +2858,17 @@ __global__ void __launch_bounds__(64)
     if (bs.r0v) {
       // B-splines evaluated here instead of read from rbf2/base
       T Bq[4], dBq[4];
-      TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * tj[n];
+      TA *se = s_s + pod_bspline_pair(bs, pg, n, Bq, dBq) + nrbf2 * ((nelements > 1) ? tj[n] : 0);
 #pragma unroll
       for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(Bq[q]));
     } else {
-      TA *se = s_s + base[n] + nrbf2 * tj[n];
+      TA *se = s_s + base[n] + nrbf2 * ((nelements > 1) ? tj[n] : 0);
       for (int q = 0; q < 4; q++) atomicAdd(se + q, static_cast<TA>(rbf2[n + Nij * q]));
     }
   }
   __syncthreads();
-  for (int t = threadIdx.x; t < nd; t += blockDim.x) d2[i + Ni * t] = static_cast<T>(s_s[t]);
+  for (int t = threadIdx.x; t < nd; t += blockDim.x)
+    d2[(long) i * da + (long) dm * t] = static_cast<T>(s_s[t]);
 }
 
 /* ----------------------------------------------------------------------
@@ -2443,6 +3045,7 @@ __global__ void __launch_bounds__(256)
 
 struct LocalEnvArgs {
   int nCls, nDes, nCoeff, nActMax;
+  int dpp;    // 1: wave sums of localenv_wave_kernel with DPP
 };
 
 template <typename T, typename TA>
@@ -2675,6 +3278,302 @@ __global__ void __launch_bounds__(256)
   TA sum = static_cast<TA>(U[i] * proj[m + a.nDes * typei]);
   for (int k = 0; k < kni; ++k) sum += static_cast<TA>(cefs[knc + k * a.nDes] * D[i + Ni * k]);
   cb[i + Ni * m] = static_cast<T>(sum);
+}
+
+// out[i + Ni*m] = in[i*M + m]: per-atom rows of M values to the layout [i + Ni*m]
+template <typename T>
+__global__ void __launch_bounds__(256)
+    atom_to_strided_kernel(T *__restrict__ out, const T *__restrict__ in, const int Ni,
+                           const int M)
+{
+  const long idx = (long) blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (long) Ni * M) return;
+  const int i = (int) (idx % Ni), m = (int) (idx / Ni);
+  out[idx] = in[(long) i * M + m];
+}
+
+/* ----------------------------------------------------------------------
+   local EA-POD (localenv_pca_split, localenv_atom_split and localenv_cb) in
+   one kernel, one wavefront per atom: the projection and the sums over the
+   descriptors are wave sums, and the two binary searches for the active
+   clusters are ballots over the (sorted) cluster edges.  with g.d3 != nullptr
+   the 3- and 4-body descriptors are computed first from sumU, as desc34_kernel,
+   and stay in LDS; the other descriptors are read from B.  the descriptors
+   of atom i are B[i*sa + sm*m] and its coefficients go to cb[i*sa + sm*m].
+   at most KM <= LP_KMAX active clusters.
+------------------------------------------------------------------------- */
+
+// LMP_POD_LENV_DTAB (HF instance): the 3/4-body descriptor index tables in LDS
+#ifndef LMP_POD_LENV_DTAB
+#define LMP_POD_LENV_DTAB 1
+#endif
+// PRE (nDes <= 128, nCls <= 64, used with KM = 4): the cluster tables of the element and the projection are
+// loaded into registers at the start, independent of the descriptors, and the coefficients of
+// the active clusters are loaded once for the sums and the force coefficients
+// HF: the sizes of the Hf model (PodHf) as constants (descriptors stored per atom)
+template <typename T, typename TA, int KM, bool PRE, bool HF>
+__global__ void __launch_bounds__(64)
+    localenv_wave_kernel(T *__restrict__ ei, T *__restrict__ cb, const T *__restrict__ B,
+                         const DescArgs<T> g_in, const T *__restrict__ sumU,
+                         const T *__restrict__ proj, const T *__restrict__ ledges,
+                         const T *__restrict__ redges, const T *__restrict__ cent,
+                         const T *__restrict__ cefs, const T *__restrict__ invlcut2,
+                         const T *__restrict__ invrcut2, const int *__restrict__ typeai,
+                         const LocalEnvArgs a_in, const int nl2_in, const int nl3_in,
+                         const int sa_in, const int sm_in)
+{
+  DescArgs<T> g = g_in;
+  LocalEnvArgs a = a_in;
+  if constexpr (HF) {
+    g.nelements = 1;
+    g.nabf3_active = PodHf::nabf3_active;
+    g.nrbf4 = PodHf::nrbf4;
+    g.nabf4 = PodHf::nabf4;
+    g.K3 = PodHf::K3;
+    g.Q4 = PodHf::Q4;
+    g.do4 = 1;
+    a.nCls = PodHf::nCls;
+    a.nDes = PodHf::nDes;
+    a.nCoeff = PodHf::nCoeff;
+    a.nActMax = PodHf::nActMax;
+  }
+  const int nl2 = HF ? PodHf::nl2 : nl2_in, nl3 = HF ? PodHf::nl3 : nl3_in;
+  const int sa = HF ? PodHf::nDes : sa_in, sm = HF ? 1 : sm_in;
+  extern __shared__ char lds_raw[];
+  const int nDes = a.nDes, nCls = a.nCls;
+  T *d_s = reinterpret_cast<T *>(lds_raw);    // descriptors of atom i
+  T *u_s = d_s + nDes;                        // sumU of atom i: [m][q][e]
+  const int i = blockIdx.x;
+  const int lane = threadIdx.x;
+  const long ib = (long) i * sa;
+  const int typei = HF ? 0 : typeai[i];    // one element in the Hf model
+  const int ncct = typei * nCls;
+  const T *pr = proj + typei * nDes;
+
+  // PRE: lane c holds the edges, centroid and cutoffs of cluster c; lane m (and m + 64) the
+  // projection of descriptor m
+  T re = T(0), le = T(0), ce = T(0), irc = T(0), ilc = T(0), pv[2] = {T(0), T(0)};
+  if (PRE) {
+    if (lane < nCls) {
+      re = redges[ncct + lane];
+      le = ledges[ncct + lane];
+      ce = cent[ncct + lane];
+      irc = invrcut2[ncct + lane];
+      ilc = invlcut2[ncct + lane];
+    }
+#pragma unroll
+    for (int q = 0; q < 2; q++)
+      if (lane + 64 * q < nDes) pv[q] = pr[lane + 64 * q];
+  }
+
+  if (g.d3) {
+    const int S = g.nelements * g.K3 * g.nrbf3;
+    for (int t = lane; t < S; t += 64) u_s[t] = sumU[(long) S * i + t];
+    for (int m = lane; m < nDes; m += 64) d_s[m] = (m < nl2) ? B[ib + (long) sm * m] : T(0);
+    // the index tables of the 3- and 4-body descriptors in LDS (after sumU), read by the inner
+    // loops of desc34_atom() instead of global memory
+    int *t_s = reinterpret_cast<int *>(u_s + S);
+    int *pc3 = t_s, *pa4 = pc3 + PodHf::K3, *pb4 = pa4 + PodHf::nabf4 + 1;
+    int *pc4 = pb4 + 3 * PodHf::Q4;
+    constexpr int QO = PodHf::K3 + PodHf::nabf4 + 1 + 4 * PodHf::Q4;    // int2 at an even offset
+    int2 *qr = reinterpret_cast<int2 *>(t_s + ((QO + 1) & ~1));
+    if constexpr (HF && LMP_POD_LENV_DTAB) {
+      if (lane < PodHf::K3) pc3[lane] = g.pc3[lane];
+      if (lane <= PodHf::nabf4) pa4[lane] = g.pa4[lane];
+      if (lane < 3 * PodHf::Q4) pb4[lane] = g.pb4[lane];
+      if (lane < PodHf::Q4) pc4[lane] = g.pc4[lane];
+      if (lane < PodHf::nabf3_active) qr[lane] = g.qrange3[lane];
+    }
+    __syncthreads();
+    DescArgs<T> gl = g;
+    gl.d3 = d_s + nl2;
+    gl.d4 = d_s + nl2 + nl3;
+    gl.Ni = 1;
+    if constexpr (HF && LMP_POD_LENV_DTAB) {
+      gl.pc3 = pc3;
+      gl.pa4 = pa4;
+      gl.pb4 = pb4;
+      gl.pc4 = pc4;
+      gl.qrange3 = qr;
+    }
+    desc34_atom<T, TA>(gl, u_s, 0);
+  } else {
+    for (int m = lane; m < nDes; m += 64) d_s[m] = B[ib + (long) sm * m];
+  }
+  __syncthreads();
+
+  // projection and active clusters, as localenv_pca_split_kernel
+  TA p = TA(0);
+  if (PRE) {
+#pragma unroll
+    for (int q = 0; q < 2; q++)
+      if (lane + 64 * q < nDes) p += static_cast<TA>(pv[q] * d_s[lane + 64 * q]);
+  } else
+    for (int m = lane; m < nDes; m += 64) p += static_cast<TA>(pr[m] * d_s[m]);
+  const TA pcai = a.dpp ? wave_sum_dpp(p) : wave_sum(p);
+  int kl = 0, kni = 1;
+  if (PRE) {
+    kl = __popcll(__ballot((lane < nCls) && (static_cast<TA>(re) < pcai)));
+    const int hi = min(kl + a.nActMax, nCls);
+    kni += __popcll(__ballot((lane > kl) && (lane < hi) && (static_cast<TA>(le) <= pcai)));
+  } else {
+    for (int c0 = 0; c0 < nCls; c0 += 64) {
+      const int cc = c0 + lane;
+      kl += __popcll(__ballot((cc < nCls) && (static_cast<TA>(redges[ncct + cc]) < pcai)));
+    }
+    const int hi = min(kl + a.nActMax, nCls);
+    for (int c0 = kl + 1; c0 < hi; c0 += 64) {
+      const int cc = c0 + lane;
+      kni += __popcll(__ballot((cc < hi) && (static_cast<TA>(ledges[ncct + cc]) <= pcai)));
+    }
+  }
+
+  // sumE(k) = sum_m cefs(m, k) B(m), as localenv_atom_split_kernel
+  const int nc = a.nCoeff * typei;
+  const int knc = 1 + nc + kl * nDes;
+  TA sumE[KM];
+  T cf[PRE ? KM : 1][2];
+#pragma unroll
+  for (int k = 0; k < KM; k++) sumE[k] = TA(0);
+  if (PRE) {
+#pragma unroll
+    for (int k = 0; k < KM; k++)
+#pragma unroll
+      for (int q = 0; q < 2; q++) {
+        const int m = lane + 64 * q;
+        cf[PRE ? k : 0][q] = ((k < kni) && (m < nDes)) ? cefs[knc + k * nDes + m] : T(0);
+      }
+#pragma unroll
+    for (int q = 0; q < 2; q++) {
+      const int m = lane + 64 * q;
+      const T b = (m < nDes) ? d_s[m] : T(0);
+#pragma unroll
+      for (int k = 0; k < KM; k++)
+        if (k < kni) sumE[k] += static_cast<TA>(cf[PRE ? k : 0][q] * b);
+    }
+  } else
+    for (int m = lane; m < nDes; m += 64) {
+      const T b = d_s[m];
+#pragma unroll
+      for (int k = 0; k < KM; k++)
+        if (k < kni) sumE[k] += static_cast<TA>(cefs[knc + k * nDes + m] * b);
+    }
+#pragma unroll
+  for (int k = 0; k < KM; k++)
+    if (k < kni) sumE[k] = a.dpp ? wave_sum_dpp(sumE[k]) : wave_sum(sumE[k]);
+
+  const T pcaiT = static_cast<T>(pcai);
+  const int kncct = kl + ncct;
+  TA sumfDi = 0.0, S = 0.0;
+  T Dk[KM], dDk[KM], Pk[KM];
+#pragma unroll
+  for (int k = 0; k < KM; k++) {
+    Dk[k] = dDk[k] = Pk[k] = T(0);
+    if (k < kni) {
+      const int kg = k + kncct;
+      T ck, irk, ilk;
+      if (PRE && (kl + k < nCls)) {
+        ck = __shfl(ce, kl + k);
+        irk = __shfl(irc, kl + k);
+        ilk = __shfl(ilc, kl + k);
+      } else {
+        ck = cent[kg];
+        irk = invrcut2[kg];
+        ilk = invlcut2[kg];
+      }
+      const T pc = pcaiT - ck;
+      const T inv_rcut2 = (pc >= static_cast<T>(0.0)) ? irk : ilk;
+      const T y2 = (pc * pc) * inv_rcut2;
+      const T omy = static_cast<T>(1.0) - y2 * y2;
+      const T omy2 = omy * omy;
+      const T fcut = omy2 * omy2;
+      const T dfcut = static_cast<T>(-8.0) * inv_rcut2 * y2 * omy2 * omy;
+      const T invDk = static_cast<T>(1.0) / (pc * pc + static_cast<T>(1e-20));
+      const T fDk = fcut * invDk;
+      Dk[k] = fDk;
+      dDk[k] = static_cast<T>(2.0) * pc * invDk * (dfcut - fDk);
+      sumfDi += static_cast<TA>(fDk);
+      S += static_cast<TA>(dDk[k]);
+    }
+  }
+  sumfDi = static_cast<TA>(1.0) / sumfDi;
+  TA eival = static_cast<TA>(cefs[nc]);
+  TA Tt = 0.0, A = 0.0;
+#pragma unroll
+  for (int k = 0; k < KM; k++)
+    if (k < kni) {
+      Pk[k] = static_cast<T>(static_cast<TA>(Dk[k]) * sumfDi);
+      const T cpk = static_cast<T>(sumE[k] * sumfDi);
+      eival += sumE[k] * static_cast<TA>(Pk[k]);
+      Tt += static_cast<TA>(cpk * Pk[k]);
+      A += static_cast<TA>(cpk * dDk[k]);
+    }
+  if (lane == 0) ei[i] = static_cast<T>(eival);
+
+  // force coefficients of the descriptors, as localenv_cb_kernel
+  const T Ui = static_cast<T>(A - S * Tt);
+  if (PRE) {
+#pragma unroll
+    for (int q = 0; q < 2; q++) {
+      const int m = lane + 64 * q;
+      if (m < nDes) {
+        TA sum = static_cast<TA>(Ui * pv[q]);
+#pragma unroll
+        for (int k = 0; k < KM; k++)
+          if (k < kni) sum += static_cast<TA>(cf[PRE ? k : 0][q] * Pk[k]);
+        cb[ib + (long) sm * m] = static_cast<T>(sum);
+      }
+    }
+  } else
+    for (int m = lane; m < nDes; m += 64) {
+      const int kncm = 1 + m + kl * nDes + nc;
+      TA sum = static_cast<TA>(Ui * pr[m]);
+#pragma unroll
+      for (int k = 0; k < KM; k++)
+        if (k < kni) sum += static_cast<TA>(cefs[kncm + k * nDes] * Pk[k]);
+      cb[ib + (long) sm * m] = static_cast<T>(sum);
+    }
+}
+
+// LMP_POD_LENV_HFKM: the Hf instance of localenv_wave_kernel is compiled for its 3 active
+// clusters instead of 4 (fewer registers)
+#ifndef LMP_POD_LENV_HFKM
+#define LMP_POD_LENV_HFKM 1
+#endif
+
+template <typename T, typename TA>
+bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<T> &g,
+                   const T *sumU, const T *proj, const T *ledges, const T *redges, const T *cent,
+                   const T *cefs, const T *invlcut2, const T *invrcut2, const int *typeai,
+                   const LocalEnvArgs &a, int nl2, int nl3, int Ni, int sa, int sm,
+                   bool pre = false, bool hf = false)
+{
+  if ((Ni <= 0) || (a.nActMax > LP_KMAX) || (a.nActMax < 1)) return false;
+  size_t lds = (size_t) a.nDes * sizeof(T);
+  if (g.d3) lds += (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T);
+  // the Hf instance: the descriptor index tables after sumU (LMP_POD_LENV_DTAB)
+  if (hf && g.d3 && LMP_POD_LENV_DTAB)
+    lds += (size_t) (PodHf::K3 + PodHf::nabf4 + 1 + 4 * PodHf::Q4 + 1 + 2 * PodHf::nabf3_active) *
+        sizeof(int);
+  if (lds > 65536) return false;
+#define LMP_POD_LENV_WAVE1(KMV, PREV, H)                                                        \
+  return launch(localenv_wave_kernel<T, TA, KMV, PREV, H>, Ni, 64, lds, stream, ei, cb, B, g,    \
+                sumU, proj, ledges, redges, cent, cefs, invlcut2, invrcut2, typeai, a, nl2, nl3, \
+                sa, sm)
+#define LMP_POD_LENV_WAVE(KMV, PREV) LMP_POD_LENV_WAVE1(KMV, PREV, false)
+  // the preloaded tables only with up to 4 active clusters: with 8 the kernel needs 110
+  // VGPRs (4 waves) instead of 78 (6 waves)
+  if (a.nActMax <= 4) {
+    // the Hf instance with KM = nActMax (3): 3 instead of 4 sets of cluster registers
+    if (hf && pre && g.d3 && LMP_POD_LENV_HFKM && (a.nActMax == PodHf::nActMax))
+      LMP_POD_LENV_WAVE1(PodHf::nActMax, true, true);
+    if (hf && pre && g.d3) LMP_POD_LENV_WAVE1(4, true, true);
+    if (pre && (a.nDes <= 128) && (a.nCls <= 64)) LMP_POD_LENV_WAVE(4, true);
+    LMP_POD_LENV_WAVE(4, false);
+  }
+  LMP_POD_LENV_WAVE(LP_KMAX, false);
+#undef LMP_POD_LENV_WAVE
+#undef LMP_POD_LENV_WAVE1
 }
 
 /* ----------------------------------------------------------------------

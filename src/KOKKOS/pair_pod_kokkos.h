@@ -95,6 +95,7 @@ class PairPODKokkos : public PairPOD {
   int native_hip;          // 1 to use native HIP kernels where available
   int hip_flags;           // which native HIP kernel variants are used (HIP_* bits)
   int hip_jtile;           // neighbor tile size of the native HIP radial-angular sum
+  int hip_palign;          // multiple of the fixed pair stride
   int abf_degree;          // angular degree L of the 3-body monomials, or -1
   bool angular_otf;        // true if the angular basis of the current block was not stored
   bool hip_acc_used;       // true if global energy/virial are accumulated in hip_acc
@@ -105,6 +106,14 @@ class PairPODKokkos : public PairPOD {
   bool pairs_fused;        // true if the pairs of the block come from FusedNeighborList()
   bool fused_abort;        // true if a stage needed the pairs of NeighborCount()/NeighborList()
   bool fuse_neigh_off;     // true once a block had to be computed again without the fused list
+  int pair_stride;         // > 0: the pairs of atom i of the block start at i*pair_stride
+  int block_gi1;           // ilist index before the first atom of the current block
+  bool desc_in_lenv;       // true if the local EA-POD kernel computes the 3/4-body descriptors
+  int lenv_nij;            // number of pairs of the block (for the local EA-POD kernel)
+  bool desc_atom;          // true if d2 (in bd) and cb are stored per atom, [i*Mdesc + m]
+  bool d2_in_neigh;        // true if the 2-body descriptors were computed with the pairs
+  bool one_type;           // true if every atom type is element 0
+  t_pod_1d hip_cbt;        // scratch of cb_strided()
 
   // maximum neighbor count of the current neighbor list, reused until the next build
   int mn_value, mn_inum;
@@ -230,6 +239,9 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d pd;   // environment probability descriptors ni x (1 + nComponents + 3*nClusters)
   t_pod_1d coefficients; // coefficients nCoeffPerElement x nelements
   t_pod_1i pq_m, pq_d, pn3, pc3; // arrays to compute 3-body angular basis functions
+  t_pod_1i pq_ex;          // packed exponents of the 3-body monomials (native kernels)
+  int hf_rows = 0;         // pq_ex holds the row table of the Hf force kernel (all monomials)
+  t_pod_1i fc_qa, fc_qp;   // index tables of the native force coefficients (HIP_FC_TABLE)
   t_pod_1i p3_qrange;  // pn3[p3_active[a]] and pn3[p3_active[a]+1] for each active channel a
   t_pod_1i pa4, pb4, pc4; // arrays to compute 4-body angular basis functions
   t_pod_1i ind33l, ind33r; // nl33
@@ -321,6 +333,11 @@ class PairPODKokkos : public PairPOD {
   void crossdesc_reduction(t_pod_1d cb1, t_pod_1d cb2, t_pod_1d c12, t_pod_1d d1,
         t_pod_1d d2, t_pod_1i ind1, t_pod_1i ind2, int n12, int Ni);
   void blockatom_base_descriptors(t_pod_1d bd, int Ni, int Nij);
+  void base_descriptors34(t_pod_1d d3, t_pod_1d d4, int Ni, int Nij);
+  bool lenv_wave_ok(int Nij) const;
+  void cb_strided(int Ni);
+  void desc_layout(int Nij);
+  bool hf_sizes(int Nij) const;
   void blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
@@ -337,7 +354,7 @@ class PairPODKokkos : public PairPOD {
   // Fused pair forces + force tally + global/per-atom virial
   void allbody_forces(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
 
-  template<bool BSPLINE, bool VGLOBAL>
+  template<bool BSPLINE, bool VGLOBAL, int NR, int MD>
   void allbody_forces_impl(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
 
   void blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij);

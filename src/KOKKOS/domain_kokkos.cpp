@@ -25,6 +25,11 @@
 
 using namespace LAMMPS_NS;
 
+// the kernels use the whole domain as functor; see fix_nh_kokkos.cpp for
+// why it is passed as kernel argument
+
+using LightWeight = Kokkos::Experimental::WorkItemProperty::HintLightWeight_t;
+
 static constexpr double BIG = 1.0e20;
 
 /* ----------------------------------------------------------------------
@@ -644,7 +649,7 @@ void DomainKokkos::lamda2x(int n)
   x = atomKK->k_x.view_device();
 
   copymode = 1;
-  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_lamda2x>(0,n),*this);
+  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_lamda2x, LightWeight>(0,n),*this);
   copymode = 0;
 
   atomKK->modified(Device,X_MASK);
@@ -664,7 +669,7 @@ void DomainKokkos::lamda2x(int n, int groupbit_in)
   groupbit = groupbit_in;
 
   copymode = 1;
-  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_lamda2x_group>(0,n),*this);
+  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_lamda2x_group, LightWeight>(0,n),*this);
   copymode = 0;
 
   atomKK->modified(Device,X_MASK);
@@ -708,7 +713,7 @@ void DomainKokkos::x2lamda(int n)
   x = atomKK->k_x.view_device();
 
   copymode = 1;
-  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_x2lamda>(0,n),*this);
+  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_x2lamda, LightWeight>(0,n),*this);
   copymode = 0;
 
   atomKK->modified(Device,X_MASK);
@@ -728,7 +733,7 @@ void DomainKokkos::x2lamda(int n, int groupbit_in)
   groupbit = groupbit_in;
 
   copymode = 1;
-  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_x2lamda_group>(0,n),*this);
+  Kokkos::parallel_for(Kokkos::RangePolicy<LMPDeviceType, TagDomain_x2lamda_group, LightWeight>(0,n),*this);
   copymode = 0;
 
   atomKK->modified(Device,X_MASK);
