@@ -667,6 +667,7 @@ action pair_pedone_kokkos.cpp pair_pedone.cpp
 action pair_pedone_kokkos.h pair_pedone.h
 action pair_pod_kokkos.cpp pair_pod.cpp
 action pair_pod_kokkos.h pair_pod.h
+action pair_pod_kokkos_hip.h pair_pod.h
 action pair_pace_kokkos.cpp pair_pace.cpp
 action pair_pace_kokkos.h pair_pace.h
 action pair_reaxff_kokkos.cpp pair_reaxff.cpp

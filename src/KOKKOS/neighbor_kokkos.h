@@ -23,9 +23,6 @@
 namespace LAMMPS_NS {
 
 template<class DeviceType>
-struct TagNeighborCheckDistance{};
-
-template<class DeviceType>
 struct TagNeighborXhold{};
 
 class NeighborKokkos : public Neighbor {
@@ -37,11 +34,6 @@ class NeighborKokkos : public Neighbor {
   void init() override;
   void init_topology() override;
   void build_topology() override;
-
-  template<class DeviceType>
-// NOLINTNEXTLINE
-  KOKKOS_INLINE_FUNCTION
-  void operator()(TagNeighborCheckDistance<DeviceType>, const int&, int&) const;
 
   template<class DeviceType>
 // NOLINTNEXTLINE
@@ -77,6 +69,9 @@ class NeighborKokkos : public Neighbor {
   DAT::ttransform_kkfloat_1d_3_lr xhold;
 
   double deltasq;
+
+  DAT::tdual_int_scalar k_check_flag;    // marked by atoms that moved too far
+  int check_stamp;                       // value of the mark in this check
 
   void init_cutneighsq_kokkos(int) override;
   void init_cutneighghostsq_kokkos(int) override;
