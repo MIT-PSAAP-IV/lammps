@@ -3279,6 +3279,10 @@ __global__ void __launch_bounds__(256)
    at most KM <= LP_KMAX active clusters.
 ------------------------------------------------------------------------- */
 
+// LMP_POD_LENV_DTAB (HF instance): the 3/4-body descriptor index tables in LDS
+#ifndef LMP_POD_LENV_DTAB
+#define LMP_POD_LENV_DTAB 1
+#endif
 // PRE (nDes <= 128, nCls <= 64, used with KM = 4): the cluster tables of the element and the projection are
 // loaded into registers at the start, independent of the descriptors, and the coefficients of
 // the active clusters are loaded once for the sums and the force coefficients
@@ -3342,11 +3346,32 @@ __global__ void __launch_bounds__(64)
     const int S = g.nelements * g.K3 * g.nrbf3;
     for (int t = lane; t < S; t += 64) u_s[t] = sumU[(long) S * i + t];
     for (int m = lane; m < nDes; m += 64) d_s[m] = (m < nl2) ? B[ib + (long) sm * m] : T(0);
+    // the index tables of the 3- and 4-body descriptors in LDS (after sumU), read by the inner
+    // loops of desc34_atom() instead of global memory
+    int *t_s = reinterpret_cast<int *>(u_s + S);
+    int *pc3 = t_s, *pa4 = pc3 + PodHf::K3, *pb4 = pa4 + PodHf::nabf4 + 1;
+    int *pc4 = pb4 + 3 * PodHf::Q4;
+    constexpr int QO = PodHf::K3 + PodHf::nabf4 + 1 + 4 * PodHf::Q4;    // int2 at an even offset
+    int2 *qr = reinterpret_cast<int2 *>(t_s + ((QO + 1) & ~1));
+    if constexpr (HF && LMP_POD_LENV_DTAB) {
+      if (lane < PodHf::K3) pc3[lane] = g.pc3[lane];
+      if (lane <= PodHf::nabf4) pa4[lane] = g.pa4[lane];
+      if (lane < 3 * PodHf::Q4) pb4[lane] = g.pb4[lane];
+      if (lane < PodHf::Q4) pc4[lane] = g.pc4[lane];
+      if (lane < PodHf::nabf3_active) qr[lane] = g.qrange3[lane];
+    }
     __syncthreads();
     DescArgs<T> gl = g;
     gl.d3 = d_s + nl2;
     gl.d4 = d_s + nl2 + nl3;
     gl.Ni = 1;
+    if constexpr (HF && LMP_POD_LENV_DTAB) {
+      gl.pc3 = pc3;
+      gl.pa4 = pa4;
+      gl.pb4 = pb4;
+      gl.pc4 = pc4;
+      gl.qrange3 = qr;
+    }
     desc34_atom<T, TA>(gl, u_s, 0);
   } else {
     for (int m = lane; m < nDes; m += 64) d_s[m] = B[ib + (long) sm * m];
@@ -3502,6 +3527,10 @@ bool localenv_wave(hipStream_t stream, T *ei, T *cb, const T *B, const DescArgs<
   if ((Ni <= 0) || (a.nActMax > LP_KMAX) || (a.nActMax < 1)) return false;
   size_t lds = (size_t) a.nDes * sizeof(T);
   if (g.d3) lds += (size_t) g.nelements * g.K3 * g.nrbf3 * sizeof(T);
+  // the Hf instance: the descriptor index tables after sumU (LMP_POD_LENV_DTAB)
+  if (hf && g.d3 && LMP_POD_LENV_DTAB)
+    lds += (size_t) (PodHf::K3 + PodHf::nabf4 + 1 + 4 * PodHf::Q4 + 1 + 2 * PodHf::nabf3_active) *
+        sizeof(int);
   if (lds > 65536) return false;
 #define LMP_POD_LENV_WAVE1(KMV, PREV, H)                                                        \
   return launch(localenv_wave_kernel<T, TA, KMV, PREV, H>, Ni, 64, lds, stream, ei, cb, B, g,    \
