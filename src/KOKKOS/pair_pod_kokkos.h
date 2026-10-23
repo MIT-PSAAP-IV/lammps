@@ -124,29 +124,26 @@ class PairPODKokkos : public PairPOD {
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_vir;    // virial of each atom of a block [6*ni]
 
-  // study: whole step in one kernel (HIP_MEGA), see pair_pod_kokkos_hip_mega.h
-  int mega_nr, mega_r0[8], mega_r1[8];   // stage ranges launched in order
-  int mega_cap, mega_pglobal, mega_stop, mega_pad, mega_persist, mega_nblk, mega_hybrid, mega_lenv, mega_freg;
-  int mega_spill, mega_pool, mega_stats, mega_ncall;
+  // mega kernel (HIP_MEGA, see mega_block()): settings from LAMMPS_POD_MEGA_*
+  int mega_cap, mega_pool, mega_hfoff, mega_stats, mega_ncall;
   bool mega_logged;
-  t_pod_1d mega_pr, mega_prh, mega_sd, mega_su, mega_sf;
-  t_pod_1i mega_paj, mega_pnp, mega_flag, mega_pai, mega_zero;
+  t_pod_1i mega_flag;    // [0] pairs not kept, [16 + 8 p] the per-step counters of parity p
   t_pod_1d mega_gpr, mega_gprh;
   t_pod_1i mega_gpaj, mega_hist;
   t_pod_1i mega_frec_i;
   t_pod_1d mega_frec_d;
   int mega_frec_ok;    // -1 not built, 0 not possible, 1 built
-  t_pod_1i mega_extab, mega_mono;    // round 5 exponent tables (built once)
-  t_pod_1i mega_rowmono;    // S6SYM row table of the force stage (built once)
-  t_pod_1i mega_ntr;    // NTR row-major neighbor list copy
+  t_pod_1i mega_extab, mega_mono;    // monomial exponent tables (built once)
+  t_pod_1i mega_rowmono;    // monomial of each row of the force stage tile (built once)
+  t_pod_1i mega_ntr;    // row-major copy of the neighbor list
   int mega_ntr_ncalls = -1, mega_ntr_nrow = -1, mega_ntr_mn = -1;
   NeighList *mega_ntr_list = nullptr;
   int mega_rowmono_ok = 0;
   t_pod_1i mega_ovf;    // atoms whose pairs did not fit in the pool (overflow kernel)
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> mega_fdum;    // force sink of those atoms in mega_kernel
-  int mega_pool_need = 0;
+  int mega_pool_need = 0;    // pairs claimed from the pool in an earlier step, if more than it held
   int mega_cpar = 0, mega_clast = 0;    // parity of the per-step mega counters, and of the last step
-  bool mega_cclean[2] = {true, true};    // counters of that parity already zeroed    // pairs claimed from the pool in an earlier step, if more than it held
+  bool mega_cclean[2] = {true, true};    // counters of that parity already zeroed
   bool mega_block(int gi1, int Ni);
   void mega_print_stats(int Ni);
 

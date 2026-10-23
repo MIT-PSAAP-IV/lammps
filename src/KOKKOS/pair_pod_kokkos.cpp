@@ -315,58 +315,24 @@ PairPODKokkos<DeviceType>::PairPODKokkos(LAMMPS *lmp) : PairPOD(lmp)
   if (env) hip_jtile = atoi(env);
   abf_degree = -1;
 
-  // study: LAMMPS_POD_MEGA = stage ranges, e.g. "0-6" (default) or "0-3,4-6"
-  mega_nr = 1;
-  mega_r0[0] = 0;
-  mega_r1[0] = 6;
+  // mega kernel (opt-in): the whole step of a one-element Hf-type model in one kernel, see
+  // mega_block().  LAMMPS_POD_MEGA=1 enables it (or bit HIP_MEGA of LAMMPS_POD_HIP_FLAGS);
+  // LAMMPS_POD_MEGA_CAP pairs per atom kept in LDS (default 32, more go to a per-step pool),
+  // LAMMPS_POD_MEGA_POOL atoms of the initial pool (default max(256, atoms/32), grown when
+  // needed), LAMMPS_POD_MEGA_HFOFF=1 the generic kernel instead of the one specialized to the
+  // Hf model sizes, LAMMPS_POD_MEGA_STATS=N pair statistics every N steps
   env = getenv("LAMMPS_POD_MEGA");
-  if (env) {
-    mega_nr = 0;
-    const char *s = env;
-    while (*s && (mega_nr < 8)) {
-      int a = -1, b = -1, n = 0;
-      if (sscanf(s, "%d-%d%n", &a, &b, &n) != 2) break;
-      mega_r0[mega_nr] = a;
-      mega_r1[mega_nr] = b;
-      mega_nr++;
-      s += n;
-      if (*s == ',') s++;
-    }
-  }
+  if (env && (atoi(env) > 0)) hip_flags |= HIP_MEGA;
   mega_cap = 32;
   env = getenv("LAMMPS_POD_MEGA_CAP");
-  if (env) mega_cap = atoi(env);
-  mega_pglobal = 0;
-  env = getenv("LAMMPS_POD_MEGA_PGLOBAL");
-  if (env) mega_pglobal = atoi(env);
-  mega_stop = 6;
-  env = getenv("LAMMPS_POD_MEGA_STOP");
-  if (env) mega_stop = atoi(env);
-  mega_pad = 0;
-  env = getenv("LAMMPS_POD_MEGA_PAD");
-  if (env) mega_pad = atoi(env);
-  mega_persist = -1;    // >= 0: persistent kernel, grid barrier after this stage (6: none)
-  env = getenv("LAMMPS_POD_MEGA_PERSIST");
-  if (env) mega_persist = atoi(env);
-  mega_nblk = 0;
-  env = getenv("LAMMPS_POD_MEGA_NBLK");
-  if (env) mega_nblk = atoi(env);
-  mega_hybrid = 0;    // 1: stages 0-3 fused, then the multi-kernel local EA-POD and force kernels
-  env = getenv("LAMMPS_POD_MEGA_HYBRID");
-  if (env) mega_hybrid = atoi(env);
-  mega_lenv = 1;
-  env = getenv("LAMMPS_POD_MEGA_LENV");
-  if (env) mega_lenv = atoi(env);
-  mega_freg = 2;    // 2: force coefficients per lane (recipe), 1: in LDS, 3: both, compared
-  env = getenv("LAMMPS_POD_MEGA_FREG");
-  if (env) mega_freg = atoi(env);
-  mega_spill = 1;    // 0: stop if an atom has more than mega_cap pairs
-  env = getenv("LAMMPS_POD_MEGA_SPILL");
-  if (env) mega_spill = atoi(env);
-  mega_pool = 0;     // atoms with pairs beyond mega_cap held in the pool; 0: max(256, Ni/32)
+  if (env) mega_cap = std::max(4, atoi(env));
+  mega_pool = 0;
   env = getenv("LAMMPS_POD_MEGA_POOL");
   if (env) mega_pool = atoi(env);
-  mega_stats = 0;    // > 0: print the pair statistics every mega_stats calls
+  mega_hfoff = 0;
+  env = getenv("LAMMPS_POD_MEGA_HFOFF");
+  if (env) mega_hfoff = atoi(env);
+  mega_stats = 0;
   env = getenv("LAMMPS_POD_MEGA_STATS");
   if (env) mega_stats = atoi(env);
   mega_ncall = 0;
@@ -655,9 +621,9 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
     ni = gi2 - gi1; // total number of atoms in the current atom block
     block_gi1 = gi1;
 
-    // study: the whole block in the mega-kernel
+    // opt-in (HIP_MEGA): the whole block in one kernel, for the models it covers
     if (mega_block(gi1, ni)) {
-      if (mega_persist < 0) tallyenergy(ei, gi1, ni);
+      tallyenergy(ei, gi1, ni);
       continue;
     }
 
@@ -707,7 +673,7 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
       const bool mflag = (hip_flags & HIP_MEGA) && ((int) mega_flag.extent(0) >= 32);
       if (mflag && (hipMemcpyAsync(h_all, mega_flag.data(), sizeof(h_all), hipMemcpyDeviceToHost,
                                    Kokkos::HIP().hip_stream()) != hipSuccess))
-        error->one(FLERR, "pair pod/kk: reading the mega study flag failed");
+        error->one(FLERR, "pair pod/kk: reading the mega kernel flags failed");
       if ((hipMemcpyAsync(h_acc, hip_acc.data(), 8 * sizeof(KK_ACC_FLOAT), hipMemcpyDeviceToHost,
                           Kokkos::HIP().hip_stream()) != hipSuccess) ||
           (hipStreamSynchronize(Kokkos::HIP().hip_stream()) != hipSuccess))
@@ -716,15 +682,15 @@ void PairPODKokkos<DeviceType>::compute(int eflag_in, int vflag_in)
       h_fl[0] = h_all[0];
       for (int q = 0; q < PODHIP::MEGA_NCNT; q++) h_fl[4 + q] = h_all[16 + 8 * mega_clast + q];
       const int h_flag = h_fl[0];
+      // (pairs beyond cap go to the pair pool or the overflow kernel: this does not happen)
       if (h_flag > mega_cap)
-        error->one(FLERR, "pair pod/kk mega study: an atom has {} pairs, more than LAMMPS_POD_MEGA_CAP={}"
-                   " (with LAMMPS_POD_MEGA_SPILL=1: the pair pool was full, raise LAMMPS_POD_MEGA_POOL)",
+        error->one(FLERR, "pair pod/kk mega kernel: {} pairs of an atom were not kept (cap {})",
                    h_flag, mega_cap);
       // the pool overflowed (those atoms found their pairs again from the neighbor list): grow it
-      if (mflag && mega_spill && (h_fl[4] > (int) mega_gpaj.extent(0))) {
+      if (mflag && (h_fl[4] > (int) mega_gpaj.extent(0))) {
         mega_pool_need = h_fl[4] + h_fl[4] / 4 + 1024;
         if (comm->me == 0)
-          utils::logmesg(lmp, "pod mega study: pair pool grown to {} pairs ({} claimed, {} atoms "
+          utils::logmesg(lmp, "pair pod/kk mega kernel: pair pool grown to {} pairs ({} claimed, {} atoms "
                          "by the overflow kernel)\n", mega_pool_need, h_fl[4], h_fl[8]);
       }
       if (eflag_global) eng_vdwl += static_cast<double>(h_acc[0]);
@@ -3069,14 +3035,15 @@ void PairPODKokkos<DeviceType>::blockatom_environment_descriptors(t_pod_1d ei, t
 }
 
 /* ----------------------------------------------------------------------
-   study (HIP_MEGA): neighbors, descriptors, local EA-POD, force coefficients and
-   forces of the block in one kernel (or the stage ranges in mega_r0/mega_r1).
-   only one-element models with Hermite many-body and B-spline 2-body radial
-   functions, local EA-POD and 3+4-body terms (the Hf benchmark); returns false
-   for anything else, which then runs the normal path
+   mega kernel (HIP_MEGA, opt-in with LAMMPS_POD_MEGA=1): neighbors, descriptors,
+   local EA-POD, force coefficients and forces of the block in one kernel, one
+   wavefront per atom.  only one-element models with Hermite many-body and
+   B-spline 2-body radial functions, local EA-POD and 3+4-body terms (as the Hf
+   model), no per-atom energy or virial; returns false for anything else, which
+   then runs the normal path
 ------------------------------------------------------------------------- */
 
-// study: every mega_stats calls, the cumulative pair statistics of the mega kernel
+// LAMMPS_POD_MEGA_STATS: every mega_stats calls, the cumulative pair statistics of the mega kernel
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::mega_print_stats(int Ni)
 {
@@ -3087,7 +3054,7 @@ void PairPODKokkos<DeviceType>::mega_print_stats(int Ni)
     int fa[32], fl[8], hs[65];
     if ((hipMemcpy(fa, mega_flag.data(), sizeof(fa), hipMemcpyDeviceToHost) != hipSuccess) ||
         (hipMemcpy(hs, mega_hist.data(), sizeof(hs), hipMemcpyDeviceToHost) != hipSuccess))
-      error->one(FLERR, "pair pod/kk mega study: reading the statistics failed");
+      error->one(FLERR, "pair pod/kk mega kernel: reading the statistics failed");
     // the counters of the last step as fl[4..8]
     for (int q = 0; q < 4; q++) fl[q] = fa[q];
     for (int q = 0; q < 4; q++) fl[4 + q] = fa[16 + 8 * mega_clast + q];
@@ -3130,30 +3097,18 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     if (!ok) return false;
     const hipStream_t stream = Kokkos::HIP().hip_stream();
     const int cap = mega_cap;
-    const int nout = nrbf3 * K3;
-    if ((int) mega_pr.extent(0) < Ni * cap) {
-      MemKK::realloc_kokkos(mega_pr, "pair_pod:mega_pr", Ni * cap);
-      MemKK::realloc_kokkos(mega_prh, "pair_pod:mega_prh", 3 * Ni * cap);
-      MemKK::realloc_kokkos(mega_paj, "pair_pod:mega_paj", Ni * cap);
-    }
-    if ((int) mega_pnp.extent(0) < Ni) {
-      MemKK::realloc_kokkos(mega_pnp, "pair_pod:mega_pnp", Ni);
-      MemKK::realloc_kokkos(mega_sd, "pair_pod:mega_sd", Ni * Mdesc);
-      MemKK::realloc_kokkos(mega_su, "pair_pod:mega_su", Ni * nout);
-      MemKK::realloc_kokkos(mega_sf, "pair_pod:mega_sf", Ni * nout);
-    }
     // (MemKK::realloc_kokkos does not initialize: the flags, counters and histogram are zeroed here)
     if ((int) mega_flag.extent(0) < 32) {
       MemKK::realloc_kokkos(mega_flag, "pair_pod:mega_flag", 32);
       mega_cclean[0] = mega_cclean[1] = true;
       if (hipMemsetAsync(mega_flag.data(), 0, 32 * sizeof(int), stream) != hipSuccess)
-        error->one(FLERR, "pair pod/kk mega study: zeroing the flags failed");
+        error->one(FLERR, "pair pod/kk mega kernel: zeroing the flags failed");
     }
     // the pair pool: pool_atoms atoms of maxneigh pairs, grown to the pairs claimed in an earlier
     // step if they did not fit (mega_pool_need, from the pool counter read with the flags)
     const int pool_atoms = (mega_pool > 0) ? mega_pool : std::max(256, Ni / 32);
     const int pool_n = std::max(pool_atoms * std::max(maxneigh, 1), mega_pool_need);
-    if (mega_spill && ((int) mega_gpaj.extent(0) < pool_n)) {
+    if ((int) mega_gpaj.extent(0) < pool_n) {
       MemKK::realloc_kokkos(mega_gpr, "pair_pod:mega_gpr", pool_n);
       MemKK::realloc_kokkos(mega_gprh, "pair_pod:mega_gprh", 3 * pool_n);
       MemKK::realloc_kokkos(mega_gpaj, "pair_pod:mega_gpaj", pool_n);
@@ -3161,7 +3116,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     if (mega_stats && ((int) mega_hist.extent(0) < 65)) {
       MemKK::realloc_kokkos(mega_hist, "pair_pod:mega_hist", 65);
       if (hipMemsetAsync(mega_hist.data(), 0, 65 * sizeof(int), stream) != hipSuccess)
-        error->one(FLERR, "pair pod/kk mega study: zeroing the statistics failed");
+        error->one(FLERR, "pair pod/kk mega kernel: zeroing the statistics failed");
     }
     // per-step counters (MegaArgs::cnt) at flag[16 + 8 p], p the parity of the step: zeroed by the
     // overflow kernel of the previous step, else by a memset here
@@ -3169,24 +3124,19 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     int *cnt = mega_flag.data() + 16 + 8 * cpar;
     if (!mega_cclean[cpar] &&
         (hipMemsetAsync(cnt, 0, PODHIP::MEGA_NCNT * sizeof(int), stream) != hipSuccess))
-      error->one(FLERR, "pair pod/kk mega study: resetting the pair pool failed");
+      error->one(FLERR, "pair pod/kk mega kernel: resetting the pair pool failed");
     mega_cclean[cpar] = false;
     mega_clast = cpar;
-    if (mega_spill && ((int) mega_ovf.extent(0) < Ni)) MemKK::realloc_kokkos(mega_ovf, "pair_pod:mega_ovf", Ni);
-    if (mega_hybrid && ((int) mega_zero.extent(0) < Ni * cap)) {
-      MemKK::realloc_kokkos(mega_pai, "pair_pod:mega_pai", Ni * cap);
-      MemKK::realloc_kokkos(mega_zero, "pair_pod:mega_zero", Ni * cap);
-      if (hipMemsetAsync(mega_zero.data(), 0, (size_t) Ni * cap * sizeof(int), stream) != hipSuccess)
-        error->one(FLERR, "pair pod/kk mega study: zeroing the hybrid element array failed");
-    }
+    if ((int) mega_ovf.extent(0) < Ni) MemKK::realloc_kokkos(mega_ovf, "pair_pod:mega_ovf", Ni);
     if (vflag_global && ((int) hip_vir.extent(0) < 6 * Ni))
       MemKK::realloc_kokkos(hip_vir, "pair_pod:hip_vir", 6 * Ni);
 
     PODHIP::MegaArgs<KK_FLOAT, KK_ACC_FLOAT> a{};
     a.na = pod_neigh_args(d_ilist, d_numneigh, d_neighbors, type, d_map, x, rcutsq);
     a.onetype = (atom->ntypes == 1) ? 1 : 0;
-    // NTR: row-major copy of the neighbor list, rebuilt after each neighbor list build
-    if (LMP_POD_MEGA_NTR && (maxneigh > 0)) {
+    // row-major copy of the neighbor list (the neighbors of an atom contiguous, one coalesced
+    // load per wave), rebuilt after each neighbor list build
+    if (maxneigh > 0) {
       const int nrow = (int) std::min(d_neighbors.extent(0), d_numneigh.extent(0)), mn = maxneigh;
       if ((neighbor->ncalls != mega_ntr_ncalls) || (list != mega_ntr_list) || (nrow != mega_ntr_nrow) ||
           (mn != mega_ntr_mn)) {
@@ -3194,7 +3144,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
           MemKK::realloc_kokkos(mega_ntr, "pair_pod:mega_ntr", (size_t) nrow * mn);
         if (!PODHIP::mega_transpose(stream, mega_ntr.data(), d_neighbors.data(), d_numneigh.data(),
                                     (int) d_neighbors.stride(0), (int) d_neighbors.stride(1), mn, nrow))
-          error->one(FLERR, "pair pod/kk mega study: neighbor list copy failed");
+          error->one(FLERR, "pair pod/kk mega kernel: neighbor list copy failed");
         mega_ntr_ncalls = neighbor->ncalls;
         mega_ntr_list = list;
         mega_ntr_nrow = nrow;
@@ -3209,14 +3159,6 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.gi1 = gi1;
     a.Ni = Ni;
     a.cap = cap;
-    a.pglobal = mega_pglobal;
-    a.pr = mega_pr.data();
-    a.prh = mega_prh.data();
-    a.paj = mega_paj.data();
-    a.pnp = mega_pnp.data();
-    a.sd = mega_sd.data();
-    a.su = mega_su.data();
-    a.sf = mega_sf.data();
     a.rs = pod_radial_src(true, rbf, drbf, rbf_hermite_coeffs, hermite_r0, hermite_invdr, ti, tj,
                           nelements, nhermite_bins, nrbfmax, 0);
     a.bs = pod_bspline_args(true, bs_r0, bs_invh, ti, tj, nelements, bs_nb, nrbf2, bs_ileft);
@@ -3226,7 +3168,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.nrbf3 = nrbf3;
     a.K3 = K3;
     a.L = L;
-    a.jtile = std::min(std::max(hip_jtile & ~3, 4), 64);
+    a.jtile = 8;    // pairs per tile of the radial-angular sums (the Hf kernel is built for 8)
     a.dg = pod_desc_args(bd, bd, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4, nelements, nrbf3,
                          nabf3_active, nrbf4, nabf4, K3, Q4, 1, true);
     a.fc = PODHIP::FcArgs<KK_FLOAT>{nullptr, nullptr, nullptr, pc3.data(), pn3.data(),
@@ -3260,24 +3202,22 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.ft.nm2 = 4;
     a.ft.Ni = 1;
     a.flag = mega_flag.data();
-    a.stop = mega_stop;
-    a.pad = mega_pad;
     // the wave-wide local EA-POD keeps at most MEGA_KM active clusters and 64 cluster tables
     // in registers; otherwise the multi-kernel decomposition (lenv 0)
-    a.lenv = (mega_lenv && (nMaxActiveClusters <= PODHIP::MEGA_KM) && (nClusters <= 64)) ? 1 : 0;
-    a.spill = mega_spill;
-    a.gpr = mega_spill ? mega_gpr.data() : nullptr;
-    a.gprh = mega_spill ? mega_gprh.data() : nullptr;
-    a.gpaj = mega_spill ? mega_gpaj.data() : nullptr;
+    a.lenv = ((nMaxActiveClusters <= PODHIP::MEGA_KM) && (nClusters <= 64)) ? 1 : 0;
+    a.spill = 1;
+    a.gpr = mega_gpr.data();
+    a.gprh = mega_gprh.data();
+    a.gpaj = mega_gpaj.data();
     a.cnt = cnt;
     a.cntz = nullptr;
     a.pool_ctr = cnt;
-    a.pool_n = mega_spill ? (int) mega_gpaj.extent(0) : 0;
-    a.ovf = (mega_spill && (mega_persist < 0) && !mega_hybrid && !mega_pglobal) ? mega_ovf.data() : nullptr;
+    a.pool_n = (int) mega_gpaj.extent(0);
+    a.ovf = mega_ovf.data();
     if ((int) mega_fdum.extent(0) < 8) MemKK::realloc_kokkos(mega_fdum, "pair_pod:mega_fdum", 8);
     a.fdummy = mega_fdum.data();
     a.hist = mega_stats ? mega_hist.data() : nullptr;
-    a.freg = mega_freg;
+    a.freg = 2;    // force coefficients per lane, from the recipe below (1: in LDS)
     a.n_pn3 = nabf3 + 1;
     if ((int) mega_extab.extent(0) != K3) {
       // exponents a | b<<8 | c<<16 of the monomials (as pod_exponents) and, for the force
@@ -3300,7 +3240,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
       }
       Kokkos::deep_copy(mega_extab, h_ex);
       Kokkos::deep_copy(mega_mono, h_mo);
-      // S6SYM: monomial of each of the 32 A rows of the force stage (row q: lane group g = q % 4,
+      // Hf kernel: monomial of each of the 32 A rows of the force stage (row q: lane group g = q % 4,
       // slot s = q / 4 in tile 0, 4 + (q - 16) / 4 in tile 1), from the template slots in
       // (X, Y, Z) = sigma_g(u, v, w); a repeated monomial is kept in its first row only
       mega_rowmono_ok = 0;
@@ -3334,7 +3274,7 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
     a.rowmono = mega_rowmono_ok ? mega_rowmono.data() : nullptr;
     a.extab = mega_extab.data();
     a.mono = reinterpret_cast<const int2 *>(mega_mono.data());
-    if (mega_freg >= 2) {
+    {
       // recipe of the per-lane force coefficients (see MegaArgs::frec_i), built once
       if (mega_frec_ok < 0) {
         auto h_pc3 = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), pc3);
@@ -3390,108 +3330,35 @@ bool PairPODKokkos<DeviceType>::mega_block(int gi1, int Ni)
         if (mega_frec_ok && (comm->me == 0)) {
           int mx = 0;
           for (int k = 0; k < K3; k++) mx = std::max(mx, ri[PODHIP::MEGA_FRI * k + 1]);
-          utils::logmesg(lmp, "pod mega study: FREG=2 recipe built, at most {} 4-body terms per monomial\n", mx);
+          utils::logmesg(lmp, "pair pod/kk mega kernel: at most {} 4-body terms per monomial\n", mx);
         }
         if (!mega_frec_ok && (comm->me == 0))
-          utils::logmesg(lmp, "pod mega study: more than {} 4-body terms per monomial, FREG=1\n", PODHIP::MEGA_FT);
+          utils::logmesg(lmp, "pair pod/kk mega kernel: more than {} 4-body terms per monomial, "
+                         "force coefficients in LDS\n", PODHIP::MEGA_FT);
       }
       if (mega_frec_ok != 1) a.freg = 1;
       a.frec_i = mega_frec_i.data();
       a.frec_d = mega_frec_d.data();
     }
-    a.sdt = 0;
-    a.pai = nullptr;
-    a.ptype = nullptr;
-
     a.hf = PODHIP::mega_is_hf(a) ? 1 : 0;
-    if (LMP_POD_MEGA_S6SYM && !a.rowmono) a.hf = 0;    // the Hf kernel needs the row table
-    { const char *e = getenv("LAMMPS_POD_MEGA_HFOFF"); if (e && atoi(e)) a.hf = 0; }
+    if (!a.rowmono) a.hf = 0;    // the Hf kernel needs the row table
+    if (mega_hfoff) a.hf = 0;
     if (!mega_logged && (comm->me == 0)) {
       mega_logged = true;
-      utils::logmesg(lmp, "pod mega study: ranges");
-      for (int r = 0; r < mega_nr; r++) utils::logmesg(lmp, " {}-{}", mega_r0[r], mega_r1[r]);
-      utils::logmesg(lmp, " cap {} pglobal {} stop {} pad {} jtile {} lenv {} hybrid {} freg {} "
-                     "spill {} pool {} pairs ({} atoms) hf {}\n", cap, mega_pglobal, mega_stop, mega_pad,
-                     a.jtile, mega_lenv, mega_hybrid, mega_freg, mega_spill, a.pool_n, pool_atoms, a.hf);
-      utils::logmesg(lmp, "pod mega study: Mdesc {} nl2 {} nl3 {} nl4 {} K3 {} L {} nrbf3 {} "
-                     "nrbf4 {} nabf3_active {} nabf4 {} Q4 {} nClusters {} nActMax {} nCoeff {} "
-                     "maxneigh {} Ni {}\n", Mdesc, nl2, nl3, nl4, K3, L, nrbf3, nrbf4, nabf3_active,
-                     nabf4, Q4, nClusters, nMaxActiveClusters, nCoeffPerElement, maxneigh, Ni);
-      for (int r = 0; r < mega_nr; r++) {
-        int q[2] = {0, 0};
-        if (PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, mega_r0[r], mega_r1[r], q))
-          utils::logmesg(lmp, "pod mega study: range {}-{} LDS {} bytes/block, {} blocks/CU "
-                         "({:.2f} waves/SIMD)\n", mega_r0[r], mega_r1[r], q[0], q[1], q[1] / 4.0);
-      }
+      int q[2] = {0, 0};
+      PODHIP::mega_run<KK_FLOAT, KK_ACC_FLOAT>(stream, a, q);
+      utils::logmesg(lmp, "pair pod/kk mega kernel: {} kernel, cap {}, pool {} pairs ({} atoms), "
+                     "LDS {} bytes per atom, {} atoms per CU\n", a.hf ? "Hf" : "generic", cap,
+                     a.pool_n, pool_atoms, q[0], q[1]);
     }
-    if (mega_hybrid) {
-      // stages 0-3 fused, writing the descriptors, sumU, the types and the pairs (cap slots per
-      // atom) in the layouts of the multi-kernel path, then its local EA-POD and force kernels
-      a.sdt = 1;
-      a.sd = bd.data();
-      a.su = sumU.data();
-      a.pai = mega_pai.data();
-      a.ptype = typeai.data();
-      if (!PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, 0, 3))
-        error->one(FLERR, "pair pod/kk mega study: hybrid front kernel failed");
-      blockatom_local_environment_descriptors(ei, cb, bd, Ni);
-      auto cb3 = Kokkos::subview(cb, std::make_pair(Ni * nl2, Ni * (nl2 + nl3)));
-      auto cb4 = Kokkos::subview(cb, std::make_pair(Ni * (nl2 + nl3), Ni * (nl2 + nl3 + nl4)));
-      PODHIP::FcArgs<KK_FLOAT> fca{cb3.data(), cb4.data(), sumU.data(), pc3.data(), pn3.data(),
-                                   p3_active.data(), pa4.data(), pb4.data(), pc4.data(),
-                                   nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, 1};
-      PODHIP::ForceTally<KK_FLOAT, KK_ACC_FLOAT> ft = a.ft;
-      ft.ai = mega_pai.data();
-      ft.aj = mega_paj.data();
-      ft.cb2 = cb.data();
-      ft.Ni = Ni;
-      ft.bs.ti = mega_zero.data();
-      ft.bs.tj = mega_zero.data();
-      PODHIP::RadialSrc<KK_FLOAT> rsrc = a.rs;
-      rsrc.ti = mega_zero.data();
-      rsrc.tj = mega_zero.data();
-      rsrc.Nij = Ni * cap;
-      PODHIP::PairGeom<KK_FLOAT> pg{mega_pr.data(), mega_prh.data(), Ni * cap};
-      if (!PODHIP::allbody_forces_otf<KK_FLOAT, KK_ACC_FLOAT>(
-              stream, nullptr, ft, forcecoeff.data(), &fca, rsrc, pg, mega_zero.data(),
-              mega_pnp.data(), pq_m.data(), pq_d.data(), nelements, nrbf3, K3, Ni, -cap, true))
-        error->one(FLERR, "pair pod/kk mega study: hybrid force kernel failed");
-      if (vflag_global &&
-          !PODHIP::virial_reduce<KK_ACC_FLOAT>(stream, hip_acc.data(), hip_vir.data(), Ni))
-        error->one(FLERR, "pair pod/kk: summing the virial on the GPU failed");
-      forces_in_fij = false;
-      pairs_fused = false;
-      return true;
-    }
-    if (mega_persist >= 0) {
-      const int nb = PODHIP::mega_persist<KK_FLOAT, KK_ACC_FLOAT>(
-          stream, a, hip_acc.data(), reinterpret_cast<unsigned *>(mega_flag.data() + 1),
-          eflag_global ? 1 : 0, vflag_global ? 1 : 0, mega_nblk, mega_persist);
-      if (nb <= 0) error->one(FLERR, "pair pod/kk mega study: persistent launch failed");
-      static bool plogged = false;
-      if (!plogged && (comm->me == 0)) {
-        plogged = true;
-        utils::logmesg(lmp, "pod mega study: persistent kernel, barrier after stage {}, {} blocks\n",
-                       mega_persist, nb);
-      }
-      mega_print_stats(Ni);
-      forces_in_fij = false;
-      pairs_fused = false;
-      return true;
-    }
-    // (the overflow list is used only by the full-range kernel)
-    const bool full = (mega_nr == 1) && (mega_r0[0] == 0) && (mega_r1[0] == PODHIP::MS_N - 1);
-    if (!full) a.ovf = nullptr;
-    for (int r = 0; r < mega_nr; r++)
-      if (!PODHIP::mega_range<KK_FLOAT, KK_ACC_FLOAT>(stream, a, mega_r0[r], mega_r1[r]))
-        error->one(FLERR, "pair pod/kk mega study: stage range {}-{} failed or not available",
-                   mega_r0[r], mega_r1[r]);
+    if (!PODHIP::mega_run<KK_FLOAT, KK_ACC_FLOAT>(stream, a))
+      error->one(FLERR, "pair pod/kk mega kernel: launch failed");
     // the atoms whose pairs did not fit in the pool, if any; the kernel also zeroes the counters
     // of the next step
     if (a.ovf) {
       a.cntz = mega_flag.data() + 16 + 8 * (cpar ^ 1);
       if (!PODHIP::mega_ovf_launch<KK_FLOAT, KK_ACC_FLOAT>(stream, a, 64))
-        error->one(FLERR, "pair pod/kk mega study: overflow kernel failed");
+        error->one(FLERR, "pair pod/kk mega kernel: overflow kernel failed");
       mega_cclean[cpar ^ 1] = true;
     }
     mega_cpar ^= 1;
