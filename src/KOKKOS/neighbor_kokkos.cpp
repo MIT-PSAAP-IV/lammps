@@ -35,12 +35,45 @@
 
 using namespace LAMMPS_NS;
 
+namespace {
+
+// marks the flag with the stamp of this check if an atom moved further
+// than allowed.  A store by any number of atoms, of a value that is new
+// for each check, needs neither a reduction nor a reset of the flag.
+// It holds only the views it needs, so it is passed as kernel argument.
+
+template<class DeviceType, class XViewType, class FlagViewType>
+struct NeighborCheckDistanceFunctor {
+  typedef DeviceType device_type;
+  XViewType x, xhold;
+  FlagViewType flag;
+  double deltasq;
+  int stamp;
+
+  NeighborCheckDistanceFunctor(const XViewType &x_, const XViewType &xhold_,
+                               const FlagViewType &flag_, double deltasq_, int stamp_) :
+    x(x_), xhold(xhold_), flag(flag_), deltasq(deltasq_), stamp(stamp_) {}
+
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int &i) const {
+    const double delx = static_cast<double>(x(i,0) - xhold(i,0));
+    const double dely = static_cast<double>(x(i,1) - xhold(i,1));
+    const double delz = static_cast<double>(x(i,2) - xhold(i,2));
+    const double rsq = delx*delx + dely*dely + delz*delz;
+    if (rsq > deltasq) Kokkos::atomic_store(&flag(),stamp);
+  }
+};
+
+}    // namespace
+
 /* ---------------------------------------------------------------------- */
 
 NeighborKokkos::NeighborKokkos(LAMMPS *lmp) : Neighbor(lmp),
   neighbond_host(lmp),neighbond_device(lmp)
 {
   device_flag = 0;
+  check_stamp = 0;
   bondlist = nullptr;
   anglelist = nullptr;
   dihedrallist = nullptr;
@@ -239,26 +272,27 @@ int NeighborKokkos::check_distance_kokkos()
   int nlocal = atom->nlocal;
   if (includegroup) nlocal = atom->nfirst;
 
-  int flag = 0;
-  copymode = 1;
-  Kokkos::parallel_reduce(Kokkos::RangePolicy<DeviceType, TagNeighborCheckDistance<DeviceType> >(0,nlocal),*this,flag);
-  copymode = 0;
+  if (!k_check_flag.view_device().data()) {
+    k_check_flag = DAT::tdual_int_scalar("neighbor:check_flag");
+    check_stamp = 0;
+  }
+  check_stamp = (check_stamp % 1000000000) + 1;
+
+  auto d_x = x.view<DeviceType>();
+  auto d_xhold = xhold.view<DeviceType>();
+  auto d_flag = k_check_flag.view<DeviceType>();
+  NeighborCheckDistanceFunctor<DeviceType,decltype(d_x),decltype(d_flag)>
+    fcheck(d_x,d_xhold,d_flag,deltasq,check_stamp);
+  Kokkos::parallel_for(Kokkos::RangePolicy<DeviceType>(0,nlocal),fcheck);
+
+  int mark = 0;
+  Kokkos::deep_copy(mark,d_flag);
+  int flag = (mark == check_stamp) ? 1 : 0;
 
   int flagall;
   MPI_Allreduce(&flag,&flagall,1,MPI_INT,MPI_MAX,world);
   if (flagall && ago == MAX(every,delay)) ndanger++;
   return flagall;
-}
-
-template<class DeviceType>
-// NOLINTNEXTLINE
-KOKKOS_INLINE_FUNCTION
-void NeighborKokkos::operator()(TagNeighborCheckDistance<DeviceType>, const int &i, int &flag) const {
-  const double delx = static_cast<double>(x.view<DeviceType>()(i,0) - xhold.view<DeviceType>()(i,0));
-  const double dely = static_cast<double>(x.view<DeviceType>()(i,1) - xhold.view<DeviceType>()(i,1));
-  const double delz = static_cast<double>(x.view<DeviceType>()(i,2) - xhold.view<DeviceType>()(i,2));
-  const double rsq = delx*delx + dely*dely + delz*delz;
-  if (rsq > deltasq) flag = 1;
 }
 
 /* ----------------------------------------------------------------------
