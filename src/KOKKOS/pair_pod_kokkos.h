@@ -67,8 +67,6 @@ class PairPODKokkos : public PairPOD {
   typedef Kokkos::View<KK_FLOAT**, DeviceType> t_fparams;
   t_fparams d_cutsq, d_scale;
   typename AT::t_int_1d d_map;
-  typename AT::t_int_1d d_ks;
-  typename AT::t_int_1d d_kn;
 
   friend void pair_virial_fdotr_compute<PairPODKokkos>(PairPODKokkos*);
 
@@ -270,7 +268,11 @@ class PairPODKokkos : public PairPOD {
   void blockatom_base_descriptors(t_pod_1d bd, int Ni, int Nij);
   void blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
+
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
+
+  template<int NAC>
+  void blockatom_local_environment_descriptors_impl(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
   void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
                       t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
