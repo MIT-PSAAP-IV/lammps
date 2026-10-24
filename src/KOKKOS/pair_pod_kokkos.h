@@ -189,6 +189,10 @@ class PairPODKokkos : public PairPOD {
   
   t_pod_1i pq_f;         // [P3*K3] directions in {0,1,2,3}: 0->1.0, 1->u, 2->v, 3->w
 
+  t_pod_1i emask;     // per-atom bitmask: bit e set if atom i has >=1 neighbor of element e: mask |= (1 << jtype)
+  t_pod_1i desc_mask; // per-element bitmask per base descriptor: mask |= (1 << jtype)
+  void build_desc_bitmask();
+
   void build_monomial_factors(t_pod_1i d_pq_m, t_pod_1i d_pq_d, const int K3);
 
   void radialangularsum(t_pod_1d l_sumU, t_pod_1d l_rbf, t_pod_1d l_rhat,
