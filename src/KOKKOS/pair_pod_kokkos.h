@@ -258,6 +258,7 @@ class PairPODKokkos : public PairPOD {
                                     const KK_FLOAT v2, const KK_FLOAT v3);
 
   void set_array_to_zero(t_pod_1d a, int N);
+  void lowcoord_zero(t_pod_1d a, int nrow, int Ni, int njmin);
 
   int NeighborCount(t_pod_1i, int, int);
   int FusedNeighborList(int gi1, int Ni);
