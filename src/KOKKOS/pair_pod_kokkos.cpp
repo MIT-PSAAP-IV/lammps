@@ -1775,6 +1775,23 @@ void PairPODKokkos<DeviceType>::crossdesc_reduction(t_pod_1d cb1, t_pod_1d cb2, 
   });
 }
 
+// as CPU pair pod (EAPOD::peratomenergyforce2() and peratombase_descriptors() in
+// ML-POD/eapod.cpp), the 3-body terms of an atom need more than one pair, the 4-body terms more
+// than two, and the cross terms 33, 34 and 44 more than three, four and five: this zeroes the
+// descriptors (or their coefficients) a[i + Ni*k], k < nrow, of the atoms of the block with fewer
+// than njmin pairs
+template<class DeviceType>
+void PairPODKokkos<DeviceType>::lowcoord_zero(t_pod_1d a, int nrow, int Ni, int njmin)
+{
+  if ((nrow <= 0) || (Ni <= 0)) return;
+  auto l_numij = numij;
+  Kokkos::parallel_for("pod_lowcoord_zero", Kokkos::RangePolicy<DeviceType>(0, Ni * nrow),
+    KOKKOS_LAMBDA(int idx) {
+      const int i = idx % Ni;
+      if (l_numij(i + 1) - l_numij(i) < njmin) a(idx) = 0.0;
+    });
+}
+
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::set_array_to_zero(t_pod_1d a, int N)
 {
@@ -1819,6 +1836,11 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
     fourbodydesc(d4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
   }
 
+  // per atom, as CPU pair pod: 3-body terms with more than one pair, 4-body with more than two
+  // (the block tests above are only early-outs; this also clears the descriptors they skip)
+  lowcoord_zero(d3, nl3, Ni, 2);
+  lowcoord_zero(d4, nl4, Ni, 3);
+
   if ((nl33>0) && (Nij>3)) {
     crossdesc(d33, d3, d3, ind33l, ind33r, nl33, Ni);
   }
@@ -1830,6 +1852,11 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
   if ((nl44>0) && (Nij>5)) {
     crossdesc(d44, d4, d4, ind44l, ind44r, nl44, Ni);
   }
+
+  // cross terms 33, 34 and 44 with more than three, four and five pairs
+  lowcoord_zero(d33, nl33, Ni, 4);
+  lowcoord_zero(d34, nl34, Ni, 5);
+  lowcoord_zero(d44, nl44, Ni, 6);
 }
 
 template<class DeviceType>
@@ -2164,9 +2191,16 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   auto cb34 = Kokkos::subview(cb, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33), Ni * (nl2 + nl3 + nl4 + nl33 + nl34)));
   auto cb44 = Kokkos::subview(cb, std::make_pair(Ni * (nl2 + nl3 + nl4 + nl33 + nl34), Ni * (nl2 + nl3 + nl4 + nl33 + nl34 + nl44)));
 
+  // per atom, as CPU pair pod: no cross-term forces for atoms with at most three, four or
+  // five pairs, no 3-body forces with at most one pair and no 4-body forces with at most two
+  lowcoord_zero(cb33, nl33, Ni, 4);
+  lowcoord_zero(cb34, nl34, Ni, 5);
+  lowcoord_zero(cb44, nl44, Ni, 6);
   if ((nl33>0) && (Nij>3)) crossdesc_reduction(cb3, cb3, cb33, d3, d3, ind33l, ind33r, nl33, Ni);
   if ((nl34>0) && (Nij>4)) crossdesc_reduction(cb3, cb4, cb34, d3, d4, ind34l, ind34r, nl34, Ni);
   if ((nl44>0) && (Nij>5)) crossdesc_reduction(cb4, cb4, cb44, d4, d4, ind44l, ind44r, nl44, Ni);
+  lowcoord_zero(cb3, nl3, Ni, 2);
+  lowcoord_zero(cb4, nl4, Ni, 3);
 
   //// GPUs have large atomblocks. Nij<=1 makes little sense: Nij is the total number of neighbors of all atoms in a block
   //// Would need to treat nij=1 neighbors differently: With numij in the allbody_forces and early return exit
@@ -2176,8 +2210,9 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
   //}
 
   // Similarly conditionals Nij>1 and Nij>2 make little sense on GPUs
+  // the force coefficients are cleared also when no block atom has 3-body terms
+  set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
   if (Nij>1) {
-    set_array_to_zero(forcecoeff, nelements * nrbf3 * K3 * Ni);
     threebody_forcecoeff(forcecoeff, cb3, sumU, pc3, pn3, p3_active, nelements, nrbf3, nabf3_active, K3, Ni);
     if ((nl4 > 0) && (Nij>2)) fourbody_forcecoeff(forcecoeff, cb4, sumU, pa4, pb4, pc4, nelements, nrbf3, nrbf4, nabf4, K3, Q4, Ni);
   }
