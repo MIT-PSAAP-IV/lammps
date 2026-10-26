@@ -698,7 +698,8 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       g.pc4 = s6;
       __syncthreads();
     }
-    desc34_atom<T, TA>(g, u_s, 0);
+    // as CPU pair pod: no 3-body terms with at most one pair, no 4-body with at most two
+    desc34_atom<T, TA>(g, u_s, 0, np);
     __syncthreads();
   }
 
@@ -953,7 +954,7 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
     g.sumU = u_s;
     g.Ni = 1;
     int *qa_s = reinterpret_cast<int *>(w_s + mega_round(nout * (int) sizeof(T)));
-    if (!flane) forcecoeff34_atom<T>(g, f_s, u_s, qa_s, qa_s + K3, 0);
+    if (!flane) forcecoeff34_atom<T>(g, f_s, u_s, qa_s, qa_s + K3, 0, np);
   }
 
   // ---- stage 6: forces and tally, as allbody_forces_mfma_kernel<CSM = 2> with the 2-body
@@ -1019,12 +1020,13 @@ __device__ inline void mega_atom(const MegaArgs<T, TA> &a, char *lds_raw, const 
       const T *rd = a.frec_d + MEGA_FRD * k;
       const int a3 = ri[0], cnt = ri[1];
       T f = T(0);
-      if (a3 >= 0) {
+      // as CPU pair pod: 3-body terms with more than one pair, 4-body with more than two
+      if ((a3 >= 0) && (np > 1)) {
         const T wq = rd[0] * cb3[a3 + a.fc.nabf3_active * m];
         const T t = wq * um[k];
         f = t + t;
       }
-      if (m < a.fc.nrbf4) {
+      if ((m < a.fc.nrbf4) && (np > 2)) {
         const int nb4 = a.fc.nabf4;
 #pragma unroll
         for (int t = 0; t < MEGA_FT; t++)
