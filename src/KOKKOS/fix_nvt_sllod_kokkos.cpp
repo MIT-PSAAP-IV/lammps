@@ -42,6 +42,7 @@ template<class DeviceType>
 FixNVTSllodKokkos<DeviceType>::FixNVTSllodKokkos(LAMMPS *lmp, int narg, char **arg) :
   FixNHKokkos<DeviceType>(lmp, narg, arg)
 {
+  this->fusable = 0;    // own nve_x(), nh_v_temp()
   atomKK = (AtomKokkos *) this->atom;
   this->kokkosable = 1;
   this->domainKK = (DomainKokkos *) this->domain;

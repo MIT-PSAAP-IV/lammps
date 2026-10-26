@@ -29,9 +29,6 @@ ComputeStyle(temp/kk/host,ComputeTempKokkos<LMPHostType>);
 namespace LAMMPS_NS {
 
 template<int RMASS>
-struct TagComputeTempScalar{};
-
-template<int RMASS>
 struct TagComputeTempVector{};
 
 template<class DeviceType>
@@ -70,11 +67,6 @@ class ComputeTempKokkos : public ComputeTemp {
   template<int RMASS>
 // NOLINTNEXTLINE
   KOKKOS_INLINE_FUNCTION
-  void operator()(TagComputeTempScalar<RMASS>, const int&, CTEMP&) const;
-
-  template<int RMASS>
-// NOLINTNEXTLINE
-  KOKKOS_INLINE_FUNCTION
   void operator()(TagComputeTempVector<RMASS>, const int&, CTEMP&) const;
 
  protected:
@@ -83,6 +75,9 @@ class ComputeTempKokkos : public ComputeTemp {
   typename AT::t_kkfloat_1d_randomread mass;
   typename AT::t_int_1d_randomread type;
   typename AT::t_int_1d_randomread mask;
+
+  Kokkos::View<double*, DeviceType> d_part;          // per-chunk partial sums
+  Kokkos::View<double*, LMPPinnedHostType> h_part;
 };
 
 }    // namespace LAMMPS_NS

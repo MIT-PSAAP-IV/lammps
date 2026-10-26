@@ -92,6 +92,37 @@ class PairPODKokkos : public PairPOD {
   int nAtomBlocks;          // number of atoms blocks
   int atomBlocks[101];      // atom blocks
   int timing;
+  int native_hip;          // 1 to use native HIP kernels where available
+  int hip_flags;           // which native HIP kernel variants are used (HIP_* bits)
+  int hip_jtile;           // neighbor tile size of the native HIP radial-angular sum
+  int hip_palign;          // multiple of the fixed pair stride
+  int abf_degree;          // angular degree L of the 3-body monomials, or -1
+  bool angular_otf;        // true if the angular basis of the current block was not stored
+  bool hip_acc_used;       // true if global energy/virial are accumulated in hip_acc
+  bool d2_fused;           // true if the 2-body descriptors of the block are already computed
+  bool forces_in_fij;      // true if the pair forces of the block are in fij, not yet tallied
+  bool rbf_deferred;       // true if rbf/drbf of the block are not computed (yet)
+  bool bs_deferred;        // true if rbf2/drbf2/bs_base of the block are not computed (yet)
+  bool pairs_fused;        // true if the pairs of the block come from FusedNeighborList()
+  bool fused_abort;        // true if a stage needed the pairs of NeighborCount()/NeighborList()
+  bool fuse_neigh_off;     // true once a block had to be computed again without the fused list
+  int pair_stride;         // > 0: the pairs of atom i of the block start at i*pair_stride
+  int block_gi1;           // ilist index before the first atom of the current block
+  bool desc_in_lenv;       // true if the local EA-POD kernel computes the 3/4-body descriptors
+  int lenv_nij;            // number of pairs of the block (for the local EA-POD kernel)
+  bool desc_atom;          // true if d2 (in bd) and cb are stored per atom, [i*Mdesc + m]
+  bool d2_in_neigh;        // true if the 2-body descriptors were computed with the pairs
+  bool one_type;           // true if every atom type is element 0
+  t_pod_1d hip_cbt;        // scratch of cb_strided()
+
+  // maximum neighbor count of the current neighbor list, reused until the next build
+  int mn_value, mn_inum;
+  bigint mn_ncalls;
+  NeighList *mn_list;
+  t_pod_1i hip_iscratch;   // scratch for the native neighbor kernels
+  t_pod_1i hip_lookback;   // scratch of the fused native neighbor kernel
+  Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
+  Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_vir;    // virial of each atom of a block [6*ni]
 
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block
@@ -182,6 +213,10 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d pd;   // environment probability descriptors ni x (1 + nComponents + 3*nClusters)
   t_pod_1d coefficients; // coefficients nCoeffPerElement x nelements
   t_pod_1i pq_m, pq_d, pn3, pc3; // arrays to compute 3-body angular basis functions
+  t_pod_1i pq_ex;          // packed exponents of the 3-body monomials (native kernels)
+  int hf_rows = 0;         // pq_ex holds the row table of the Hf force kernel (all monomials)
+  t_pod_1i fc_qa, fc_qp;   // index tables of the native force coefficients (HIP_FC_TABLE)
+  t_pod_1i p3_qrange;  // pn3[p3_active[a]] and pn3[p3_active[a]+1] for each active channel a
   t_pod_1i pa4, pb4, pc4; // arrays to compute 4-body angular basis functions
   t_pod_1i ind33l, ind33r; // nl33
   t_pod_1i ind34l, ind34r; // nl34
@@ -226,6 +261,9 @@ class PairPODKokkos : public PairPOD {
   void lowcoord_zero(t_pod_1d a, int nrow, int Ni, int njmin);
 
   int NeighborCount(t_pod_1i, int, int);
+  int FusedNeighborList(int gi1, int Ni);
+  int exact_pairs(int gi1);
+  bool fused_abort_needed();
 
   void NeighborList(t_pod_1d l_rr, t_pod_1d l_rhat, t_pod_1i l_numij, t_pod_1i l_typeai,
     t_pod_1i l_idxi, t_pod_1i l_ai, t_pod_1i l_aj, t_pod_1i l_ti, t_pod_1i l_tj,
@@ -242,6 +280,8 @@ class PairPODKokkos : public PairPOD {
                  t_pod_1d rbf, t_pod_1d drbf, int Nij, int ns, int nrbfmax);
 
   void radialbasis_hermite(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rr, t_pod_1i ti, t_pod_1i tj, int N);
+  void ensure_rbf(int N);
+  void ensure_bspline(int N);
 
   void radialbasis_bspline(t_pod_1d l_rbf2, t_pod_1d l_drbf2, t_pod_1d l_rr,
                            t_pod_1i l_base, t_pod_1i ti, t_pod_1i tj, int N);
@@ -250,7 +290,7 @@ class PairPODKokkos : public PairPOD {
                            t_pod_1i l_idxi, t_pod_1i l_tj,
                            int l_nrbf2, const int Ni, const int Nij);
 
-  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
+  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat, t_pod_1d l_rr,
                               t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj,
                               int l_nrbf2, const int Ni, const int Nij);
 
@@ -268,11 +308,16 @@ class PairPODKokkos : public PairPOD {
   void crossdesc_reduction(t_pod_1d cb1, t_pod_1d cb2, t_pod_1d c12, t_pod_1d d1,
         t_pod_1d d2, t_pod_1i ind1, t_pod_1i ind2, int n12, int Ni);
   void blockatom_base_descriptors(t_pod_1d bd, int Ni, int Nij);
+  void base_descriptors34(t_pod_1d d3, t_pod_1d d4, int Ni, int Nij);
+  bool lenv_wave_ok(int Nij) const;
+  void cb_strided(int Ni);
+  void desc_layout(int Nij);
+  bool hf_sizes(int Nij) const;
   void blockatom_base_coefficients(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
   void blockatom_local_environment_descriptors(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
-  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
+  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat, t_pod_1d l_rr,
                       t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3, t_pod_1d l_sumU, t_pod_1i l_pc3,
@@ -290,6 +335,7 @@ class PairPODKokkos : public PairPOD {
   void blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij);
   void tallyenergy(t_pod_1d l_ei, int istart, int Ni);
   void tallyforce(t_pod_1d l_fij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij);
+  void tallystress(t_pod_1d l_fij, t_pod_1d l_rr, t_pod_1d l_rhat, t_pod_1i l_ai, t_pod_1i l_aj, int Nij);
 
   int getStreamingProcessorCount();
 };

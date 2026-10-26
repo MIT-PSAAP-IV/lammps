@@ -19,6 +19,7 @@
 /*_intel.cpp
 /*_kokkos.h
 /*_kokkos_impl.h
+/*_kokkos_hip.h
 /*_kokkos.cpp
 /*_omp.h
 /*_omp.cpp
