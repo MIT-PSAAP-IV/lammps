@@ -706,36 +706,15 @@ void FitPOD::read_exyz_file(double *lattice, double *stress, double *energy, dou
 void FitPOD::get_data(datastruct &data, const std::vector<std::string> &species)
 {
   get_exyz_files(data.data_files, data.group_names, data.data_path, data.file_extension);
-  data.num_atom_sum =
-      get_number_atoms(data.num_atom, data.num_atom_each_file, data.num_config, data.data_files);
-  data.num_config_sum = data.num_atom.size();
-  size_t maxname = 9;
-  for (const auto &fname : data.data_files) maxname = MAX(maxname, fname.size());
-  maxname -= data.data_path.size() + 1;
-  const std::string sepline(maxname + 46, '-');
-  if (comm->me == 0)
-    utils::logmesg(lmp, "{}\n {:^{}} | number of configurations | number of atoms\n{}\n", sepline,
-                   "data file", maxname, sepline);
-  int i = 0;
-  for (const auto &fname : data.data_files) {
-    std::string filename = fname.substr(data.data_path.size() + 1);
-    data.filenames.push_back(filename);
-    if (comm->me == 0)
-      utils::logmesg(lmp, " {:<{}} |        {:>10}        |    {:>8}\n", filename, maxname,
-                     data.num_config[i], data.num_atom_each_file[i]);
-    ++i;
-  }
-  if (comm->me == 0) {
-    utils::logmesg(lmp, "{}\n", sepline);
-    utils::logmesg(lmp, "number of files: {}\n", data.data_files.size());
-    utils::logmesg(lmp, "number of configurations in all files: {}\n", data.num_config_sum);
-    utils::logmesg(lmp, "number of atoms in all files: {}\n", data.num_atom_sum);
-  }
 
   if (data.data_files.empty())
     error->all(FLERR,
                "Cannot fit potential without data files. The data paths may not be valid. Please "
                "check the data paths in the POD data file.");
+
+  data.num_atom_sum =
+      get_number_atoms(data.num_atom, data.num_atom_each_file, data.num_config, data.data_files);
+  data.num_config_sum = data.num_atom.size();
 
   int n = data.num_config_sum;
   memory->create(data.lattice, 9 * n, "fitpod:lattice");
@@ -849,7 +828,39 @@ void FitPOD::get_data(datastruct &data, const std::vector<std::string> &species)
       }
   }
 
+  size_t maxname = 9;
+  for (const auto &fname : data.data_files) maxname = MAX(maxname, fname.size());
+  maxname -= data.data_path.size() + 1;
+  const std::string sepline(maxname + 24 + 15 + 13 + 12 + 13 + 16, '-');
+  if (comm->me == 0)
+    utils::logmesg(lmp, "{}\n {:^{}} | number of configurations | number of atoms | energy weight | force weight | virial weight \n{}\n", sepline, "data file", maxname, sepline);
+  int i = 0;
+  for (const auto &fname : data.data_files) {
+    std::string filename = fname.substr(data.data_path.size() + 1);
+    data.filenames.push_back(filename);
+    std::string group_name = data.group_names[i];
+    if (data.we_map.find(group_name) != data.we_map.end()) {
+      we_group = data.we_map[group_name];
+      wf_group = data.wf_map[group_name];
+    } else {
+      we_group = data.fitting_weights[0];
+      wf_group = data.fitting_weights[1];
+    }
+    if (data.ws_map.find(group_name) != data.ws_map.end())
+      ws_group = data.ws_map[group_name];
+    else
+      ws_group = data.fitting_weights[2];
+    if (comm->me == 0)
+      utils::logmesg(lmp, " {:<{}} | {:>24} | {:>15} | {:>13} | {:>12} | {:>13}\n", filename, maxname,
+                     data.num_config[i], data.num_atom_each_file[i], we_group, wf_group, ws_group);
+    ++i;
+  }
+
   if (comm->me == 0) {
+    utils::logmesg(lmp, "{}\n", sepline);
+    utils::logmesg(lmp, "number of files: {}\n", data.data_files.size());
+    utils::logmesg(lmp, "number of configurations in all files: {}\n", data.num_config_sum);
+    utils::logmesg(lmp, "number of atoms in all files: {}\n", data.num_atom_sum);
     utils::logmesg(lmp, "minimum number of atoms: {}\n", data.num_atom_min);
     utils::logmesg(lmp, "maximum number of atoms: {}\n", data.num_atom_max);
   }
