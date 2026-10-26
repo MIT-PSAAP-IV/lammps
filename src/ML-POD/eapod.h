@@ -285,10 +285,11 @@ class EAPOD : protected Pointers {
                       double *abf, double *abfx, double *abfy, double *abfz, int *tj, int Nj);
 
   void descriptors(double *gd, double *gdd, double *basedesc, double *probdesc, double *x,
-                   int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom);
+                   int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom,
+                   double *gdv = nullptr);
 
   void descriptors(double *gd, double *gdd, double *basedesc, double *x, int *atomtype, int *alist,
-                   int *jlist, int *pairnumsum, int natom);
+                   int *jlist, int *pairnumsum, int natom, double *gdv = nullptr);
 
   void peratombase_descriptors(double *bd, double *bdd, double *rij, double *temp, int *ti, int *tj, int Nj);
   double peratombase_coefficients(double *cb, double *bd, int *ti);
@@ -311,7 +312,7 @@ class EAPOD : protected Pointers {
   double peratomenergyforce2(double *fij, double *rij, double *temp, int *ti, int *tj, int Nj);
 
   double energyforce(double *force, double *x, int *atomtype, int *alist, int *jlist,
-                     int *pairnumsum, int natom);
+                     int *pairnumsum, int natom, double *virial = nullptr);
 
   void tallyforce(double *force, double *fij, int *ai, int *aj, int N);
 

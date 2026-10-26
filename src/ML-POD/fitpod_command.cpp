@@ -42,7 +42,7 @@ static constexpr double SMALL = 1.0e-10;
 FitPOD::datastruct::datastruct() :
     file_format("extxyz"), file_extension("xyz"), filenametag("pod"), group_weight_type("global"),
     lattice(nullptr), energy(nullptr), stress(nullptr), position(nullptr), force(nullptr),
-    atomtype(nullptr), we(nullptr), wf(nullptr),
+    atomtype(nullptr), hasstress(nullptr), we(nullptr), wf(nullptr), ws(nullptr),
     fitting_weights{100.0, 1.0, 0.0, 1, 1, 0, 0, 1, 1, 1, 1, 1e-10,
                     /*12 kappa*/ 0.0, /*13 escheme*/ 0.0,
                     /*14 dE*/ 1.0,   /*15 dF*/ 1.0, /*16 Ftol2*/ 1e-8,   /*17 wzero*/ 1e-3}
@@ -78,6 +78,7 @@ void FitPOD::datastruct::copydatainfo(datastruct &data) const
   for (int i = 0; i < 18; i++) data.fitting_weights[i] = fitting_weights[i];
   data.we_map = we_map;
   data.wf_map = wf_map;
+  data.ws_map = ws_map;
 }
 
 FitPOD::neighborstruct::neighborstruct() :
@@ -91,7 +92,8 @@ FitPOD::neighborstruct::neighborstruct() :
 }
 
 FitPOD::descriptorstruct::descriptorstruct() :
-    bd(nullptr), pd(nullptr), gd(nullptr), gdd(nullptr), A(nullptr), b(nullptr), c(nullptr)
+    bd(nullptr), pd(nullptr), gd(nullptr), gdd(nullptr), gdv(nullptr), A(nullptr), b(nullptr),
+    c(nullptr)
 {
   szd = 0;
   nCoeffAll = 0;
@@ -251,6 +253,7 @@ void FitPOD::command(int narg, char **arg)
   memory->destroy(desc.pd);
   memory->destroy(desc.gd);
   memory->destroy(desc.gdd);
+  memory->destroy(desc.gdv);
 
   // // deallocate neighbor data
   memory->destroy(nb.alist);
@@ -268,7 +271,8 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
                            std::string &filenametag, const std::string &data_file,
                            std::string &group_weight_type,
                            std::unordered_map<std::string, double> &we_map,
-                           std::unordered_map<std::string, double> &wf_map)
+                           std::unordered_map<std::string, double> &wf_map,
+                           std::unordered_map<std::string, double> &ws_map)
 {
   int precision = 8;
 
@@ -390,12 +394,13 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
       }
       int numwords = words.size();
 
-      // Loop over group table entries.
-      while (numwords == 3) {
+      // Group table columns: name, ew, fw, sw (optional)
+      while ((numwords == 3) || (numwords == 4)) {
 
         // Insert in map.
         we_map[words[0]] = utils::numeric(FLERR, words[1], false, lmp);
         wf_map[words[0]] = utils::numeric(FLERR, words[2], false, lmp);
+        if (numwords == 4) ws_map[words[0]] = utils::numeric(FLERR, words[3], false, lmp);
 
         // Get next line.
         if (comm->me == 0) {
@@ -537,8 +542,9 @@ int FitPOD::get_number_atoms(std::vector<int> &num_atom, std::vector<int> &num_a
 }
 
 void FitPOD::read_exyz_file(double *lattice, double *stress, double *energy, double *we, double *wf,
-                            double *pos, double *forces, int *atomtype, std::string file,
-                            std::vector<std::string> species, double we_group, double wf_group)
+                            double *ws, int *hasstress, double *pos, double *forces,
+                            int *atomtype, std::string file, std::vector<std::string> species,
+                            double we_group, double wf_group, double ws_group)
 {
 
   std::string filename = std::move(file);
@@ -644,7 +650,10 @@ void FitPOD::read_exyz_file(double *lattice, double *stress, double *energy, dou
 
         index = std::distance(words.begin(), it);
 
+        for (int k = 0; k < 9; k++) stress[k + 9 * cfi] = 0.0;
+        hasstress[cfi] = 0;
         if (index < std::distance(words.begin(), words.end())) {
+          hasstress[cfi] = 1;
           if (words[index].find('=') != std::string::npos) {
 
             // stress numbers start at index + 1
@@ -654,7 +663,7 @@ void FitPOD::read_exyz_file(double *lattice, double *stress, double *energy, dou
             }
           } else {
 
-            // lattice numbers start at index + 2
+            // stress numbers start at index + 2
 
             for (int k = 0; k < 9; k++) {
               stress[k + 9 * cfi] = utils::numeric(FLERR, words[index + 2 + k], false, lmp);
@@ -667,6 +676,7 @@ void FitPOD::read_exyz_file(double *lattice, double *stress, double *energy, dou
 
       we[cfi] = we_group;
       wf[cfi] = wf_group;
+      ws[cfi] = ws_group;
 
       cfi += 1;
     }
@@ -734,13 +744,19 @@ void FitPOD::get_data(datastruct &data, const std::vector<std::string> &species)
   // Group weights have same size as energy.
   memory->create(data.we, n, "fitpod:we");
   memory->create(data.wf, n, "fitpod:wf");
+  memory->create(data.ws, n, "fitpod:ws");
+  memory->create(data.hasstress, n, "fitpod:hasstress");
+  for (int i = 0; i < n; i++) {
+    data.hasstress[i] = 0;
+    for (int k = 0; k < 9; k++) data.stress[k + 9 * i] = 0.0;
+  }
 
   n = data.num_atom_sum;
   memory->create(data.position, 3 * n, "fitpod:position");
   memory->create(data.force, 3 * n, "fitpod:force");
   memory->create(data.atomtype, n, "fitpod:atomtype");
 
-  double we_group, wf_group;              // group weights
+  double we_group, wf_group, ws_group;    // group weights
   int nfiles = data.data_files.size();    // number of files
   int nconfigs = 0;
   int natoms = 0;
@@ -755,11 +771,35 @@ void FitPOD::get_data(datastruct &data, const std::vector<std::string> &species)
       we_group = data.fitting_weights[0];
       wf_group = data.fitting_weights[1];
     }
+    if (data.ws_map.find(group_name) != data.ws_map.end())
+      ws_group = data.ws_map[group_name];
+    else
+      ws_group = data.fitting_weights[2];
     //utils::logmesg(lmp, "Read xyz file: {}\n", group_name);
     read_exyz_file(&data.lattice[9 * nconfigs], &data.stress[9 * nconfigs], &data.energy[nconfigs],
-                   &data.we[nconfigs], &data.wf[nconfigs], &data.position[3 * natoms],
-                   &data.force[3 * natoms], &data.atomtype[natoms], data.data_files[i], species,
-                   we_group, wf_group);
+                   &data.we[nconfigs], &data.wf[nconfigs], &data.ws[nconfigs],
+                   &data.hasstress[nconfigs], &data.position[3 * natoms], &data.force[3 * natoms],
+                   &data.atomtype[natoms], data.data_files[i], species, we_group, wf_group,
+                   ws_group);
+
+    // all-zero stress tensors: a) not computed, or b) isolated system (stress follows from forces)
+
+    if ((ws_group > 0.0) && (compute_descriptors == 0) && (comm->me == 0)) {
+      int nzero = 0;
+      for (int ci = nconfigs; ci < nconfigs + data.num_config[i]; ci++) {
+        if (!data.hasstress[ci]) continue;
+        int allzero = 1;
+        for (int k = 0; k < 9; k++)
+          if (data.stress[k + 9 * ci] != 0.0) allzero = 0;
+        nzero += allzero;
+      }
+      if (nzero > 0)
+        error->warning(FLERR,
+                       "{} configurations in group {} have a stress tensor that is exactly zero. "
+                       "If the stress was not computed (e.g. for molecules in vacuum), set the "
+                       "stress weight of this group to 0",
+                       nzero, group_name);
+    }
     nconfigs += data.num_config[i];
     natoms += data.num_atom_each_file[i];
   }
@@ -792,6 +832,21 @@ void FitPOD::get_data(datastruct &data, const std::vector<std::string> &species)
     matrix33_multiplication(Qmat, lattice, Qmat, DIM);
     matrix33_multiplication(x, Qmat, x, natom);
     matrix33_multiplication(f, Qmat, f, natom);
+
+    // rotate stress tensor: S' = Q S Q^T
+
+    double *s = &data.stress[9 * ci];
+    double QS[9];
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++) {
+        QS[3 * a + b] = 0.0;
+        for (int c = 0; c < 3; c++) QS[3 * a + b] += Qmat[a + 3 * c] * s[3 * c + b];
+      }
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++) {
+        s[3 * a + b] = 0.0;
+        for (int c = 0; c < 3; c++) s[3 * a + b] += QS[3 * a + c] * Qmat[b + 3 * c];
+      }
   }
 
   if (comm->me == 0) {
@@ -912,6 +967,8 @@ void FitPOD::select_data(datastruct &newdata, const datastruct &data)
   // Group weights have same size as energy.
   memory->create(newdata.we, n, "fitpod:we");
   memory->create(newdata.wf, n, "fitpod:wf");
+  memory->create(newdata.ws, n, "fitpod:ws");
+  memory->create(newdata.hasstress, n, "fitpod:hasstress");
 
   n = newdata.num_atom_sum;
   memory->create(newdata.position, 3 * n, "fitpod:newdata_position");
@@ -942,6 +999,8 @@ void FitPOD::select_data(datastruct &newdata, const datastruct &data)
       newdata.energy[cn] = data.energy[ci];
       newdata.we[cn] = data.we[ci];
       newdata.wf[cn] = data.wf[ci];
+      newdata.ws[cn] = data.ws[ci];
+      newdata.hasstress[cn] = data.hasstress[ci];
       for (int j = 0; j < 9; j++) {
         newdata.stress[j + 9 * cn] = data.stress[j + 9 * ci];
         newdata.lattice[j + 9 * cn] = data.lattice[j + 9 * ci];
@@ -998,7 +1057,7 @@ void FitPOD::read_data_files(const std::string &data_file, const std::vector<std
   data.precision =
       read_data_file(data.fitting_weights, data.file_format, data.file_extension, envdata.data_path,
                      testdata.data_path, data.data_path, data.filenametag, data_file,
-                     data.group_weight_type, data.we_map, data.wf_map);
+                     data.group_weight_type, data.we_map, data.wf_map, data.ws_map);
 
   data.training_analysis = (int) data.fitting_weights[3];
   data.test_analysis = (int) data.fitting_weights[4];
@@ -1237,6 +1296,7 @@ void FitPOD::allocate_memory_descriptorstruct(int nCoeffAll)
   memory->create(desc.b, nCoeffAll, "fitpod:desc_b");
   memory->create(desc.c, nCoeffAll, "fitpod:desc_c");
   memory->create(desc.gdd, desc.szd, "fitpod:desc_gdd");
+  memory->create(desc.gdv, 9 * nCoeffAll, "fitpod:desc_gdv");
   podArraySetValue(desc.A, 0.0, nCoeffAll * nCoeffAll);
   podArraySetValue(desc.b, 0.0, nCoeffAll);
   podArraySetValue(desc.c, 0.0, nCoeffAll);
@@ -1262,6 +1322,8 @@ void FitPOD::deallocate_memory_datastruct(datastruct &data)
   memory->destroy(data.atomtype);
   memory->destroy(data.we);
   memory->destroy(data.wf);
+  memory->destroy(data.ws);
+  memory->destroy(data.hasstress);
 }
 
 void FitPOD::estimate_memory_fastpod(const datastruct &data)
@@ -1291,7 +1353,7 @@ void FitPOD::estimate_memory_fastpod(const datastruct &data)
   desc.szd = MAX(desc.szd, 3 * Nijmax * fastpodptr->nCoeffAll);
 }
 
-void FitPOD::local_descriptors_fastpod(const datastruct &data, int ci)
+void FitPOD::local_descriptors_fastpod(const datastruct &data, int ci, double *gdv)
 {
   int dim = 3;
   int *pbc = fastpodptr->pbc;
@@ -1312,10 +1374,10 @@ void FitPOD::local_descriptors_fastpod(const datastruct &data, int ci)
 
   if (desc.nClusters > 1) {
     fastpodptr->descriptors(desc.gd, desc.gdd, desc.bd, desc.pd, nb.y, atomtype, nb.alist,
-                            nb.pairlist, nb.pairnum_cumsum, natom);
+                            nb.pairlist, nb.pairnum_cumsum, natom, gdv);
   } else {
     fastpodptr->descriptors(desc.gd, desc.gdd, desc.bd, nb.y, atomtype, nb.alist, nb.pairlist,
-                            nb.pairnum_cumsum, natom);
+                            nb.pairnum_cumsum, natom, gdv);
   }
 }
 
@@ -1704,8 +1766,21 @@ void FitPOD::training_cluster_calculation(const datastruct &data)
     utils::logmesg(lmp, "**************** End Calculating Training K-means Clustering ****************\n");
 }
 
+static double latticevolume(double *lattice)
+{
+  double *v1 = &lattice[0];
+  double *v2 = &lattice[3];
+  double *v3 = &lattice[6];
+
+  double b0 = v1[1] * v2[2] - v1[2] * v2[1];
+  double b1 = v1[2] * v2[0] - v1[0] * v2[2];
+  double b2 = v1[0] * v2[1] - v1[1] * v2[0];
+
+  return (b0 * v3[0] + b1 * v3[1] + b2 * v3[2]);
+}
+
 void FitPOD::least_squares_matrix(const datastruct &data, int ci,
-                                  double eweight, double *fweight)
+                                  double eweight, double *fweight, double sweight)
 {
   int dim = 3;
   int natom = data.num_atom[ci];
@@ -1717,13 +1792,13 @@ void FitPOD::least_squares_matrix(const datastruct &data, int ci,
   double energy = data.energy[ci];
   double *force = &data.force[dim * natom_cumsum];
 
-  // --- energy block:  A += we2 * gd*gd ,  b += we2*energy*gd
+  // --- energy block:  A += we2 * gd^T gd ,  b += we2*energy * gd^T
   double we2 = eweight * (normconst * normconst);
   podKron(desc.A, desc.gd, desc.gd, we2, nCoeffAll, nCoeffAll);
   double wee = we2 * energy;
   for (int i = 0; i < nCoeffAll; i++) desc.b[i] += wee * desc.gd[i];
 
-  // --- force block with per-atom weights:  A += gdd^T W gdd , b += gdd^T W f
+  // --- force block with per-atom weights:  A += gdd^T Wf gdd , b += gdd^T Wf force
   std::vector<double> fw(nforce);
   for (int a = 0; a < natom; a++) {
     double s = sqrt(fweight[a]);
@@ -1742,6 +1817,21 @@ void FitPOD::least_squares_matrix(const datastruct &data, int ci,
         desc.gdd, &nforce, desc.gdd, &nforce, &one, desc.A, &nCoeffAll);
   DGEMV(&cht, &nforce, &nCoeffAll, &one, desc.gdd, &nforce,
         fw.data(), &inc1, &one, desc.b, &inc1);
+
+  // --- stress block (9 virial components, W = -V*stress):
+  //     A += ws2 * gdv^T gdv ,  b += ws2 * gdv^T W
+  // W/N and E/N have same units: normalize on the energe-scale
+  if (sweight > 0.0) {
+    int nvirial = 9;
+    double ws2 = sweight * (normconst * normconst);
+    double vol = latticevolume(&data.lattice[9 * ci]);
+    double wv[9];
+    for (int v = 0; v < 9; v++) wv[v] = -vol * data.stress[v + 9 * ci];
+    DGEMM(&cht, &chn, &nCoeffAll, &nCoeffAll, &nvirial, &ws2,
+          desc.gdv, &nvirial, desc.gdv, &nvirial, &one, desc.A, &nCoeffAll);
+    DGEMV(&cht, &nvirial, &nCoeffAll, &ws2, desc.gdv, &nvirial,
+          wv, &inc1, &one, desc.b, &inc1);
+  }
 }
 
 void FitPOD::least_squares_fit(const datastruct &data)
@@ -1752,14 +1842,15 @@ void FitPOD::least_squares_fit(const datastruct &data)
   int nconfig = (int) data.num_atom.size();
   std::vector<double> ew(nconfig);
   std::vector<double> fwt(data.num_atom_sum);
-  compute_loss_weights(data, ew.data(), fwt.data());
+  std::vector<double> sw(nconfig);
+  compute_loss_weights(data, ew.data(), fwt.data(), sw.data());
 
   for (int ci = 0; ci < nconfig; ci++) {
     if ((ci % 100) == 0 && comm->me == 0)
       utils::logmesg(lmp, "Configuration: # {}\n", ci + 1);
 
     if ((ci % comm->nprocs) == comm->me) {
-      local_descriptors_fastpod(data, ci);
+      local_descriptors_fastpod(data, ci, (sw[ci] > 0.0) ? desc.gdv : nullptr);
 
       if (save_descriptors > 0) {
         std::string filename =
@@ -1772,7 +1863,7 @@ void FitPOD::least_squares_fit(const datastruct &data)
         }
       }
 
-      least_squares_matrix(data, ci, ew[ci], &fwt[data.num_atom_cumsum[ci]]);
+      least_squares_matrix(data, ci, ew[ci], &fwt[data.num_atom_cumsum[ci]], sw[ci]);
     }
   }
 
@@ -1810,7 +1901,7 @@ void FitPOD::least_squares_fit(const datastruct &data)
   fastpodptr->mknewcoeff(desc.c, nCoeffAll);
 }
 
-void FitPOD::compute_loss_weights(const datastruct &data, double *ew, double *fw)
+void FitPOD::compute_loss_weights(const datastruct &data, double *ew, double *fw, double *sw)
 {
   int    nconfig = (int) data.num_atom.size();
   int    escheme = (int) data.fitting_weights[13];
@@ -1821,6 +1912,20 @@ void FitPOD::compute_loss_weights(const datastruct &data, double *ew, double *fw
   double wzero   = data.fitting_weights[17];   // fixed weight for zero-force atoms
   if (dE <= 0.0) dE = 1.0;
   if (dF <= 0.0) dF = 1.0;
+
+  // ---------- stress weights ----------
+  if (escheme == 0) {
+    for (int ci = 0; ci < nconfig; ci++)
+      sw[ci] = data.hasstress[ci] ? data.ws[ci]*data.ws[ci] : 0.0;
+  } else {
+    double sumS = 0.0;
+    for (int ci = 0; ci < nconfig; ci++) {
+      sw[ci] = data.hasstress[ci] ? data.ws[ci] : 0.0;
+      sumS += sw[ci];
+    }
+    if (sumS <= 0.0) sumS = 1.0;
+    for (int ci = 0; ci < nconfig; ci++) sw[ci] /= sumS;
+  }
 
   // ---------- legacy path (scheme 0): original ----------
   if (escheme == 0) {
@@ -1895,20 +2000,8 @@ void FitPOD::compute_loss_weights(const datastruct &data, double *ew, double *fw
   for (int i = 0; i < data.num_atom_sum; i++) fw[i]  *= kappa;
 }
 
-static double latticevolume(double *lattice)
-{
-  double *v1 = &lattice[0];
-  double *v2 = &lattice[3];
-  double *v3 = &lattice[6];
-
-  double b0 = v1[1] * v2[2] - v1[2] * v2[1];
-  double b1 = v1[2] * v2[0] - v1[0] * v2[2];
-  double b2 = v1[0] * v2[1] - v1[1] * v2[0];
-
-  return (b0 * v3[0] + b1 * v3[1] + b2 * v3[2]);
-}
-
-double FitPOD::energyforce_calculation_fastpod(double *force, const datastruct &data, int ci)
+double FitPOD::energyforce_calculation_fastpod(double *force, const datastruct &data, int ci,
+                                               double *virial)
 {
   int dim = 3;
   int *pbc = fastpodptr->pbc;
@@ -1928,7 +2021,7 @@ double FitPOD::energyforce_calculation_fastpod(double *force, const datastruct &
                       fastpodptr->nelements);
 
   double energy = fastpodptr->energyforce(force, nb.y, atomtype, nb.alist, nb.pairlist,
-                                          nb.pairnum_cumsum, natom);
+                                          nb.pairnum_cumsum, natom, virial);
 
   return energy;
 }
@@ -1956,20 +2049,22 @@ void FitPOD::print_analysis(const datastruct &data, double *outarray, double *er
   utils::logmesg(lmp, mystr);
   utils::print(fp_errors, mystr);
 
-  std::string sa(lm + 80, '-');
+  std::string sa(lm + 108, '-');
   sa += '\n';
   std::string sb = fmt::format(
-      " {:^{}} | # configs |  # atoms  | MAE energy  | RMSE energy | MAE force  | RMSE force\n",
+      " {:^{}} | # configs |  # atoms  | MAE energy  | RMSE energy | MAE force  | RMSE force  "
+      "| MAE stress  | RMSE stress\n",
       "File", lm);
   utils::logmesg(lmp, sa + sb + sa);
   utils::print(fp_errors, sa + sb + sa);
 
-  int ci = 0, m = 8, nc = 0, nf = 0;
+  int ci = 0, m = 11, ne = 6, nc = 0, nf = 0;
   for (int file = 0; file < nfiles; file++) {
     utils::print(fp_analysis, "# {}\n", data.filenames[file]);
     utils::print(fp_analysis,
                "  config   # atoms       volume        energy        DFT energy     energy error   "
-               "  force          DFT force       force error\n");
+               "  force          DFT force       force error     stress          DFT stress    "
+               "  stress error\n");
 
     int nforceall = 0;
     int nconfigs = data.num_config[file];
@@ -1990,19 +2085,21 @@ void FitPOD::print_analysis(const datastruct &data, double *outarray, double *er
     nf += nforceall;
 
     int q = file + 1;
-    auto s =
-        fmt::format("{:<{}} {:>10} {:>11}     {:<10.8f}    {:<10.8f}    {:<10.8f}    {:<10.8f}\n",
-                    data.filenames[file], lm, nconfigs, nforceall / 3, errors[0 + 4 * q],
-                    errors[1 + 4 * q], errors[2 + 4 * q], errors[3 + 4 * q]);
+    auto s = fmt::format("{:<{}} {:>10} {:>11}     {:<10.8f}    {:<10.8f}    {:<10.8f}    "
+                         "{:<10.8f}    {:<10.8f}    {:<10.8f}\n",
+                         data.filenames[file], lm, nconfigs, nforceall / 3, errors[0 + ne * q],
+                         errors[1 + ne * q], errors[2 + ne * q], errors[3 + ne * q],
+                         errors[4 + ne * q], errors[5 + ne * q]);
     utils::logmesg(lmp, s);
     utils::print(fp_errors, s);
   }
   utils::logmesg(lmp, sa);
   utils::print(fp_errors, sa);
 
-  auto s =
-      fmt::format("{:<{}} {:>10} {:>11}     {:<10.8f}    {:<10.8f}    {:<10.8f}    {:<10.8f}\n",
-                  "All files", lm, nc, nf / 3, errors[0], errors[1], errors[2], errors[3]);
+  auto s = fmt::format("{:<{}} {:>10} {:>11}     {:<10.8f}    {:<10.8f}    {:<10.8f}    "
+                       "{:<10.8f}    {:<10.8f}    {:<10.8f}\n",
+                       "All files", lm, nc, nf / 3, errors[0], errors[1], errors[2], errors[3],
+                       errors[4], errors[5]);
   utils::logmesg(lmp, s + sa);
   utils::print(fp_errors, "{}", s + sa);
 
@@ -2024,15 +2121,31 @@ void FitPOD::error_analysis(const datastruct &data, double *coeff)
   int nfiles = data.data_files.size();       // number of files
   int num_configs = data.num_atom.size();    // number of configurations in all files
 
-  int m = 8;
+  int m = 11;
   std::vector<double> outarray(m * num_configs);
   for (int i = 0; i < m * num_configs; i++) outarray[i] = 0.0;
 
   std::vector<double> ssrarray(num_configs);
   for (int i = 0; i < num_configs; i++) ssrarray[i] = 0.0;
 
-  std::vector<double> errors(4 * (nfiles + 1));
-  for (int i = 0; i < 4 * (nfiles + 1); i++) errors[i] = 0.0;
+  // sum of squared stress errors per configuration:
+  // stress statistics use only configurations with a stress tensor,
+  // except all-zero tensors with zero stress weight
+
+  std::vector<double> sssrarray(num_configs);
+  std::vector<int> usestress(num_configs);
+  for (int i = 0; i < num_configs; i++) {
+    sssrarray[i] = 0.0;
+    int allzero = 1;
+    for (int k = 0; k < 9; k++)
+      if (data.stress[k + 9 * i] != 0.0) allzero = 0;
+    usestress[i] = (data.hasstress[i] && !(allzero && (data.ws[i] == 0.0))) ? 1 : 0;
+  }
+
+  int ne = 6;
+  std::vector<double> errors(ne * (nfiles + 1));
+  for (int i = 0; i < ne * (nfiles + 1); i++) errors[i] = 0.0;
+  double virial[9], podstress[9];
 
   std::vector<double> newcoeff(nCoeffAll);
   for (int j = 0; j < nCoeffAll; j++) newcoeff[j] = coeff[j];
@@ -2054,7 +2167,7 @@ void FitPOD::error_analysis(const datastruct &data, double *coeff)
         int natom = data.num_atom[ci];
         int nforce = dim * natom;
 
-        energy = energyforce_calculation_fastpod(force.data(), data, ci);
+        energy = energyforce_calculation_fastpod(force.data(), data, ci, virial);
 
         double DFTenergy = data.energy[ci];
         int natom_cumsum = data.num_atom_cumsum[ci];
@@ -2076,6 +2189,21 @@ void FitPOD::error_analysis(const datastruct &data, double *coeff)
         }
         outarray[7 + m * ci] = sum / nforce;
         ssrarray[ci] = ssr;
+
+        // stress = -W/V
+        double vol = latticevolume(&data.lattice[9 * ci]);
+        for (int k = 0; k < 9; k++) podstress[k] = -virial[k] / vol;
+        double *DFTstress = &data.stress[9 * ci];
+        outarray[8 + m * ci] = podArrayNorm(podstress, 9);
+        outarray[9 + m * ci] = podArrayNorm(DFTstress, 9);
+        sum = ssr = 0.0;
+        for (int k = 0; k < 9; k++) {
+          diff = DFTstress[k] - podstress[k];
+          sum += fabs(diff);
+          ssr += diff * diff;
+        }
+        outarray[10 + m * ci] = sum / 9.0;
+        sssrarray[ci] = ssr;
       }
 
       ci += 1;
@@ -2084,13 +2212,14 @@ void FitPOD::error_analysis(const datastruct &data, double *coeff)
 
   MPI_Allreduce(MPI_IN_PLACE, outarray.data(), m * num_configs, MPI_DOUBLE, MPI_SUM, world);
   MPI_Allreduce(MPI_IN_PLACE, ssrarray.data(), num_configs, MPI_DOUBLE, MPI_SUM, world);
+  MPI_Allreduce(MPI_IN_PLACE, sssrarray.data(), num_configs, MPI_DOUBLE, MPI_SUM, world);
 
   ci = 0;    // configuration counter
-  int nc = 0, nf = 0;
+  int nc = 0, nf = 0, ns = 0;
   for (int file = 0; file < nfiles; file++) {    // loop over each file in the training data set
 
-    double emae = 0.0, essr = 0.0, fmae = 0.0, fssr = 0.0;
-    int nforceall = 0;
+    double emae = 0.0, essr = 0.0, fmae = 0.0, fssr = 0.0, smae = 0.0, sssr = 0.0;
+    int nforceall = 0, nstressall = 0;
 
     int nconfigs = data.num_config[file];
     nc += nconfigs;
@@ -2105,22 +2234,32 @@ void FitPOD::error_analysis(const datastruct &data, double *coeff)
       fmae += outarray[7 + m * ci] * nforce;              // sum_c |fPOD_c - fDFT_c|
       fssr += ssrarray[ci];
       nforceall += nforce;
+      if (usestress[ci]) {
+        smae += outarray[10 + m * ci] * 9.0;    // sum_c |sPOD_c - sDFT_c|
+        sssr += sssrarray[ci];
+        nstressall += 9;
+      }
       ci += 1;
     }
 
     int q = file + 1;
     if (nconfigs == 0) nconfigs = 1;
     if (nforceall == 0) nforceall = 1;
-    errors[0 + 4 * q] = emae / nconfigs;
-    errors[1 + 4 * q] = sqrt(essr / nconfigs);
-    errors[2 + 4 * q] = fmae / nforceall;
-    errors[3 + 4 * q] = sqrt(fssr / nforceall);
+    errors[0 + ne * q] = emae / nconfigs;
+    errors[1 + ne * q] = sqrt(essr / nconfigs);
+    errors[2 + ne * q] = fmae / nforceall;
+    errors[3 + ne * q] = sqrt(fssr / nforceall);
+    errors[4 + ne * q] = (nstressall > 0) ? smae / nstressall : 0.0;
+    errors[5 + ne * q] = (nstressall > 0) ? sqrt(sssr / nstressall) : 0.0;
 
     nf += nforceall;
+    ns += nstressall;
     errors[0] += emae;    // sum_c |ePOD_c - eDFT_c|/natom_c
     errors[1] += essr;    // sum_c |ePOD_c - eDFT_c|^2/(natom_c)^2
     errors[2] += fmae;
     errors[3] += fssr;
+    errors[4] += smae;
+    errors[5] += sssr;
   }
 
   if (nc == 0) nc = 1;
@@ -2129,6 +2268,8 @@ void FitPOD::error_analysis(const datastruct &data, double *coeff)
   errors[1] = sqrt(errors[1] / nc);    // sqrt { (1/Nc) *  sum_c |ePOD_c - eDFT_c|^2/(natom_c)^2 }
   errors[2] = errors[2] / nf;
   errors[3] = sqrt(errors[3] / nf);
+  errors[4] = (ns > 0) ? errors[4] / ns : 0.0;
+  errors[5] = (ns > 0) ? sqrt(errors[5] / ns) : 0.0;
 
   if (comm->me == 0) {
     utils::logmesg(lmp, "**************** End of Error Calculation ****************\n");
@@ -2140,7 +2281,7 @@ void FitPOD::energyforce_calculation(const datastruct &data)
 {
   int dim = 3;
   double energy;
-  std::vector<double> force(1 + dim * data.num_atom_max);
+  std::vector<double> force(1 + dim * data.num_atom_max + 9);
 
   int nfiles = data.data_files.size();    // number of files
 
@@ -2160,15 +2301,20 @@ void FitPOD::energyforce_calculation(const datastruct &data)
       int nforce = dim * natom;
 
       if ((ci % comm->nprocs) == comm->me) {
-        energy = energyforce_calculation_fastpod(force.data() + 1, data, ci);
+        double *stress = &force[1 + nforce];
+        energy = energyforce_calculation_fastpod(force.data() + 1, data, ci, stress);
 
-        // save energy and force into a binary file
+        // stress = -W/V
+        double vol = latticevolume(&data.lattice[9 * ci]);
+        for (int k = 0; k < 9; k++) stress[k] = -stress[k] / vol;
+
+        // save energy, forces, and stress into a binary file
         force[0] = energy;
         std::string filename = "energyforce_config" + std::to_string(ci + 1) + ".bin";
 
         SafeFilePtr fp = fopen(filename.c_str(), "wb");
 
-        fwrite(reinterpret_cast<char *>(force.data()), sizeof(double) * (1 + nforce), 1, fp);
+        fwrite(reinterpret_cast<char *>(force.data()), sizeof(double) * (1 + nforce + 9), 1, fp);
       }
       ci += 1;
     }

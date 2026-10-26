@@ -29,6 +29,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 // header file. Moved down here to avoid polluting other headers with its defines
 #include "eapod.h"
@@ -1426,10 +1427,11 @@ double EAPOD::peratomenergyforce(double *fij, double *rij, double *temp,
 }
 
 double EAPOD::energyforce(double *force, double *x, int *atomtype, int *alist,
-          int *jlist, int *pairnumsum, int natom)
+          int *jlist, int *pairnumsum, int natom, double *virial)
 {
   double etot = 0.0;
   memset(force, 0, 3*natom * sizeof(*force));
+  if (virial) memset(virial, 0, 9 * sizeof(*virial));
 
   for (int i=0; i<natom; i++) {
     int Nj = pairnumsum[i+1] - pairnumsum[i]; // # neighbors around atom i
@@ -1458,6 +1460,14 @@ double EAPOD::energyforce(double *force, double *x, int *atomtype, int *alist,
       etot += peratomenergyforce(fij, rij, &tmpmem[6*Nj], ti, tj, Nj);
 
       tallyforce(force, fij, ai, aj, Nj);
+
+      // virial W_ab = -sum_n rij_a * fij_b, same convention as pair_pod.cpp
+      if (virial) {
+        for (int n=0; n<Nj; n++)
+          for (int a=0; a<3; a++)
+            for (int b=0; b<3; b++)
+              virial[3*a + b] -= rij[a + 3*n]*fij[b + 3*n];
+      }
     }
   }
 
@@ -1501,10 +1511,11 @@ void EAPOD::base_descriptors(double *basedesc, double *x,
 }
 
 void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *x,
-        int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom)
+        int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom, double *gdv)
 {
   memset(gd, 0, nd * sizeof(*gd));
   memset(gdd, 0, 3*natom*nd * sizeof(*gdd));
+  if (gdv) memset(gdv, 0, 9*nd * sizeof(*gdv));
   memset(basedesc, 0, natom*Mdesc * sizeof(*basedesc));
 
   for (int i=0; i<natom; i++) {
@@ -1547,6 +1558,13 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *x,
           gdd[1 + jm] -= bdd[1 + nm];
           gdd[2 + jm] -= bdd[2 + nm];
         }
+        // virial descriptors: gdv_ab += -rij_a * bdd_b
+        if (gdv) {
+          for (int n=0; n<Nj; n++)
+            for (int a=0; a<3; a++)
+              for (int b=0; b<3; b++)
+                gdv[3*a + b + 9*k] -= rij[a + 3*n]*bdd[b + 3*n + 3*Nj*m];
+        }
       }
 
     }
@@ -1554,12 +1572,14 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *x,
 }
 
 void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *probdesc, double *x,
-        int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom)
+        int *atomtype, int *alist, int *jlist, int *pairnumsum, int natom, double *gdv)
 {
   memset(gd, 0, nCoeffAll * sizeof(*gd));
   memset(gdd, 0, 3*natom*nCoeffAll * sizeof(*gdd));
+  if (gdv) memset(gdv, 0, 9*nCoeffAll * sizeof(*gdv));
   memset(basedesc, 0, natom*Mdesc * sizeof(*basedesc));
   memset(probdesc, 0, natom*nClusters * sizeof(*probdesc));
+  std::vector<double> xij;
 
   for (int i=0; i<natom; i++) {
     int Nj = pairnumsum[i+1] - pairnumsum[i]; // # neighbors around atom i
@@ -1587,6 +1607,9 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *probd
       // many-body descriptors
       peratombase_descriptors(bd, bdd, rij, &tmpmem[3*Nj], ti, tj, Nj);
 
+      // the environment descriptors below use tmpmem as scratch and overwrite rij
+      if (gdv) xij.assign(rij, rij + 3*Nj);
+
       // calculate multi-environment descriptors and their derivatives with respect to atom coordinates
       if (localeapod) peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], Nj);
       else            peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], Nj);
@@ -1608,6 +1631,18 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *probd
             gdd[0 + jm] -= bdd[0 + nm]*pd[j] + bd[m]*pdd[0 + nj];
             gdd[1 + jm] -= bdd[1 + nm]*pd[j] + bd[m]*pdd[1 + nj];
             gdd[2 + jm] -= bdd[2 + nm]*pd[j] + bd[m]*pdd[2 + nj];
+          }
+          // virial descriptors: gdv_ab += -rij_a * d(pd*bd)_b
+          if (gdv) {
+            for (int n=0; n<Nj; n++) {
+              int nm = 3*n + 3*Nj*m;
+              int nj = 3*n + 3*Nj*j;
+              for (int b=0; b<3; b++) {
+                double dpb = bdd[b + nm]*pd[j] + bd[m]*pdd[b + nj];
+                for (int a=0; a<3; a++)
+                  gdv[3*a + b + 9*k] -= xij[a + 3*n]*dpb;
+              }
+            }
           }
         }
       }

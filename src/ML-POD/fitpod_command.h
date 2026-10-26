@@ -60,9 +60,11 @@ class FitPOD : public Command {
     double *position;
     double *force;
     int *atomtype;
+    int *hasstress;    // 1 if the configuration has a stress tensor, 0 otherwise
     // Group weights will have same size as energy.
     double *we;
     double *wf;
+    double *ws;
 
     int training;
     int normalizeenergy;
@@ -76,6 +78,7 @@ class FitPOD : public Command {
 
     std::unordered_map<std::string, double> we_map;
     std::unordered_map<std::string, double> wf_map;
+    std::unordered_map<std::string, double> ws_map;
 
     double fitting_weights[24];
   };
@@ -103,6 +106,7 @@ class FitPOD : public Command {
     double *pd;     // multi-environment descriptors (probabilities)
     double *gd;     // global descriptors
     double *gdd;    // derivatives of global descriptors and peratom descriptors
+    double *gdv;    // virial descriptors (9 x nCoeffAll)
     double *A;      // least-square matrix for all descriptors
     double *b;      // least-square vector for all descriptors
     double *c;      // coefficents of descriptors
@@ -160,15 +164,17 @@ class FitPOD : public Command {
                      std::string &filenametag, const std::string &data_file,
                      std::string &group_weight_type,
                      std::unordered_map<std::string, double> &we_map,
-                     std::unordered_map<std::string, double> &wf_map);
+                     std::unordered_map<std::string, double> &wf_map,
+                     std::unordered_map<std::string, double> &ws_map);
   void get_exyz_files(std::vector<std::string> &, std::vector<std::string> &, const std::string &,
                       const std::string &);
   int get_number_atom_exyz(std::vector<int> &num_atom, int &num_atom_sum, std::string file);
   int get_number_atoms(std::vector<int> &num_atom, std::vector<int> &num_atom_sum,
                        std::vector<int> &num_config, std::vector<std::string> training_files);
   void read_exyz_file(double *lattice, double *stress, double *energy, double *we, double *wf,
-                      double *pos, double *forces, int *atomtype, std::string file,
-                      std::vector<std::string> species, double we_group, double wf_group);
+                      double *ws, int *hasstress, double *pos, double *forces, int *atomtype,
+                      std::string file, std::vector<std::string> species, double we_group,
+                      double wf_group, double ws_group);
   void get_data(datastruct &data, const std::vector<std::string> &species);
   std::vector<int> linspace(int start_in, int end_in, int num_in);
   std::vector<int> shuffle(int start_in, int end_in, int num_in);
@@ -188,9 +194,9 @@ class FitPOD : public Command {
   void allocate_memory_descriptorstruct(int nd);
   void estimate_memory_fastpod(const datastruct &data);
   void deallocate_memory_datastruct(datastruct &data);
-  void local_descriptors_fastpod(const datastruct &data, int ci);
+  void local_descriptors_fastpod(const datastruct &data, int ci, double *gdv = nullptr);
   void base_descriptors_fastpod(const datastruct &data, int ci);
-  void least_squares_matrix(const datastruct &data, int ci, double eweight, double *fweight);
+  void least_squares_matrix(const datastruct &data, int ci, double eweight, double *fweight, double sweight);
   void least_squares_fit(const datastruct &data);
   void descriptors_calculation(const datastruct &data);
   void environment_cluster_calculation(const datastruct &data);
@@ -203,10 +209,10 @@ class FitPOD : public Command {
 
   void print_analysis(const datastruct &data, double *outarray, double *errors);
   void error_analysis(const datastruct &data, double *coeff);
-  double energyforce_calculation_fastpod(double *force, const datastruct &data, int ci);
+  double energyforce_calculation_fastpod(double *force, const datastruct &data, int ci, double *virial = nullptr);
   void energyforce_calculation(const datastruct &data);
 
-  void compute_loss_weights(const datastruct &data, double *ew, double *fw);
+  void compute_loss_weights(const datastruct &data, double *ew, double *fw, double *sw);
 };
 }    // namespace LAMMPS_NS
 #endif
