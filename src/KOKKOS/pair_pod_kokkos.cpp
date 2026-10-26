@@ -138,6 +138,8 @@ PODHIP::DescArgs<KK_FLOAT> pod_desc_args(const VD &d3, const VD &d4, const VI &p
   g.Ni = Ni;
   g.do4 = do4 ? 1 : 0;
   g.split = 0;
+  g.numij = nullptr;
+  g.ps = 0;
   return g;
 }
 
@@ -2524,6 +2526,8 @@ void PairPODKokkos<DeviceType>::base_descriptors34(t_pod_1d d3, t_pod_1d d4, int
       auto g = pod_desc_args(d3, d4, pc3, pn3, p3_active, p3_qrange, pa4, pb4, pc4, nelements,
                              nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, (nl4 > 0) && (Nij > 2));
       g.split = (hip_flags & HIP_DESC_SPLIT) ? 1 : 0;
+      g.numij = numij.data();    // per-atom 3/4-body tests, as CPU pair pod
+      g.ps = pair_stride;
       desc_done =
           PODHIP::desc34<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), g, sumU.data());
     }
@@ -2719,6 +2723,8 @@ void PairPODKokkos<DeviceType>::blockatom_local_environment_descriptors(
                              (nl4 > 0) && (lenv_nij > 2));
       g.split = (hip_flags & HIP_DESC_SPLIT) ? 1 : 0;
       PODHIP::LocalEnvArgs la{nCls, nDes, nCoeff, nActMax, 0};
+      la.numij = numij.data();    // per-atom 3/4-body tests, as CPU pair pod
+      la.ps = pair_stride;
       la.dpp = (hip_flags & HIP_LENV_DPP) ? 1 : 0;
       if (!PODHIP::localenv_wave<KK_FLOAT, KK_ACC_FLOAT>(Kokkos::HIP().hip_stream(), ei.data(),
               cb.data(), B.data(), g, sumU.data(), proj.data(), ledges.data(), redges.data(),
@@ -3058,6 +3064,8 @@ void PairPODKokkos<DeviceType>::blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_
         fca.qa = fc_qa.data();
         fca.qp = fc_qp.data();
       }
+      fca.numij = numij.data();    // per-atom 3/4-body tests, as CPU pair pod
+      fca.ps = pair_stride;
       fc_deferred = angular_otf && (hip_flags & HIP_FUSE_FC);
       if (!fc_deferred)
         fc_done =

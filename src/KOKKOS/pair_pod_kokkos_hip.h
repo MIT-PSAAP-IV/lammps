@@ -106,7 +106,20 @@ template <typename T> struct FcArgs {
   int ca, cm;    // coefficient k of atom i: cb3[i*ca + cm*k] (likewise cb4)
   const int *qa, *qp;    // or nullptr: tables of the active index a of each 3-body term q
                          // (or -1) and of the 4-body channel p of each 4-body term q
+  const int *numij;      // or nullptr: pair counts (PairGeom::range() with stride ps), for the
+  int ps;                // per-atom tests of pod_lowcoord()
 };
+
+// pairs of atom i from numij (PairGeom::range() layout: ps > 0 counts, otherwise offsets), or a
+// large number without numij.  as CPU pair pod (EAPOD::peratomenergyforce2() and
+// peratombase_descriptors() in ML-POD/eapod.cpp), an atom has 3-body terms only with more than
+// one pair, 4-body terms only with more than two and the cross terms 33, 34, 44 with more than
+// three, four and five
+__device__ inline int pod_lowcoord(const int *numij, const int ps, const int i)
+{
+  if (!numij) return 1 << 30;
+  return (ps > 0) ? numij[i + 1] : numij[i + 1] - numij[i];
+}
 
 // force coefficients of atom i into f_s, with u_s (nelements * K3 * nrbf3 values), qa_s (K3)
 // and qp_s (Q4) as scratch, all in LDS; called by all threads of the block, ends synchronized
@@ -119,6 +132,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
   const int S = nelements * K3 * nrbf3;
   const int base = S * i;
   const int NeK3 = nelements * K3;
+  const int nj = pod_lowcoord(g.numij, g.ps, i);    // no 3-body terms for nj <= 1, 4-body nj <= 2
 
   for (int t = threadIdx.x; t < S; t += blockDim.x) {
     u_s[t] = g.sumU[base + t];
@@ -143,7 +157,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
   // three-body: cb3 index i*ca + cm*(a + nabf3_active*m) + N3*(element pair)
 
   const int N3 = cm * nabf3_active * nrbf3;
-  for (int item = threadIdx.x; item < nrbf3 * K3; item += blockDim.x) {
+  for (int item = threadIdx.x; item < ((nj > 1) ? nrbf3 * K3 : 0); item += blockDim.x) {
     const int q = item % K3;
     const int m = item / K3;
     const int a = qa[q];
@@ -166,7 +180,7 @@ __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int
 
   if (g.do4) {
     const int N4 = cm * g.nabf4 * g.nrbf4;
-    for (int item = threadIdx.x; item < g.nrbf4 * Q4; item += blockDim.x) {
+    for (int item = threadIdx.x; item < ((nj > 2) ? g.nrbf4 * Q4 : 0); item += blockDim.x) {
       const int q = item % Q4;
       const int m = item / Q4;
       const int p = qp[q];
@@ -644,6 +658,8 @@ template <typename T> struct DescArgs {
   const int2 *qrange3;    // (pn3[p3_active[a]], pn3[p3_active[a] + 1]) for each a
   int nelements, nrbf3, nabf3_active, nrbf4, nabf4, K3, Q4, Ni, do4;
   int split;    // 1: a descriptor may be summed by up to 8 threads (desc34_atom)
+  const int *numij;    // or nullptr: pair counts for pod_lowcoord() (desc34_kernel)
+  int ps;
 };
 
 // threads per descriptor in desc34_atom(): the power of 2 (<= 8) that spreads n items over the
@@ -657,9 +673,11 @@ __device__ inline int desc34_lpi(const int split, const int n)
 }
 
 // 3- and 4-body descriptors of atom i from its sumU block u_s (in LDS),
-// computed by the threads of the calling block
+// computed by the threads of the calling block; nj pairs of the atom (pod_lowcoord()): the
+// 3-body descriptors are 0 for nj <= 1, the 4-body ones for nj <= 2
 template <typename T, typename TA>
-__device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int i)
+__device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int i,
+                                   const int nj = 1 << 30)
 {
   const int nelements = g.nelements, Ni = g.Ni;
   const int NeK3 = nelements * g.K3;
@@ -684,7 +702,7 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
           tmp += static_cast<TA>(static_cast<T>(g.pc3[q]) * u[i1 + nelements * q] *
                                  u[i2 + nelements * q]);
         for (int o = 1; o < lpi3; o <<= 1) tmp += __shfl_xor(tmp, o);
-        if (sub3 == 0) g.d3[k] = static_cast<T>(tmp);
+        if (sub3 == 0) g.d3[k] = (nj > 1) ? static_cast<T>(tmp) : T(0);
       }
   }
 
@@ -710,7 +728,7 @@ __device__ inline void desc34_atom(const DescArgs<T> &g, const T *u_s, const int
                                      u[i2 + nelements * j2] * u[i3 + nelements * j3]);
             }
             for (int o = 1; o < lpi4; o <<= 1) tmp += __shfl_xor(tmp, o);
-            if (sub4 == 0) g.d4[k] = static_cast<T>(tmp);
+            if (sub4 == 0) g.d4[k] = (nj > 2) ? static_cast<T>(tmp) : T(0);
           }
     }
   }
@@ -1938,7 +1956,7 @@ __global__ void desc34_kernel(const DescArgs<T> g, const T *__restrict__ sumU)
   const int i = blockIdx.x;
   for (int t = threadIdx.x; t < S; t += blockDim.x) u_s[t] = sumU[S * i + t];
   __syncthreads();
-  desc34_atom<T, TA>(g, u_s, i);
+  desc34_atom<T, TA>(g, u_s, i, pod_lowcoord(g.numij, g.ps, i));
 }
 
 // three-body descriptors only: one thread per (a, m, i), with the same
@@ -3046,6 +3064,8 @@ __global__ void __launch_bounds__(256)
 struct LocalEnvArgs {
   int nCls, nDes, nCoeff, nActMax;
   int dpp;    // 1: wave sums of localenv_wave_kernel with DPP
+  const int *numij = nullptr;    // pair counts for pod_lowcoord() (localenv_wave_kernel)
+  int ps = 0;
 };
 
 template <typename T, typename TA>
@@ -3396,7 +3416,7 @@ __global__ void __launch_bounds__(64)
       gl.pc4 = pc4;
       gl.qrange3 = qr;
     }
-    desc34_atom<T, TA>(gl, u_s, 0);
+    desc34_atom<T, TA>(gl, u_s, 0, pod_lowcoord(a.numij, a.ps, i));
   } else {
     for (int m = lane; m < nDes; m += 64) d_s[m] = B[ib + (long) sm * m];
   }
