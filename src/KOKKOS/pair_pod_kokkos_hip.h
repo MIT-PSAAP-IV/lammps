@@ -125,14 +125,15 @@ __device__ inline int pod_lowcoord(const int *numij, const int ps, const int i)
 // and qp_s (Q4) as scratch, all in LDS; called by all threads of the block, ends synchronized
 template <typename T>
 __device__ inline void forcecoeff34_atom(const FcArgs<T> &g, T *f_s, T *u_s, int *qa_s,
-                                         int *qp_s, const int i)
+                                         int *qp_s, const int i, const int nj_in = -1)
 {
   const int nelements = g.nelements, nrbf3 = g.nrbf3, nabf3_active = g.nabf3_active;
   const int K3 = g.K3, Q4 = g.Q4, ca = g.ca, cm = g.cm;
   const int S = nelements * K3 * nrbf3;
   const int base = S * i;
   const int NeK3 = nelements * K3;
-  const int nj = pod_lowcoord(g.numij, g.ps, i);    // no 3-body terms for nj <= 1, 4-body nj <= 2
+  // pairs of the atom (nj_in, or from g.numij): no 3-body terms for nj <= 1, 4-body for nj <= 2
+  const int nj = (nj_in >= 0) ? nj_in : pod_lowcoord(g.numij, g.ps, i);
 
   for (int t = threadIdx.x; t < S; t += blockDim.x) {
     u_s[t] = g.sumU[base + t];

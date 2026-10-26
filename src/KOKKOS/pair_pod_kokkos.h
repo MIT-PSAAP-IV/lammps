@@ -124,6 +124,29 @@ class PairPODKokkos : public PairPOD {
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_acc;    // device energy (0) and virial (1-6)
   Kokkos::View<KK_ACC_FLOAT *, DeviceType> hip_vir;    // virial of each atom of a block [6*ni]
 
+  // mega kernel (HIP_MEGA, see mega_block()): settings from LAMMPS_POD_MEGA_*
+  int mega_cap, mega_pool, mega_hfoff, mega_stats, mega_ncall;
+  bool mega_logged;
+  t_pod_1i mega_flag;    // [0] pairs not kept, [16 + 8 p] the per-step counters of parity p
+  t_pod_1d mega_gpr, mega_gprh;
+  t_pod_1i mega_gpaj, mega_hist;
+  t_pod_1i mega_frec_i;
+  t_pod_1d mega_frec_d;
+  int mega_frec_ok;    // -1 not built, 0 not possible, 1 built
+  t_pod_1i mega_extab, mega_mono;    // monomial exponent tables (built once)
+  t_pod_1i mega_rowmono;    // monomial of each row of the force stage tile (built once)
+  t_pod_1i mega_ntr;    // row-major copy of the neighbor list
+  int mega_ntr_ncalls = -1, mega_ntr_nrow = -1, mega_ntr_mn = -1;
+  NeighList *mega_ntr_list = nullptr;
+  int mega_rowmono_ok = 0;
+  t_pod_1i mega_ovf;    // atoms whose pairs did not fit in the pool (overflow kernel)
+  Kokkos::View<KK_ACC_FLOAT *, DeviceType> mega_fdum;    // force sink of those atoms in mega_kernel
+  int mega_pool_need = 0;    // pairs claimed from the pool in an earlier step, if more than it held
+  int mega_cpar = 0, mega_clast = 0;    // parity of the per-step mega counters, and of the last step
+  bool mega_cclean[2] = {true, true};    // counters of that parity already zeroed
+  bool mega_block(int gi1, int Ni);
+  void mega_print_stats(int Ni);
+
   int ni;            // number of atoms i in the current atom block
   int nij;           // number of pairs (i,j) in the current atom block
   int nimax;         // maximum number of atoms i
