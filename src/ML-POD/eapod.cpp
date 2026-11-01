@@ -106,7 +106,12 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
   nhermite_grid = 1000;
   nhermite_bins = nhermite_grid-1;
   
-  uncertaintyflag = false;
+  uncertaintyflag = 0;
+  ncommittee = 0;          // auto
+  uq_eps = 1.0e-8;
+  uq_wF = 0.0;
+  Lgram = nullptr;
+  uqref = nullptr;
 
   // read pod input file to podstruct
   read_pod_file(pod_file);
@@ -169,6 +174,8 @@ EAPOD::~EAPOD()
   memory->destroy(bs_r0);
   memory->destroy(bs_invh);
   memory->destroy(bs_base);
+  memory->destroy(Lgram);
+  memory->destroy(uqref);
 }
 
 void EAPOD::read_pod_file(const std::string &pod_file)
@@ -248,12 +255,19 @@ void EAPOD::read_pod_file(const std::string &pod_file)
       if (words.size() != 2)
         error->one(FLERR,"Improper POD file.", utils::getsyserror());
       
+      if (keywd == "enable_active_learning")
+        uncertaintyflag = utils::inumeric(FLERR,words[1],false,lmp);
+      if (keywd == "committee_size")
+        ncommittee = utils::inumeric(FLERR,words[1],false,lmp);
+      if (keywd == "uq_gram_regularization")
+        uq_eps = utils::numeric(FLERR,words[1],false,lmp);
+      if (keywd == "uq_gram_force_weight")
+        uq_wF = utils::numeric(FLERR,words[1],false,lmp);
+      
       if (keywd == "number_of_environment_clusters")
         nClusters = utils::inumeric(FLERR,words[1],false,lmp);
       if (keywd == "number_of_active_clusters")
         nActiveClusters = utils::numeric(FLERR,words[1],false,lmp);
-      if (keywd == "enable_active_learning")
-        uncertaintyflag = utils::inumeric(FLERR,words[1],false,lmp);
       if (keywd == "order_of_cluster_activation_basis")
         hat_p = utils::numeric(FLERR,words[1],false,lmp);
       if (keywd == "order_of_cluster_activation_hat")
@@ -365,7 +379,10 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   clusterSearchBox = 0.5 * nActiveClusters + 1;
   nMaxActiveClusters = clusterSearchBox + 1;
 
-  if (uncertaintyflag && !eapod) uncertaintyflag = false;
+  if (ncommittee <= 0) ncommittee = MAX(3, (int) std::ceil(nActiveClusters));
+  ncommittee = MIN(MAX(ncommittee, 2), nClusters);
+
+  if (uncertaintyflag && !eapod) uncertaintyflag = 0;
 
   hat_pq = hat_p * hat_q;
   hat_p1 = hat_p - 1;
@@ -472,6 +489,7 @@ void EAPOD::read_pod_file(const std::string &pod_file)
       }
     }
     utils::logmesg(lmp, "enable active learning: {}\n", (int)uncertaintyflag);
+    utils::logmesg(lmp, "committee size: {}\n", ncommittee);
     utils::logmesg(lmp, "number of environment clusters: {}\n", nClusters);
     utils::logmesg(lmp, "enable local ea-pod: {}\n", (int)localeapod);
     utils::logmesg(lmp, "number of active clusters: {}\n", nActiveClusters);
@@ -666,10 +684,8 @@ void EAPOD::read_model_coeff_file(const std::string &coeff_file)
     if (ncentall != nComponents*nClusters*nelements)
         error->all(FLERR,"number of coefficients in the projection file is not correct");
 
-    if (uncertaintyflag) {
-      memory->create(invPcaSpan, nComponents*nelements, "pod:invPcaSpan");
-      calculatePcaSpan();
-      read_cluster_occupancy_file(coeff_file);
+    if (uncertaintyflag == 1) {    // QBC + leverage
+      read_cluster_gram_file(coeff_file);
     }
 
     if (localeapod) {
@@ -688,6 +704,69 @@ void EAPOD::read_model_coeff_file(const std::string &coeff_file)
     utils::logmesg(lmp, "total number of elements for PCA centroids: {}\n", ncentall);
     utils::logmesg(lmp, "**************** End of Model Coefficients ****************\n\n");
   }
+}
+
+void EAPOD::read_cluster_gram_file(const std::string &coeff_file)
+{
+  std::string fname = coeff_file;
+  auto pos = fname.rfind("_coefficients");
+  if (pos != std::string::npos) fname.replace(pos, std::string("_coefficients").size(), "_cluster_gram");
+  else {
+    auto dot = fname.rfind(".pod");
+    if (dot != std::string::npos) fname.erase(dot);
+    fname += "_cluster_gram.pod";
+  }
+
+  const int ng = nelements*nClusters;
+  const size_t npack = (size_t) Mdesc*(Mdesc+1)/2;
+  const size_t nval = (size_t) ng*(3 + npack);
+  std::vector<double> buf;
+  int status = 0;   // 0 ok, 1 missing, 2 bad format, 3 mismatch
+
+  if (comm->me == 0) {
+    SafeFilePtr fp = utils::open_potential(fname, lmp, nullptr);
+    if (fp == nullptr) status = 1;
+    else {
+      char line[MAXLINE];
+      int ne = -1, nk = -1, nm = -1;
+      if (fgets(line, MAXLINE, fp) == nullptr) status = 2;
+      else {
+        try {
+          ValueTokenizer w(utils::trim_comment(line));
+          w.next_string();  ne = w.next_int();  nk = w.next_int();  nm = w.next_int();
+          uq_eps = w.next_double();  uq_wF = w.next_double();
+        } catch (TokenizerException &) { status = 2; }
+      }
+      if ((status == 0) && ((ne != nelements) || (nk != nClusters) || (nm != Mdesc))) status = 3;
+      if (status == 0) {
+        buf.resize(nval);
+        for (size_t q = 0; q < nval; q++)
+          if (fscanf(fp, "%lf", &buf[q]) != 1) { status = 2; break; }
+      }
+    }
+  }
+  MPI_Bcast(&status, 1, MPI_INT, 0, world);
+  if ((status == 1) || (status == 3)) {
+    if (comm->me == 0)
+      error->warning(FLERR, "Cluster gram file {} {}; QBC metrics are uncalibrated and the "
+                     "extrapolation grade is disabled (output -1)", fname,
+                     (status == 1) ? "not found" : "does not match the model");
+    return;
+  }
+  if (status == 2) error->all(FLERR, "Incorrect format in cluster gram file {}", fname);
+
+  if (comm->me != 0) buf.resize(nval);
+  MPI_Bcast(buf.data(), (int) nval, MPI_DOUBLE, 0, world);
+
+  memory->create(uqref, 3*ng, "pod:uqref");
+  memory->create(Lgram, (bigint) ng*npack, "pod:Lgram");
+  for (int g = 0; g < ng; g++) {
+    const double *b = &buf[(size_t) g*(3 + npack)];
+    for (int r = 0; r < 3; r++) uqref[3*g + r] = b[r];
+    std::copy(b + 3, b + 3 + npack, &Lgram[(size_t) g*npack]);
+  }
+  if (comm->me == 0)
+    utils::logmesg(lmp, "loaded cluster gram file {} (eps = {}, wF = {})\n", fname, uq_eps, uq_wF);
 }
 
 void EAPOD::read_cluster_occupancy_file(const std::string &coeff_file)
@@ -2859,173 +2938,119 @@ void EAPOD::snapshots(double *rbf, double *xij, double rinij, double rdiffij, in
   }
 }
 
+// row-packed lower Cholesky factor (row r at offset r(r+1)/2): returns ||L^{-1} d||^2
+static inline double leverage(const double *Lp, const double *d, double *y, int M)
+{
+  double g = 0.0;
+  for (int r = 0, off = 0; r < M; off += ++r) {
+    double s = d[r];
+    for (int c = 0; c < r; c++) s -= Lp[off + c] * y[c];
+    y[r] = s / Lp[off + r];
+    g += y[r] * y[r];
+  }
+  return g;
+}
+
 /* ----------------------------------------------------------------------
-   Per-atom active-learning uncertainty quantities
-   out[0] = full atomic energy (one-body + blended many-body)  [eV]    (diagnostic)
-   out[1] = P-weighted committee std of E_k                    [eV]    (Method B, primary)
-   out[2] = uniform committee std over active clusters         [eV]    (Method B, variant)
-   out[3] = P-weighted committee std of F_k                    [eV/A]  (Method B, primary)
-   out[4] = uniform committee std over active clusters         [eV/A]  (Method B, variant)
-   out[5] = S = sum_k D_k                                      (Method A: U = 1/(S+eps))
-   out[6] = population-weighted density uncertainty 1/(sum_k D_k*n_k)   (Method C)
-   out[7] = pca (first principal component of the base descriptor)     (diagnostic)
-   out[8] = number of active clusters (double)                         (diagnostic)
-   'tm' scratch must hold >= 2*nClusters + nComponents doubles.
+   out[0] = E_i            blended atomic energy (== MD per-atom energy)
+   out[1] = sigmaE_hat     calibrated QBC energy disagreement
+   out[2] = sigmaF_hat     calibrated QBC per-pair force disagreement
+   out[3] = gamma_hat      sum_k P_k gamma_ik/gamma_ref,k  (-1 if no gram file)
+   out[4] = eps_ext        latent-axis extrapolation (in units of end spacing)
+   out[5] = phi            gate-force magnitude || J (Pi U) ||
+   out[6] = k*             nearest cluster
 ------------------------------------------------------------------------- */
 void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti)
 {
-  int typei = ti[0];
-  int nc   = nCoeffPerElement*typei;
-  int nct  = nComponents*typei;
-  int ncct = nClusters*nct;
-  double *proj = &Proj[Mdesc*nct];
-  double *invspan = &invPcaSpan[nct];
+  const int typei = ti[0];
+  const int K = nClusters, nC = nComponents;
+  int M = Mdesc, N = 3*Nj;
+  const int nc = nCoeffPerElement*typei;
+  const double *c0 = &coeff[1 + nc];
+  const double *cent = &Centroids[nC*K*typei];
+  const double *proj = &Proj[nC*M*typei];
 
-  // reduce bdd (N x Mdesc, column-major, N=3*Nj) to net force on atom i:
-  // G[d + 3*m] = sum_p bdd[(3*p+d) + N*m]   (sum over neighbor pairs p)
-  int N = 3 * Nj;
-  double *G  = &tm[2 * nClusters + nComponents];        // 3*Mdesc
-  double *Fk = &tm[2 * nClusters + nComponents + 3 * Mdesc]; // 3*nClusters
-  for (int m = 0; m < Mdesc; m++) {
-    double gx = 0.0, gy = 0.0, gz = 0.0;
-    double *col = &bdd[N * m];
-    for (int p = 0; p < Nj; p++) { gx += col[3*p]; gy += col[3*p+1]; gz += col[3*p+2]; }
-    G[0 + 3*m] = gx; G[1 + 3*m] = gy; G[2 + 3*m] = gz;
-  }
+  int o[9];
+  uq_offsets(o, Nj);
+  double *pca = tm + o[0], *U = tm + o[1], *P = tm + o[2], *dP = tm + o[3];
+  double *dc = tm + o[4], *F = tm + o[5], *v = tm + o[6], *y = tm + o[7];
+  int *win = uqwin.data();
 
-  double *D  = &tm[0];           // nClusters
-  double *Ek = &tm[nClusters];   // nClusters
-  double *pca = &tm[2*nClusters];   // nComponents
+  uq_pca(pca, bd, typei);
 
-  double S_density = 0.0;
-  double S_pop = 0.0;    // occupancy-weighted density: sum_k D_k * n_k (training population)
-  double U = 0.0;
-  double U_pop = 0.0;
+  // (1) gate == MD path: blended energy and gate force coefficient U = dE/dpca
+  int ks;
+  const int kn = uq_gate(P, dP, pca, typei, ks);
   double Ebar = 0.0;
-
-  int ks = 0;
-  int ke = nClusters;
-  int kn = ke - ks;
-
-  for (int c = 0; c < nComponents; c++) {
-    double s = 0.0;
-    for (int m = 0; m < Mdesc; m++) s += proj[c + nComponents * m] * bd[m];
-    pca[c] = s;
-  }
-  double pca0 = pca[0];
-
-  if (localeapod) { // local EA-POD
-    double *ledges = &leftClusterEdges[ncct];
-    double *redges = &rightClusterEdges[ncct];
-
-    find_active_clusters(pca0, ledges, redges, nClusters, nMaxActiveClusters, ks, ke);
-    kn = ke - ks;
-    ncct += ks;
-
-    double *cent     = &Centroids[ncct];
-    double *invlcut2 = &invLeftClusterRcut2[ncct];
-    double *invrcut2 = &invRightClusterRcut2[ncct];
-    double invspan0 = invspan[0];
-    int *occ = (clusterOccupancy != nullptr) ? &clusterOccupancy[ncct] : nullptr;
-
-    double fcut, dfcut;
-    for (int k = 0; k < kn; k++) {
-      double pc = pca0 - cent[k];
-      double inv_rcut2 = (pc >= 0.0) ? invrcut2[k] : invlcut2[k];
-      cluster_cutoff_hat(pc, inv_rcut2, fcut, dfcut);
-      double pcn = pc * invspan0;
-      double Dk = fcut / (pcn * pcn + 1e-20);
-      D[k] = Dk;
-      S_density += Dk;
-      if (occ != nullptr) S_pop += Dk * occ[k];
-    }
-  } else { // EA-POD
-    double *cent = &Centroids[ncct];
-    int *occ = (clusterOccupancy != nullptr) ? &clusterOccupancy[nClusters * typei] : nullptr;
-    for (int k = 0; k < kn; k++) {
-      double s = 0.0;
-      for (int c = 0; c < nComponents; c++) {
-        double d = (pca[c] - cent[c + k * nComponents]) * invspan[c];
-        s += d * d;
-      }
-      double Dk = 1.0 / (s + 1e-20);
-      D[k] = Dk;
-      S_density += Dk;
-      if (occ != nullptr) S_pop += Dk * occ[k];
-    }
-  }
-  U = (S_density > 0.0) ? 1.0 / S_density : 0.0;
-  U_pop = (S_pop > 0.0) ? 1.0 / S_pop : U;
-
-  double *ceffs = &coeff[1 + ks * Mdesc + nc];
-
+  for (int n = 0; n < nC; n++) U[n] = 0.0;
   for (int k = 0; k < kn; k++) {
+    const double *ck = c0 + (size_t) (ks + k)*M;
     double e = 0.0;
-    double fx = 0.0, fy = 0.0, fz = 0.0;
-    for (int m = 0; m < Mdesc; m++) {
-      double c = ceffs[m + k * Mdesc];
-      e  += c * bd[m];
-      fx += c * G[0 + 3*m];
-      fy += c * G[1 + 3*m];
-      fz += c * G[2 + 3*m];
+    for (int j = 0; j < M; j++) e += ck[j] * bd[j];
+    Ebar += P[k] * e;
+    for (int n = 0; n < nC; n++) U[n] += e * dP[k + kn*n];
+  }
+
+  // (2) calibrated QBC on the gate-independent window
+  const int kstar = uq_window(win, pca, typei);
+  double sE2, sF2;
+  uq_committee(sE2, sF2, bd, bdd, N, win, typei, dc, F);
+  double sigE = sqrt(sE2), sigF = sqrt(sF2);
+  if (uqref) {
+    const double *ref = &uqref[3*(typei*K + kstar)];
+    sigE /= ref[1];
+    sigF /= ref[2];
+  }
+
+  // (3) per-expert extrapolation grade over the gate support
+  double gam = -1.0;
+  if (Lgram) {
+    const size_t npack = (size_t) M*(M+1)/2;
+    gam = 0.0;
+    for (int k = 0; k < kn; k++) {
+      if (P[k] < 1e-6) continue;      // negligible gate weight
+      const int g = typei*K + ks + k;
+      gam += P[k] * leverage(&Lgram[(size_t) g*npack], bd, y, M) / uqref[3*g];
     }
-    Ek[k] = e;
-    Fk[3*k] = fx; Fk[3*k+1] = fy; Fk[3*k+2] = fz;
-    Ebar += (D[k] * U) * e;
   }
 
-  // committee variances (weighted and uniform over the active window)
-  // Energy:
-  double varP = 0.0, meanU = 0.0;
-  for (int k = 0; k < kn; k++) {
-    double Pk = D[k] * U;
-    double Ekk = Ek[k];
-    meanU += Ekk;
-    varP  += Pk * (Ekk - Ebar) * (Ekk - Ebar);
+  // (4a) latent-axis extrapolation
+  double ext = 0.0;
+  if (nC == 1) {
+    const double p = pca[0];
+    if (p < cent[0])        ext = (cent[0] - p) / MAX(cent[1] - cent[0], 1e-20);
+    else if (p > cent[K-1]) ext = (p - cent[K-1]) / MAX(cent[K-1] - cent[K-2], 1e-20);
+  } else {
+    for (int n = 0; n < nC; n++) {
+      double lo = cent[n], hi = cent[n];
+      for (int k = 1; k < K; k++) { lo = MIN(lo, cent[n + nC*k]); hi = MAX(hi, cent[n + nC*k]); }
+      const double dl = MAX((hi - lo)/(K - 1), 1e-20);
+      ext = MAX(ext, MAX(0.0, MAX(lo - pca[n], pca[n] - hi)) / dl);
+    }
   }
-  meanU /= kn;
-  double varU = 0.0;
-  for (int k = 0; k < kn; k++) varU += (Ek[k] - meanU) * (Ek[k] - meanU);
-  varU /= kn;
 
-  // Force (RMS vector deviation across clusters)
-  double Fbar[3] = {0.0, 0.0, 0.0};
-  for (int k = 0; k < kn; k++) {
-    double Pk = D[k] * U;
-    Fbar[0] += Pk * Fk[3*k];
-    Fbar[1] += Pk * Fk[3*k+1];
-    Fbar[2] += Pk * Fk[3*k+2];
+  // (4b) gate-force magnitude phi = || bdd * (Proj U) ||   (F reused as N-vector)
+  for (int j = 0; j < M; j++) {
+    double s = 0.0;
+    for (int n = 0; n < nC; n++) s += proj[n + nC*j] * U[n];
+    v[j] = s;
   }
-  double FmeanU[3] = {0.0, 0.0, 0.0};
-  for (int k = 0; k < kn; k++) {
-    FmeanU[0] += Fk[3*k];
-    FmeanU[1] += Fk[3*k+1];
-    FmeanU[2] += Fk[3*k+2];
-  }
-  FmeanU[0] /= kn;
-  FmeanU[1] /= kn;
-  FmeanU[2] /= kn;
-
-  double varFP = 0.0, varFU = 0.0;
-  for (int k = 0; k < kn; k++) {
-    double Pk = D[k] * U;
-    double dx = Fk[3*k]-Fbar[0], dy = Fk[3*k+1]-Fbar[1], dz = Fk[3*k+2]-Fbar[2];
-    varFP += Pk * (dx*dx + dy*dy + dz*dz);
-    double ux = Fk[3*k]-FmeanU[0], uy = Fk[3*k+1]-FmeanU[1], uz = Fk[3*k+2]-FmeanU[2];
-    varFU += (ux*ux + uy*uy + uz*uz);
-  }
-  varFU /= kn;
+  char chn = 'N';
+  double one = 1.0, zero = 0.0;
+  int inc1 = 1;
+  DGEMV(&chn, &N, &M, &one, bdd, &N, v, &inc1, &zero, F, &inc1);
+  double phi = 0.0;
+  for (int q = 0; q < N; q++) phi += F[q]*F[q];
 
   out[0] = coeff[nc] + Ebar;
-  out[1] = sqrt(varP);
-  out[2] = sqrt(varU);
-  out[3] = sqrt(varFP);
-  out[4] = sqrt(varFU);
-  out[5] = U;
-  out[6] = U_pop;
-  out[7] = pca0;
-  out[8] = (double) kn;
+  out[1] = sigE;
+  out[2] = sigF;
+  out[3] = gam;
+  out[4] = ext;
+  out[5] = sqrt(phi);
+  out[6] = (double) kstar;
 }
+
 
 /**
  * @brief Estimate the amount of memory needed for training and compute/pod commands.
@@ -3305,6 +3330,167 @@ void EAPOD::calculatePcaSpan()
   }
 }
 
+// single source of truth for the UQ scratch layout; o[8] = total size
+void EAPOD::uq_offsets(int *o, int Nj) const
+{
+  const int KW = localeapod ? nMaxActiveClusters : nClusters;   // max gate support
+  const int m = ncommittee;
+  o[0] = 0;                        // pca  [nComponents]
+  o[1] = o[0] + nComponents;       // U    [nComponents]  dE/dpca
+  o[2] = o[1] + nComponents;       // P    [KW]
+  o[3] = o[2] + KW;                // dP   [KW*nComponents]
+  o[4] = o[3] + KW*nComponents;    // dc   [Mdesc*m]   c_k - cbar
+  o[5] = o[4] + Mdesc*m;           // F    [3*Nj*m]    J*(c_k - cbar)
+  o[6] = o[5] + 3*Nj*m;            // v    [Mdesc]     Pi*U
+  o[7] = o[6] + Mdesc;             // y    [Mdesc]     triangular-solve work
+  o[8] = o[7] + Mdesc;
+}
+
+int EAPOD::uq_scratch_size(int Nj) const
+{
+  int o[9];
+  uq_offsets(o, Nj);
+  return o[8];
+}
+
+double *EAPOD::uq_scratch(int Nj)
+{
+  const size_t n = uq_scratch_size(Nj);
+  if (uqbuf.size() < n) uqbuf.resize(n);
+  if ((int) uqwin.size() < ncommittee) uqwin.resize(ncommittee);
+  return uqbuf.data();
+}
+
+void EAPOD::uq_pca(double *pca, const double *bd, int typei) const
+{
+  const double *proj = &Proj[nComponents*Mdesc*typei];
+  for (int n = 0; n < nComponents; n++) {
+    double s = 0.0;
+    for (int m = 0; m < Mdesc; m++) s += proj[n + nComponents*m] * bd[m];
+    pca[n] = s;
+  }
+}
+
+// gate weights identical to the MD path; P[k], dP[k + kn*n] = dP_k/dpca_n
+// for clusters ks..ks+kn-1; returns kn
+int EAPOD::uq_gate(double *P, double *dP, const double *pca, int typei, int &ks)
+{
+  const int K = nClusters, nC = nComponents;
+  const int ncct = nC*K*typei;
+  const double *cent = &Centroids[ncct];
+
+  if (localeapod) {    // == peratom_local_environment_descriptors
+    int ke;
+    find_active_clusters(pca[0], &leftClusterEdges[ncct], &rightClusterEdges[ncct],
+                         K, nMaxActiveClusters, ks, ke);
+    const int kn = ke - ks;
+    double S = 0.0, dS = 0.0, fcut, dfcut;
+    for (int k = 0; k < kn; k++) {
+      const double pc = pca[0] - cent[ks + k];
+      const double inv_rcut2 = (pc >= 0.0) ? invRightClusterRcut2[ncct + ks + k]
+                                           : invLeftClusterRcut2[ncct + ks + k];
+      cluster_cutoff_hat(pc, inv_rcut2, fcut, dfcut);
+      const double invD = 1.0 / (pc*pc + 1e-20);
+      P[k]  = fcut * invD;
+      dP[k] = 2.0 * pc * invD * (dfcut - P[k]);
+      S += P[k];
+      dS += dP[k];
+    }
+    const double invS = 1.0 / S;
+    for (int k = 0; k < kn; k++) {
+      P[k] *= invS;
+      dP[k] = (dP[k] - P[k]*dS) * invS;
+    }
+    return kn;
+  }
+
+  // global EA-POD == peratom_environment_descriptors (unnormalized distances)
+  ks = 0;
+  double S = 0.0;
+  for (int k = 0; k < K; k++) {
+    double s = 1e-20;
+    for (int n = 0; n < nC; n++) { double d = pca[n] - cent[n + nC*k]; s += d*d; }
+    const double D = 1.0 / s;
+    P[k] = D;
+    S += D;
+    for (int n = 0; n < nC; n++) dP[k + K*n] = -2.0 * (pca[n] - cent[n + nC*k]) * D * D;
+  }
+  const double invS = 1.0 / S;
+  for (int k = 0; k < K; k++) P[k] *= invS;
+  for (int n = 0; n < nC; n++) {
+    double dS = 0.0;
+    for (int k = 0; k < K; k++) dS += dP[k + K*n];
+    for (int k = 0; k < K; k++) dP[k + K*n] = (dP[k + K*n] - P[k]*dS) * invS;
+  }
+  return K;
+}
+
+// committee window: the m centroids nearest to pca, independent of the gate
+// win[0] = nearest cluster k*
+int EAPOD::uq_window(int *win, const double *pca, int typei) const
+{
+  const int K = nClusters, m = ncommittee, nC = nComponents;
+  const double *cent = &Centroids[nC*K*typei];
+  if (nC == 1) {      // sorted 1-D centroids: contiguous window
+    const double p = pca[0];
+    int r = (int) (std::lower_bound(cent, cent + K, p) - cent);
+    int l = r - 1;
+    for (int w = 0; w < m; w++) {
+      if ((r >= K) || ((l >= 0) && (p - cent[l] <= cent[r] - p))) win[w] = l--;
+      else win[w] = r++;
+    }
+  } else {            // general case (global EA-POD, nComponents > 1): O(K m^2), K small
+    for (int w = 0; w < m; w++) {
+      double dmin = 1e300;
+      int kmin = 0;
+      for (int k = 0; k < K; k++) {
+        bool used = false;
+        for (int u = 0; u < w; u++) if (win[u] == k) { used = true; break; }
+        if (used) continue;
+        double s = 0.0;
+        for (int n = 0; n < nC; n++) { double d = pca[n] - cent[n + nC*k]; s += d*d; }
+        if (s < dmin) { dmin = s; kmin = k; }
+      }
+      win[w] = kmin;
+    }
+  }
+  return win[0];
+}
+
+// sigma_E^2 = 1/m sum_k [(c_k - cbar).D]^2
+// sigma_F^2 = 1/m sum_k sum_j ||J_ij (c_k - cbar)||^2 = ||bdd*dc||_F^2 / m
+void EAPOD::uq_committee(double &sE2, double &sF2, double *bd, double *bdd, int N,
+                         const int *win, int typei, double *dc, double *F)
+{
+  int M = Mdesc, m = ncommittee;
+  const double *c0 = &coeff[1 + nCoeffPerElement*typei];
+  const double invm = 1.0 / m;
+
+  for (int w = 0; w < m; w++)
+    memcpy(&dc[(size_t) M*w], c0 + (size_t) M*win[w], M*sizeof(double));
+  for (int j = 0; j < M; j++) {
+    double s = 0.0;
+    for (int w = 0; w < m; w++) s += dc[j + M*w];
+    s *= invm;
+    for (int w = 0; w < m; w++) dc[j + M*w] -= s;
+  }
+
+  sE2 = 0.0;
+  for (int w = 0; w < m; w++) {
+    double e = 0.0;
+    for (int j = 0; j < M; j++) e += dc[j + M*w] * bd[j];
+    sE2 += e*e;
+  }
+  sE2 *= invm;
+
+  char chn = 'N';
+  double one = 1.0, zero = 0.0;
+  DGEMM(&chn, &chn, &N, &m, &M, &one, bdd, &N, dc, &M, &zero, F, &N);
+  double s = 0.0;
+  for (int q = 0; q < N*m; q++) s += F[q]*F[q];
+  sF2 = s * invm;
+}
+
 inline void EAPOD::cluster_cutoff_hat_train(double u, double &fcut, double &dfcut_du)
 {
   constexpr int p = 2;
@@ -3530,6 +3716,66 @@ void EAPOD::peratomenvironment_descriptors(double *P, double *dP_dR, double *B, 
   // calculate dP_dR = dB_dR * dP_dB , which are derivatives of probabilities with respect to atomic coordinates
   int N = 3*nNeighbors;
   DGEMM(&chn, &cht, &N, &nClusters, &Mdesc, &alpha, dB_dR, &N, dP_dB, &nClusters, &beta, dP_dR, &N);
+}
+
+// pass 1: Gram[g] += P_k (D D^T + wF J^T J);  val[2i] = sigmaE, val[2i+1] = sigmaF
+// pass 2: val[i] = gamma_{i,k*} (needs Lgram);  grp[i] = elem*K + k*  (-1: no neighbors)
+void EAPOD::uq_training(double *Gram, double *val, int *grp, double *x, int *atomtype,
+                        int *alist, int *jlist, int *pairnumsum, int natom, int pass)
+{
+  int M = Mdesc, ione = 1;
+  const size_t MM = (size_t) M*M, npack = (size_t) M*(M+1)/2;
+  char chu = 'U', chn = 'N', cht = 'T';
+  double one = 1.0;
+
+  for (int i = 0; i < natom; i++) {
+    grp[i] = -1;
+    int Nj = pairnumsum[i+1] - pairnumsum[i];
+    if (Nj == 0) continue;
+    if (Nj > Njmax) {
+      Njmax = Nj;
+      free_temp_memory();
+      allocate_temp_memory(Njmax);
+    }
+
+    double *rij = &tmpmem[0];
+    int *ai = &tmpint[0], *aj = &tmpint[Nj], *ti = &tmpint[2*Nj], *tj = &tmpint[3*Nj];
+    myneighbors(rij, x, ai, aj, ti, tj, jlist, pairnumsum, atomtype, alist, i);
+    peratombase_descriptors(bd, bdd, rij, &tmpmem[3*Nj], ti, tj, Nj);
+
+    const int typei = ti[0];
+    int N = 3*Nj;
+    double *tm = uq_scratch(Nj);
+    int o[9];
+    uq_offsets(o, Nj);
+    double *pca = tm + o[0], *P = tm + o[2], *dP = tm + o[3];
+    double *dc = tm + o[4], *F = tm + o[5], *y = tm + o[7];
+
+    uq_pca(pca, bd, typei);
+    const int kstar = uq_window(uqwin.data(), pca, typei);
+    grp[i] = typei*nClusters + kstar;
+
+    if (pass == 1) {
+      int ks;
+      const int kn = uq_gate(P, dP, pca, typei, ks);
+      for (int k = 0; k < kn; k++) {
+        if (P[k] <= 0.0) continue;
+        double *G = &Gram[(size_t) (typei*nClusters + ks + k)*MM];
+        double a = P[k];
+        DSYRK(&chu, &chn, &M, &ione, &a, bd, &M, &one, G, &M);     // G += P D D^T
+        if (uq_wF > 0.0) {
+          double aw = uq_wF * a;
+          DSYRK(&chu, &cht, &M, &N, &aw, bdd, &N, &one, G, &M);    // G += wF P sum_j J^T J
+        }
+      }
+      double sE2, sF2;
+      uq_committee(sE2, sF2, bd, bdd, N, uqwin.data(), typei, dc, F);
+      val[2*i] = sqrt(sE2);
+      val[2*i+1] = sqrt(sF2);
+    } else {
+      val[i] = leverage(&Lgram[(size_t) grp[i]*npack], bd, y, M);
+    }
+  }
 }
 
 inline int EAPOD::binom(int n, int k) {

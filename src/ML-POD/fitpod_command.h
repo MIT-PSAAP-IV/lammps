@@ -213,6 +213,9 @@ class FitPOD : public Command {
   void energyforce_calculation(const datastruct &data);
 
   void compute_loss_weights(const datastruct &data, double *ew, double *fw, double *sw);
+
+  void uq_reference_calculation(const datastruct &data);
+  void group_percentile(std::vector<double> &val, std::vector<int> &grp, int ngroups, double q, double *out);
 };
 }    // namespace LAMMPS_NS
 #endif
