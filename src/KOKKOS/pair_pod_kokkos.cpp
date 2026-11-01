@@ -45,10 +45,10 @@ using namespace MathSpecial;
 
 static constexpr int GPU_CONCURRENCY_DIV = 1;
 
-static constexpr int POD_MAX_NRBF  = 5;   // max nrbf3 held in registers
-static constexpr int POD_MAX_NELEM = 1;   // max nelements in the fused sum
+static constexpr int POD_MAX_NRBF  = 8;   // max nrbf3 held in registers
+static constexpr int POD_MAX_NELEM = 2;   // max nelements in the fused sum
 static constexpr int POD_MAX_DEG   = 3;   // max monomial degree (P3)
-static constexpr int POD_MAX_ACT_CLS = 3; // max active clusters
+static constexpr int POD_MAX_ACT_CLS = 4; // max active clusters
 
 // true : allbody_forces handles force calculations, tallying: forces, virial
 // false: allbody_forces writes fij, tallyforce() does the atomics (original, for benchmarking)
@@ -561,9 +561,11 @@ void PairPODKokkos<DeviceType>::copy_from_pod_class(EAPOD *podptr)
     Kokkos::deep_copy(bessel_pi_inv_t1, h_pi_inv_t1);
     Kokkos::deep_copy(bessel_dx_factor, h_dx_factor);
 
-    MemKK::realloc_kokkos(Phi, "pair_pod:Phi", ns*ns);
+    const int ns2   = ns * ns;
+    const int npair = nelements * nelements;
+    MemKK::realloc_kokkos(Phi, "pair_pod:Phi", npair * ns2);
     auto h_Phi = Kokkos::create_mirror_view(Phi);
-    for (int i=0; i<ns*ns; i++) h_Phi[i] = podptr->Phi[i];
+    for (int i=0; i<npair * ns2; i++) h_Phi[i] = podptr->Phi[i];
     Kokkos::deep_copy(Phi, h_Phi);
   }
 
@@ -1025,26 +1027,36 @@ void PairPODKokkos<DeviceType>::radialbasis(
 
 template<class DeviceType>
 void PairPODKokkos<DeviceType>::radialPhi(t_pod_1d rbft, t_pod_1d drbft, t_pod_1d Phi,
-                                          t_pod_1d rbf,t_pod_1d drbf,
-                                          int Nij, int ns, int nrbfmax)
+                                          t_pod_1d rbf, t_pod_1d drbf,
+                                          t_pod_1i ti, t_pod_1i tj,
+                                          int nelements, int Nij, int ns, int nrbfmax)
 {
+  using c_1d = Kokkos::View<const KK_FLOAT*, typename t_pod_1d::array_layout, DeviceType,
+                            Kokkos::MemoryTraits<Kokkos::RandomAccess>>;
+  const c_1d l_phi = Phi;
+
+  const int ns2 = ns * ns;
+
   Kokkos::parallel_for("radialPhi",
     Kokkos::RangePolicy<DeviceType>(0, Nij * nrbfmax),
     KOKKOS_LAMBDA(const int idx) {
-        const int j = idx / Nij;  // col in output
-        const int i = idx % Nij;  // row in output
+      const int j = idx / Nij;  // col in output (radial basis index)
+      const int i = idx % Nij;  // row in output (pair index)
 
-        KK_ACC_FLOAT sum1 = 0.0;
-        KK_ACC_FLOAT sum2 = 0.0;
+      const int pair     = ti(i) * nelements + tj(i);
+      const int phi_base = pair * ns2 + ns * j;
 
-        for (int k = 0; k < ns; ++k) {
-            const KK_FLOAT phi_kj = Phi(k + ns * j);
-            sum1 += rbft(i + Nij * k) * phi_kj;
-            sum2 += drbft(i + Nij * k) * phi_kj;
-        }
+      KK_ACC_FLOAT sum1 = 0.0;
+      KK_ACC_FLOAT sum2 = 0.0;
 
-        rbf(i + Nij * j) = sum1;
-        drbf(i + Nij * j) = sum2;
+      for (int k = 0; k < ns; ++k) {
+        const KK_FLOAT phi_kj = l_phi(phi_base + k);
+        sum1 += rbft (i + Nij * k) * phi_kj;
+        sum2 += drbft(i + Nij * k) * phi_kj;
+      }
+
+      rbf (i + Nij * j) = sum1;
+      drbf(i + Nij * j) = sum2;
     });
 }
 
@@ -1831,7 +1843,7 @@ void PairPODKokkos<DeviceType>::blockatom_base_descriptors(t_pod_1d bd, int Ni, 
                 bessel_neg_alpha, bessel_pi_inv_t1, bessel_dx_factor, ti, tj,
                 nelements, besseldegree, inversedegree, nbesselpars, Nij);
 
-    radialPhi(rbft, drbft, Phi, rbf, drbf, Nij, ns, nrbfmax);
+    radialPhi(rbft, drbft, Phi, rbf, drbf, ti, tj, nelements, Nij, ns, nrbfmax);
     Kokkos::fence();
     end = std::chrono::high_resolution_clock::now();
     comptime[11] += std::chrono::duration_cast<std::chrono::nanoseconds>(end-begin).count()/1e6;

@@ -160,7 +160,7 @@ class PairPODKokkos : public PairPOD {
   t_pod_1d bessel_neg_alpha;
   t_pod_1d bessel_pi_inv_t1;
   t_pod_1d bessel_dx_factor;
-  t_pod_1d Phi;  // eigenvectors matrix ns x ns
+  t_pod_1d Phi;  // eigenvector matrices, nelements*nelements * ns*ns
   t_pod_1d rbf;   // many-body radial basis functions   nij x nrbfmax
   t_pod_1d drbf;  // dR/dr / r of the above             nij x nrbfmax
   t_pod_1d rbf2;  // two-body radial basis: alias of rbf, or 4 B-spline
@@ -237,7 +237,9 @@ class PairPODKokkos : public PairPOD {
     int l_nelements, int l_besseldegree, int l_inversedegree, int l_nbesselpars, int Nij);
 
   void radialPhi(t_pod_1d rbft, t_pod_1d drbft, t_pod_1d Phi,
-                 t_pod_1d rbf, t_pod_1d drbf, int Nij, int ns, int nrbfmax);
+                 t_pod_1d rbf, t_pod_1d drbf,
+                 t_pod_1i ti, t_pod_1i tj,
+                 int nelements, int Nij, int ns, int nrbfmax);
 
   void radialbasis_hermite(t_pod_1d rbf, t_pod_1d drbf, t_pod_1d rr, t_pod_1i ti, t_pod_1i tj, int N);
 
