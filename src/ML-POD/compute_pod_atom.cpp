@@ -34,7 +34,7 @@ enum { SCALAR, VECTOR, ARRAY };
 ComputePODAtom::ComputePODAtom(LAMMPS *lmp, int narg, char **arg) :
     Compute(lmp, narg, arg), list(nullptr), podptr(nullptr), pod(nullptr), tmpmem(nullptr),
     rij(nullptr), elements(nullptr), map(nullptr), ai(nullptr), aj(nullptr), ti(nullptr),
-    tj(nullptr), uqmetrics(nullptr)
+    tj(nullptr)
 {
   int nargmin = 6;
 
@@ -44,12 +44,6 @@ ComputePODAtom::ComputePODAtom(LAMMPS *lmp, int narg, char **arg) :
   std::string coeff_file = std::string(arg[4]);    // coefficient input file
   podptr = new EAPOD(lmp, pod_file, coeff_file);
 
-  if (podptr->uncertaintyflag) {
-    memory->destroy(uqmetrics);
-    int tmpmemuq = 5*podptr->nClusters + podptr->nComponents + 3*podptr->Mdesc + 9;
-    memory->create(uqmetrics, tmpmemuq, "compute_pod_atom:unc");
-  }
-
   int ntypes = atom->ntypes;
   memory->create(map, ntypes + 1, "compute_pod_atom:map");
   map_element2type(narg - 5, arg + 5, podptr->nelements);
@@ -58,8 +52,8 @@ ComputePODAtom::ComputePODAtom(LAMMPS *lmp, int narg, char **arg) :
   nmax = 0;
   nijmax = 0;
 
-  if (podptr->uncertaintyflag) size_peratom_cols = 9;
-  else                         size_peratom_cols = podptr->Mdesc * podptr->nClusters;
+  if (podptr->uncertaintyflag == 1) size_peratom_cols = 7;
+  else                              size_peratom_cols = podptr->Mdesc * podptr->nClusters;
   peratom_flag = 1;
 }
 
@@ -71,7 +65,6 @@ ComputePODAtom::~ComputePODAtom()
     for (int i = 0; i < atom->ntypes; i++) delete[] elements[i];
     delete[] elements;
   }
-  memory->destroy(uqmetrics);
   memory->destroy(map);
   memory->destroy(pod);
   delete podptr;
@@ -139,7 +132,7 @@ void ComputePODAtom::compute_peratom()
   int Mdesc = podptr->Mdesc;
   bool eapod = podptr->eapod;
   bool localeapod = podptr->localeapod;
-  bool uncertaintyflag = podptr->uncertaintyflag;
+  int uncertaintyflag = podptr->uncertaintyflag;
   double **rcutsq = podptr->rcutsq;
 
   // determine the maximum number of neighbor list candidates for all local atoms
@@ -174,8 +167,9 @@ void ComputePODAtom::compute_peratom()
       podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
 
       if (uncertaintyflag) {
-        podptr->peratom_uncertainty(uqout, bd, bdd, nij, uqmetrics, ti);
-        for (int m = 0; m < 9; m++) pod[i][m] = uqout[m];
+        double *tm = podptr->uq_scratch(nij);
+        podptr->peratom_uncertainty(uqout, bd, bdd, nij, tm, ti);
+        for (int m = 0; m < size_peratom_cols; m++) pod[i][m] = uqout[m];
       }
       else if (eapod) {
         double *pd  = &podptr->pd[0];

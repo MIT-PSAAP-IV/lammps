@@ -192,6 +192,9 @@ void FitPOD::command(int narg, char **arg)
       }
     }
 
+    if ((fastpodptr->uncertaintyflag == 1) && fastpodptr->eapod)
+      uq_reference_calculation(traindata);
+
     // calculate errors for the training data set
 
     if ((traindata.training_analysis) && ((int) traindata.data_path.size() > 1))
@@ -2332,6 +2335,146 @@ void FitPOD::energyforce_calculation(const datastruct &data)
   }
   if (comm->me == 0)
     utils::logmesg(lmp, "**************** End of Energy/Force Calculation ****************\n");
+}
+
+void FitPOD::group_percentile(std::vector<double> &val, std::vector<int> &grp, int ngroups,
+                              double q, double *out)
+{
+  int n = (int) val.size();
+  const int np = comm->nprocs;
+  std::vector<int> counts(np), displs(np);
+  MPI_Allgather(&n, 1, MPI_INT, counts.data(), 1, MPI_INT, world);
+  int ntot = 0;
+  for (int p = 0; p < np; p++) { displs[p] = ntot; ntot += counts[p]; }
+  std::vector<double> allv((comm->me == 0) ? MAX(ntot, 1) : 1);
+  std::vector<int> allg((comm->me == 0) ? MAX(ntot, 1) : 1);
+  MPI_Gatherv(val.data(), n, MPI_DOUBLE, allv.data(), counts.data(), displs.data(), MPI_DOUBLE, 0, world);
+  MPI_Gatherv(grp.data(), n, MPI_INT, allg.data(), counts.data(), displs.data(), MPI_INT, 0, world);
+
+  if (comm->me == 0) {
+    std::vector<std::vector<double>> bucket(ngroups);
+    for (int i = 0; i < ntot; i++) bucket[allg[i]].push_back(allv[i]);
+    for (int g = 0; g < ngroups; g++) {
+      auto &b = bucket[g];
+      if (b.empty()) { out[g] = 0.0; continue; }
+      size_t r = (size_t) std::ceil(q * b.size());
+      r = (r > 0) ? r - 1 : 0;
+      if (r >= b.size()) r = b.size() - 1;
+      std::nth_element(b.begin(), b.begin() + r, b.end());
+      out[g] = b[r];
+    }
+  }
+  MPI_Bcast(out, ngroups, MPI_DOUBLE, 0, world);
+}
+
+void FitPOD::uq_reference_calculation(const datastruct &data)
+{
+  EAPOD *pod = fastpodptr;
+  int M = pod->Mdesc;
+  const int K = pod->nClusters, Ne = pod->nelements, ng = Ne*K, dim = 3;
+  const size_t MM = (size_t) M*M, npack = (size_t) M*(M+1)/2;
+
+  if (comm->me == 0)
+    utils::logmesg(lmp, "**************** Begin of UQ Reference Calculation ****************\n");
+
+  std::vector<double> Gram((size_t) ng*MM, 0.0);
+  std::vector<double> val(2*nb.natom_max);
+  std::vector<int> g(nb.natom_max);
+  std::vector<double> sigE, sigF, gam;
+  std::vector<int> grp;
+
+  for (int pass = 1; pass <= 2; pass++) {
+    for (int ci = 0; ci < (int) data.num_atom.size(); ci++) {
+      if ((ci % comm->nprocs) != comm->me) continue;
+      int natom = data.num_atom[ci];
+      int natom_cumsum = data.num_atom_cumsum[ci];
+      int *atomtype = &data.atomtype[natom_cumsum];
+      double *lattice = &data.lattice[9*ci];
+      podfullneighborlist(nb.y, nb.alist, nb.pairlist, nb.pairnum, nb.pairnum_cumsum,
+                          &data.position[dim*natom_cumsum], &lattice[0], &lattice[3], &lattice[6],
+                          pod->rcutsq, pod->pbc, atomtype, natom, Ne);
+      pod->uq_training(Gram.data(), val.data(), g.data(), nb.y, atomtype, nb.alist, nb.pairlist,
+                       nb.pairnum_cumsum, natom, pass);
+      for (int a = 0; a < natom; a++) {
+        if (g[a] < 0) continue;
+        if (pass == 1) { sigE.push_back(val[2*a]); sigF.push_back(val[2*a+1]); grp.push_back(g[a]); }
+        else gam.push_back(val[a]);
+      }
+    }
+
+    if (pass == 1) {
+      MPI_Allreduce(MPI_IN_PLACE, Gram.data(), (int) (ng*MM), MPI_DOUBLE, MPI_SUM, world);
+      memory->destroy(pod->Lgram);
+      memory->create(pod->Lgram, (bigint) ng*npack, "fitpod:Lgram");
+
+      if (comm->me == 0) {
+        char chu = 'U';
+        std::vector<double> A(MM);
+        const double eps = MAX(pod->uq_eps, 1e-14);
+        for (int e = 0; e < Ne; e++) {
+          std::vector<double> tr(K, 0.0);
+          double trsum = 0.0;
+          int ntr = 0;
+          for (int k = 0; k < K; k++) {
+            const double *G = &Gram[(size_t) (e*K + k)*MM];
+            for (int j = 0; j < M; j++) tr[k] += G[j + (size_t) M*j];
+            if (tr[k] > 0.0) { trsum += tr[k]; ntr++; }
+          }
+          const double trfb = (ntr > 0) ? trsum/ntr : 1.0;   // empty clusters
+          for (int k = 0; k < K; k++) {
+            const double *G = &Gram[(size_t) (e*K + k)*MM];
+            double lambda = eps * ((tr[k] > 0.0) ? tr[k] : trfb) / M;
+            int info = 1;
+            for (int att = 0; (att < 6) && (info != 0); att++, lambda *= 100.0) {
+              std::copy(G, G + MM, A.begin());
+              for (int j = 0; j < M; j++) A[j + (size_t) M*j] += lambda;
+              DPOTRF(&chu, &M, A.data(), &M, &info);           // G = U^T U, L = U^T
+            }
+            if (info != 0)
+              error->one(FLERR, "Cholesky of cluster information matrix failed (elem {}, cluster {})", e, k);
+            double *Lp = &pod->Lgram[(size_t) (e*K + k)*npack];
+            for (int r = 0, off = 0; r < M; off += ++r)
+              for (int c = 0; c <= r; c++) Lp[off + c] = A[c + (size_t) M*r];
+          }
+        }
+      }
+      MPI_Bcast(pod->Lgram, (int) (ng*npack), MPI_DOUBLE, 0, world);
+    }
+  }
+
+  // per-cluster percentiles (atoms grouped by nearest centroid k*)
+  std::vector<double> gref(ng), eref(ng), fref(ng);
+  group_percentile(gam,  grp, ng, 0.99, gref.data());
+  group_percentile(sigE, grp, ng, 0.95, eref.data());
+  group_percentile(sigF, grp, ng, 0.95, fref.data());
+  for (double *r : {gref.data(), eref.data(), fref.data()})
+    for (int e = 0; e < Ne; e++) {        // empty clusters: smallest positive ref (conservative)
+      double rmin = 1e300;
+      for (int k = 0; k < K; k++) if (r[e*K + k] > 0.0) rmin = MIN(rmin, r[e*K + k]);
+      if (rmin == 1e300) rmin = 1.0;
+      for (int k = 0; k < K; k++) if (r[e*K + k] <= 0.0) r[e*K + k] = rmin;
+    }
+
+  memory->destroy(pod->uqref);
+  memory->create(pod->uqref, 3*ng, "fitpod:uqref");
+  for (int q = 0; q < ng; q++) {
+    pod->uqref[3*q] = gref[q];
+    pod->uqref[3*q+1] = eref[q];
+    pod->uqref[3*q+2] = fref[q];
+  }
+
+  if (comm->me == 0) {
+    std::string filename = data.filenametag + "_cluster_gram.pod";
+    SafeFilePtr fp = fopen(filename.c_str(), "w");
+    utils::print(fp, "cluster_gram: {} {} {} {} {}\n", Ne, K, M, pod->uq_eps, pod->uq_wF);
+    for (int q = 0; q < ng; q++) {
+      utils::print(fp, "{:.17g} {:.17g} {:.17g}\n", pod->uqref[3*q], pod->uqref[3*q+1], pod->uqref[3*q+2]);
+      const double *Lp = &pod->Lgram[(size_t) q*npack];
+      for (size_t t = 0; t < npack; t++) utils::print(fp, "{:.17g}\n", Lp[t]);
+    }
+    utils::logmesg(lmp, "wrote {} ({} clusters x {} elements)\n", filename, K, Ne);
+    utils::logmesg(lmp, "**************** End of UQ Reference Calculation ****************\n");
+  }
 }
 
 void FitPOD::podArrayFill(int *output, int start, int length)

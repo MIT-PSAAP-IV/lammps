@@ -23,6 +23,8 @@
 #define DGETRI dgetri_
 #define DSYEV dsyev_
 #define DPOSV dposv_
+#define DPOTRF dpotrf_
+#define DSYRK dsyrk_
 
 extern "C" {
 double DDOT(int *, double *, int *, double *, int *);
@@ -34,6 +36,8 @@ void DGETRF(int *, int *, double *, int *, int *, int *);
 void DGETRI(int *, double *, int *, int *, double *, int *, int *);
 void DSYEV(char *, char *, int *, double *, int *, double *, double *, int *, int *);
 void DPOSV(char *, int *, int *, double *, int *, double *, int *, int *);
+void DPOTRF(char *, int *, double *, int *, int *);
+void DSYRK(char *, char *, int *, int *, double *, double *, int *, double *, double *, int *);
 }
 
 namespace LAMMPS_NS {
@@ -138,7 +142,6 @@ class EAPOD : protected Pointers {
   double *tmpmem;
 
   // --- Variables for environment-adaptive MLIP (EA-POD)
-  bool uncertaintyflag;
   bool eapod; // flag for EAPOD
   bool localeapod; // flag for Local-EAPOD
   int nClusters;      // number of environment clusters
@@ -164,6 +167,29 @@ class EAPOD : protected Pointers {
   double *invPcaSpan;         // 1/(span centroid) per PCA component and element type (nComponents*nelements)
   int *clusterOccupancy;      // training-atom count per cluster and element type (nClusters*nelements)
 
+  // ---- active learning: calibrated QBC + per-expert leverage ----
+  int uncertaintyflag;
+  int ncommittee;          // committee window size m
+  double uq_eps;           // Gram regularization: lambda_k = eps*tr(G_k)/M
+  double uq_wF;            // force weight in G_k (0 = energy-only)
+  double *Lgram;           // [nelements*nClusters][M(M+1)/2] row-packed lower Cholesky factors
+  double *uqref;           // [nelements*nClusters][3] = gamma_ref, sigmaE_ref, sigmaF_ref
+  std::vector<double> uqbuf;
+  std::vector<int> uqwin;
+
+  void read_cluster_gram_file(const std::string &coeff_file);
+  void uq_offsets(int *o, int Nj) const;
+  int uq_scratch_size(int Nj) const;
+  double *uq_scratch(int Nj);
+  void uq_pca(double *pca, const double *bd, int typei) const;
+  int uq_gate(double *P, double *dP, const double *pca, int typei, int &ks);
+  int uq_window(int *win, const double *pca, int typei) const;
+  void uq_committee(double &sE2, double &sF2, double *bd, double *bdd, int N,
+                    const int *win, int typei, double *dc, double *F);
+  void uq_training(double *Gram, double *val, int *grp, double *x, int *atomtype, int *alist,
+                   int *jlist, int *pairnumsum, int natom, int pass);
+  void peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti);
+
   double *bd;           // base descriptors
   double *bdd;          // derivatives of the base descriptors with respect to the atomic positions
   double *pd;           // multi-environment descriptors
@@ -171,8 +197,6 @@ class EAPOD : protected Pointers {
   double *sumU;         // [Ne*K3*nrbf3]
   double *forcecoeff;   // [Ne*K3*nrbf3]
   double *tmpenvmem;    // [2*nMaxActiveClusters || 3*nClusters + nComponents]
-
-  
 
   int Njmax;
   int nCoeffPerElement;    // number of coefficients per element = (nl1 + Mdesc*nClusters)
@@ -325,8 +349,6 @@ class EAPOD : protected Pointers {
   void calculateClusterEdges(int nClusters, double nActiveClusters, int nComponents, int nelements);
 
   void calculatePcaSpan();
-
-  void peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti);
 };
 
 }    // namespace LAMMPS_NS
