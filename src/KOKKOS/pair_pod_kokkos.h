@@ -146,7 +146,6 @@ class PairPODKokkos : public PairPOD {
 
   t_pod_1d rr;          // r = norm(rj - ri) for all pairs (I,J)
   t_pod_1d rhat;        // (rj - ri)/r for all pairs (I, J), SoA: rhat(n + Nij*d), d = 0,1,2
-  t_pod_1d fij;         // force for all pairs (I, J) only allocated if POD_FUSE_FORCE_TALLY == false
 
   t_pod_1d ei;          // energy for each atom I
   t_pod_1i typeai;      // types of atoms I only
@@ -250,7 +249,7 @@ class PairPODKokkos : public PairPOD {
                            t_pod_1i l_idxi, t_pod_1i l_tj,
                            int l_nrbf2, const int Ni, const int Nij);
 
-  void twobody_forces_bspline(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
+  void twobody_forces_bspline(t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
                               t_pod_1i l_base, t_pod_1i l_idxi, t_pod_1i l_tj,
                               int l_nrbf2, const int Ni, const int Nij);
 
@@ -276,7 +275,7 @@ class PairPODKokkos : public PairPOD {
   template<int NAC>
   void blockatom_local_environment_descriptors_impl(t_pod_1d ei, t_pod_1d cb, t_pod_1d B, int Ni);
 
-  void twobody_forces(t_pod_1d fij, t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
+  void twobody_forces(t_pod_1d cb2, t_pod_1d l_drbf2, t_pod_1d l_rhat,
                       t_pod_1i l_idxi, t_pod_1i l_tj, int l_nrbf2, const int Ni, const int Nij);
 
   void threebody_forcecoeff(t_pod_1d fb3, t_pod_1d cb3, t_pod_1d l_sumU, t_pod_1i l_pc3,
@@ -286,14 +285,14 @@ class PairPODKokkos : public PairPOD {
     t_pod_1i l_pb4, t_pod_1i l_pc4, int l_nelements, int l_nrbf3, int l_nrbf4, int l_nabf4, int l_K3, int l_Q4, int Ni);
 
   // Fused pair forces + force tally + global/per-atom virial
-  void allbody_forces(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
+  void allbody_forces(t_pod_1d l_cb2, int Ni, int Nij);
 
-  template<bool BSPLINE, bool VGLOBAL, int NR, int MD>
-  void allbody_forces_impl(t_pod_1d l_fij, t_pod_1d l_cb2, int Ni, int Nij);
-  
-  void blockatom_energyforce(t_pod_1d l_ei, t_pod_1d l_fij, int Ni, int Nij);
+  template<int NR, int MD>
+  void allbody_forces_impl(t_pod_1d l_cb2, int Ni, int Nij);
+
+  void blockatom_energyforce(t_pod_1d l_ei, int Ni, int Nij);
+
   void tallyenergy(t_pod_1d l_ei, int istart, int Ni);
-  void tallyforce(t_pod_1d l_fij, t_pod_1i l_ai, t_pod_1i l_aj, int Nij);
 
   void savematrix2binfile(std::string filename, t_pod_1d d_A, int nrows, int ncols);
   void saveintmatrix2binfile(std::string filename, t_pod_1i d_A, int nrows, int ncols);
