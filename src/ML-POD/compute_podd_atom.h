@@ -36,12 +36,13 @@ class ComputePODDAtom : public Compute {
                           int *numneigh, double **rcutsq, int nelements, int i);
   void map_element2type(int narg, char **arg, int nelements);
 
- private:
+ protected:
   class NeighList *list;
   class EAPOD *podptr;
   double **pod;
   double cutmax;
   int nmax;
+  int natoms_cols;   // natoms used to size the columns
   int nij;
   int nijmax;
 

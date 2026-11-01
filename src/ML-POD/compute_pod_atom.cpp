@@ -111,15 +111,16 @@ void ComputePODAtom::compute_peratom()
 
   // grow pod array if necessary
 
-  if (atom->natoms > nmax) {
+  if (atom->nmax > nmax) {
     memory->destroy(pod);
-    nmax = atom->natoms;
-    size_array_rows = nmax;
-    memory->create(pod, size_array_rows, size_peratom_cols, "pod/atom:pod");
+    nmax = atom->nmax;
+    //size_array_rows = nmax;
+    memory->create(pod, nmax, size_peratom_cols, "pod/atom:pod");
     array_atom = pod;
   }
 
-  for (int i = 0; i < atom->natoms; i++)
+  const int nlocal = atom->nlocal;
+  for (int i = 0; i < nlocal; i++)
     for (int icoeff = 0; icoeff < size_peratom_cols; icoeff++) {
       pod[i][icoeff] = 0.0;
     }
@@ -130,6 +131,7 @@ void ComputePODAtom::compute_peratom()
 
   double **x = atom->x;
   int **firstneigh = list->firstneigh;
+  int *mask = atom->mask;
   int *numneigh = list->numneigh;
   int *type = atom->type;
   int *ilist = list->ilist;
@@ -164,33 +166,32 @@ void ComputePODAtom::compute_peratom()
 
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
-
+    if (!(mask[i] & groupbit)) continue;
     // get neighbor list for atom i
     lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, nelements, i);
+    if (nij == 0) continue;
+    // peratom base descriptors
+    double *bd  = &podptr->bd[0];
+    double *bdd = &podptr->bdd[0];
+    podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
 
-    if (nij > 0) {
-      double *bd  = &podptr->bd[0];
-      double *bdd = &podptr->bdd[0];
-      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
-
-      if (uncertaintyflag) {
-        podptr->peratom_uncertainty(uqout, bd, bdd, nij, uqmetrics, ti);
-        for (int m = 0; m < 9; m++) pod[i][m] = uqout[m];
-      }
-      else if (eapod) {
-        double *pd  = &podptr->pd[0];
-        double *pdd = &podptr->pdd[0];
-        if (localeapod)
-          podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
-        else
-          podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
-        for (int k = 0; k < nClusters; k++)
-          for (int m = 0; m < Mdesc; m++)
-            pod[i][m + Mdesc * k] = pd[k] * bd[m];
-      }
-      else {
-        for (int m = 0; m < Mdesc; m++) pod[i][m] = bd[m];
-      }
+    if (uncertaintyflag) {
+      podptr->peratom_uncertainty(uqout, bd, bdd, nij, uqmetrics, ti);
+      for (int m = 0; m < 9; m++) pod[i][m] = uqout[m];
+    }
+    else if (eapod) {
+      double *pd  = &podptr->pd[0];
+      double *pdd = &podptr->pdd[0];
+      if (localeapod)
+        podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+      else
+        podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+      for (int k = 0; k < nClusters; k++)
+        for (int m = 0; m < Mdesc; m++)
+          pod[i][m + Mdesc * k] = pd[k] * bd[m];
+    }
+    else {
+      for (int m = 0; m < Mdesc; m++) pod[i][m] = bd[m];
     }
   }
 }

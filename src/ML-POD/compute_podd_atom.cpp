@@ -39,7 +39,6 @@ ComputePODDAtom::ComputePODDAtom(LAMMPS *lmp, int narg, char **arg) :
   int nargmin = 6;
 
   if (narg < nargmin) error->all(FLERR, "Illegal compute {} command", style);
-  if (comm->nprocs > 1) error->all(FLERR, "compute command does not support multi processors");
 
   std::string pod_file = std::string(arg[3]);      // pod input file
   std::string coeff_file = std::string(arg[4]);    // coefficient input file
@@ -54,9 +53,11 @@ ComputePODDAtom::ComputePODDAtom(LAMMPS *lmp, int narg, char **arg) :
   nmax = 0;
   nijmax = 0;
 
-  if ((((3.0*atom->natoms)*podptr->nClusters)*podptr->Mdesc) > (MAXSMALLINT*1.0))
-      error->all(FLERR, "Too many atoms ({}) for compute {}", atom->natoms, style);
-  size_peratom_cols = 3 * atom->natoms * podptr->Mdesc * podptr->nClusters;
+  natoms_cols = atom->natoms;
+  size_peratom_cols = 3 * natoms_cols * podptr->Mdesc * podptr->nClusters;
+  if (size_peratom_cols > (MAXSMALLINT*1.0))
+      error->all(FLERR, "Too many atoms ({}) for compute {}", natoms_cols, style);
+  
   peratom_flag = 1;
 }
 
@@ -89,6 +90,14 @@ void ComputePODDAtom::init()
 
   if (modify->get_compute_by_style("pod").size() > 1 && comm->me == 0)
     error->warning(FLERR,"More than one compute pod");
+  
+  // check for consecutive ID tags:
+  // If "delete_atoms" gives: tag - 1 >= natoms, pod[i] writes OOB.
+  tagint maxtag_one = 0, maxtag;
+  for (int i = 0; i < atom->nlocal; i++) maxtag_one = MAX(maxtag_one, atom->tag[i]);
+  MPI_Allreduce(&maxtag_one, &maxtag, 1, MPI_LMP_TAGINT, MPI_MAX, world);
+  if (maxtag != atom->natoms)
+    error->all(FLERR, "Compute {} requires consecutive atom IDs. Use: reset_atoms id", style);
 }
 
 
@@ -105,22 +114,22 @@ void ComputePODDAtom::compute_peratom()
 {
   invoked_peratom = update->ntimestep;
 
-  // grow pod array if necessary
+  if (atom->natoms != natoms_cols)
+    error->all(FLERR, "Compute {}: number of atoms changed since compute was defined", style);
 
-  if (atom->natoms > nmax) {
+  // grow pod array if necessary (rows = local storage, cols = global derivatives)
+
+  if (atom->nmax > nmax) {
     memory->destroy(pod);
-    nmax = atom->natoms;
-    if ((((3.0*atom->natoms)*podptr->nClusters)*podptr->Mdesc) > (MAXSMALLINT*1.0))
-      error->all(FLERR, "Too many atoms ({}) for compute {}", atom->natoms, style);
-    int numdesc = 3 * atom->natoms * podptr->Mdesc * podptr->nClusters;
-    memory->create(pod, nmax, numdesc,"podd/atom:pod");
+    nmax = atom->nmax;
+    memory->create(pod, nmax, size_peratom_cols, "podd/atom:pod");
     array_atom = pod;
   }
 
-  for (int i = 0; i < atom->natoms; i++)
-    for (int icoeff = 0; icoeff < size_peratom_cols; icoeff++) {
+  const int nlocal = atom->nlocal;
+  for (int i = 0; i < nlocal; i++)
+    for (int icoeff = 0; icoeff < size_peratom_cols; icoeff++)
       pod[i][icoeff] = 0.0;
-    }
 
   // invoke full neighbor list (will copy or build if necessary)
 
@@ -128,6 +137,7 @@ void ComputePODDAtom::compute_peratom()
 
   double **x = atom->x;
   int **firstneigh = list->firstneigh;
+  int *mask = atom->mask;
   int *numneigh = list->numneigh;
   int *type = atom->type;
   int *ilist = list->ilist;
@@ -137,6 +147,8 @@ void ComputePODDAtom::compute_peratom()
   int nelements = podptr->nelements;
   bool localeapod = podptr->localeapod;
   double **rcutsq = podptr->rcutsq;
+
+  const int MC = Mdesc*nClusters;
 
   // determine the maximum number of neighbor list candidates for all local atoms
   // and allocate temporary memory accordingly.  a minimum of one guarantees that
@@ -160,56 +172,52 @@ void ComputePODDAtom::compute_peratom()
 
   for (int ii = 0; ii < inum; ii++) {
     int i = ilist[ii];
-    
+    if (!(mask[i] & groupbit)) continue;
     // get neighbor list for atom i
     lammpsNeighborList(x, firstneigh, atom->tag, type, numneigh, rcutsq, nelements, i);
-
-    if (nij > 0) {
-      // peratom base descriptors
-      double *bd = &podptr->bd[0];
-      double *bdd = &podptr->bdd[0];
-      podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
-
-      if (nClusters>1) {
-        // peratom env descriptors
-        double *pd = &podptr->pd[0];
-        double *pdd = &podptr->pdd[0];
-        if (localeapod) {
-          podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
-        } else {
-          podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
-        }
-        for (int n=0; n<nij; n++) {
-          int ain = 3*ai[n];
-          int ajn = 3*aj[n];
-          for (int k = 0; k < nClusters; k++) {
-            for (int m = 0; m < Mdesc; m++) {
-              int mk = m + Mdesc*k;
-              int nm = 3*n + 3*nij*m;
-              int nk = 3*n + 3*nij*k;
-              pod[i][mk + Mdesc*nClusters*0 + Mdesc*nClusters*ain] += bdd[0 + nm]*pd[k] + bd[m]*pdd[0+nk];
-              pod[i][mk + Mdesc*nClusters*1 + Mdesc*nClusters*ain] += bdd[1 + nm]*pd[k] + bd[m]*pdd[1+nk];
-              pod[i][mk + Mdesc*nClusters*2 + Mdesc*nClusters*ain] += bdd[2 + nm]*pd[k] + bd[m]*pdd[2+nk];
-              pod[i][mk + Mdesc*nClusters*0 + Mdesc*nClusters*ajn] -= bdd[0 + nm]*pd[k] + bd[m]*pdd[0+nk];
-              pod[i][mk + Mdesc*nClusters*1 + Mdesc*nClusters*ajn] -= bdd[1 + nm]*pd[k] + bd[m]*pdd[1+nk];
-              pod[i][mk + Mdesc*nClusters*2 + Mdesc*nClusters*ajn] -= bdd[2 + nm]*pd[k] + bd[m]*pdd[2+nk];
-            }
+    if (nij == 0) continue;
+    // peratom base descriptors
+    double *bd = &podptr->bd[0];
+    double *bdd = &podptr->bdd[0];
+    podptr->peratombase_descriptors(bd, bdd, rij, tmpmem, ti, tj, nij);
+    if (nClusters>1) {
+      // peratom env descriptors
+      double *pd = &podptr->pd[0];
+      double *pdd = &podptr->pdd[0];
+      if (localeapod)
+        podptr->peratomlocalenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+      else
+        podptr->peratomenvironment_descriptors(pd, pdd, bd, bdd, tmpmem, ti[0], nij);
+      for (int n=0; n<nij; n++) {
+        int ain = 3*ai[n];
+        int ajn = 3*aj[n];
+        for (int k = 0; k < nClusters; k++) {
+          for (int m = 0; m < Mdesc; m++) {
+            int mk = m + Mdesc*k;
+            int nm = 3*n + 3*nij*m;
+            int nk = 3*n + 3*nij*k;
+            pod[i][mk + MC*0 + MC*ain] += bdd[0 + nm]*pd[k] + bd[m]*pdd[0+nk];
+            pod[i][mk + MC*1 + MC*ain] += bdd[1 + nm]*pd[k] + bd[m]*pdd[1+nk];
+            pod[i][mk + MC*2 + MC*ain] += bdd[2 + nm]*pd[k] + bd[m]*pdd[2+nk];
+            pod[i][mk + MC*0 + MC*ajn] -= bdd[0 + nm]*pd[k] + bd[m]*pdd[0+nk];
+            pod[i][mk + MC*1 + MC*ajn] -= bdd[1 + nm]*pd[k] + bd[m]*pdd[1+nk];
+            pod[i][mk + MC*2 + MC*ajn] -= bdd[2 + nm]*pd[k] + bd[m]*pdd[2+nk];
           }
         }
       }
-      else {
-        for (int n=0; n<nij; n++) {
-          int ain = 3*ai[n];
-          int ajn = 3*aj[n];
-          for (int m = 0; m < Mdesc; m++) {
-            int nm = 3*n + 3*nij*m;  // d D_im/ d R_j, m = 1, ..., M, i = 1, ..., N, j = 1, ..., N
-            pod[i][m + Mdesc*0 + Mdesc*ain] += bdd[0 + nm];
-            pod[i][m + Mdesc*1 + Mdesc*ain] += bdd[1 + nm];
-            pod[i][m + Mdesc*2 + Mdesc*ain] += bdd[2 + nm];
-            pod[i][m + Mdesc*0 + Mdesc*ajn] -= bdd[0 + nm];
-            pod[i][m + Mdesc*1 + Mdesc*ajn] -= bdd[1 + nm];
-            pod[i][m + Mdesc*2 + Mdesc*ajn] -= bdd[2 + nm];
-          }
+    }
+    else {
+      for (int n=0; n<nij; n++) {
+        int ain = 3*ai[n];
+        int ajn = 3*aj[n];
+        for (int m = 0; m < Mdesc; m++) {
+          int nm = 3*n + 3*nij*m;  // d D_im/ d R_j, m = 1, ..., M, i = 1, ..., N, j = 1, ..., N
+          pod[i][m + Mdesc*0 + Mdesc*ain] += bdd[0 + nm];
+          pod[i][m + Mdesc*1 + Mdesc*ain] += bdd[1 + nm];
+          pod[i][m + Mdesc*2 + Mdesc*ain] += bdd[2 + nm];
+          pod[i][m + Mdesc*0 + Mdesc*ajn] -= bdd[0 + nm];
+          pod[i][m + Mdesc*1 + Mdesc*ajn] -= bdd[1 + nm];
+          pod[i][m + Mdesc*2 + Mdesc*ajn] -= bdd[2 + nm];
         }
       }
     }
