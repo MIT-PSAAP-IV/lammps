@@ -47,8 +47,8 @@ static constexpr int GPU_CONCURRENCY_DIV = 1;
 
 static constexpr int POD_MAX_NRBF  = 8;   // max nrbf3 held in registers
 static constexpr int POD_MAX_NELEM = 2;   // max nelements in the fused sum
-static constexpr int POD_MAX_DEG   = 3;   // max monomial degree (P3)
-static constexpr int POD_MAX_ACT_CLS = 4; // max active clusters
+static constexpr int POD_MAX_DEG   = 4;   // max monomial degree (P3)
+static constexpr int POD_MAX_ACT_CLS = 8; // max active clusters
 
 // monomial direction table: 0 -> 1, 1 -> u, 2 -> v, 3 -> w
 KOKKOS_FORCEINLINE_FUNCTION

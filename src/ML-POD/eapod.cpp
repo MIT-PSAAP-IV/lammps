@@ -376,10 +376,10 @@ void EAPOD::read_pod_file(const std::string &pod_file)
   if (nActiveClusters >= 1.0) localeapod = 1;
   if ( (localeapod) && (nComponents != 1))
     error->all(FLERR,"local EA-POD with multiple PCA components is not supported yet. Please use one principal component.");
-  clusterSearchBox = 0.5 * nActiveClusters + 1;
-  nMaxActiveClusters = clusterSearchBox + 1;
+  clusterSearchBox = std::ceil(0.5 * nActiveClusters + 1);
+  nMaxActiveClusters = std::ceil(nActiveClusters);
 
-  if (ncommittee <= 0) ncommittee = MAX(3, (int) std::ceil(nActiveClusters));
+  if (ncommittee <= 0) ncommittee = MAX(2, nMaxActiveClusters);
   ncommittee = MIN(MAX(ncommittee, 2), nClusters);
 
   if (uncertaintyflag && !eapod) uncertaintyflag = 0;

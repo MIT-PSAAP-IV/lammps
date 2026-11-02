@@ -33,7 +33,7 @@
 
 using namespace LAMMPS_NS;
 
-static constexpr int UQ_MAX_ACT  = 4;   // == POD_MAX_ACT_CLS in pair_pod_kokkos.cpp
+static constexpr int UQ_MAX_ACT  = 8;   // POD_MAX_ACT_CLS in pair_pod_kokkos.cpp
 static constexpr int UQ_MAX_COMM = 8;   // max committee size m
 
 // cluster hat (p=2,q=4), same as MD; dfcut = (1/(2pc)) dfcut/dpc
