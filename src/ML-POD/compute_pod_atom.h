@@ -54,8 +54,6 @@ class ComputePODAtom : public Compute {
   int *ti;    // types of atoms I for all pairs (I, J)
   int *tj;    // types of atoms J  for all pairs (I, J)
 
-  //int uncertaintyflag;   // 1 => output 8 AL uncertainty columns instead of descriptors
-  double *uqmetrics;
   double uqout[9];
 };
 
