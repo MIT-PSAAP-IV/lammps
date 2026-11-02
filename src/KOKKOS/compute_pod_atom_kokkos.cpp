@@ -369,9 +369,10 @@ void ComputePODAtomKokkos<DeviceType>::uq_gate(int gi1, int Ni)
       pod(gi, 0) = coef(cn) + Ebar;
       pod(gi, 1) = sigE;
       pod(gi, 5) = ext;
-      pod(gi, 6) = kstar;
-      pod(gi, 7) = ks;
-      pod(gi, 8) = kn;
+      pod(gi, 6) = pca;
+      pod(gi, 7) = kstar;
+      pod(gi, 8) = ks;
+      pod(gi, 9) = kn;
       U(i) = Ui;  ks_(i) = ks;  kn_(i) = kn;
     });
 }

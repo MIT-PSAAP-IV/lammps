@@ -54,7 +54,7 @@ class ComputePODAtom : public Compute {
   int *ti;    // types of atoms I for all pairs (I, J)
   int *tj;    // types of atoms J  for all pairs (I, J)
 
-  double uqout[9];
+  double uqout[10];
 };
 
 }    // namespace LAMMPS_NS

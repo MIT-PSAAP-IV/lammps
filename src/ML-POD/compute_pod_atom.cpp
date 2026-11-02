@@ -52,7 +52,7 @@ ComputePODAtom::ComputePODAtom(LAMMPS *lmp, int narg, char **arg) :
   nmax = 0;
   nijmax = 0;
 
-  if (podptr->uncertaintyflag == 1) size_peratom_cols = 9;
+  if (podptr->uncertaintyflag == 1) size_peratom_cols = 10;
   else                              size_peratom_cols = podptr->Mdesc * podptr->nClusters;
   peratom_flag = 1;
 }

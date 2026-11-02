@@ -2958,9 +2958,10 @@ static inline double leverage(const double *Lp, const double *d, double *y, int 
    out[3] = gamma_hat      sum_k P_k gamma_ik/gamma_ref,k  (-1 if no gram file)
    out[4] = phi            gate-force magnitude || J (Proj U) ||
    out[5] = eps_ext        latent-axis extrapolation (in units of end spacing)
-   out[6] = k*             nearest cluster
-   out[7] = ks             first active cluster
-   out[8] = kn             number of active clusters
+   out[6] = pca            latent coordinate (1st pca component)
+   out[7] = k*             nearest cluster
+   out[8] = ks             first active cluster
+   out[9] = kn             number of active clusters
 ------------------------------------------------------------------------- */
 void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, double *tm, int *ti)
 {
@@ -3050,9 +3051,10 @@ void EAPOD::peratom_uncertainty(double *out, double *bd, double *bdd, int Nj, do
   out[3] = gam;
   out[4] = sqrt(phi);
   out[5] = ext;
-  out[6] = kstar;
-  out[7] = ks;
-  out[8] = kn;
+  out[6] = pca[0];
+  out[7] = kstar;
+  out[8] = ks;
+  out[9] = kn;
 }
 
 
