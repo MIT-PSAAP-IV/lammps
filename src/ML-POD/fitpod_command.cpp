@@ -165,7 +165,8 @@ void FitPOD::command(int narg, char **arg)
       training_cluster_calculation(traindata);
     }
 
-    if ((fastpodptr->nClusters > 1) && (compute_descriptors == 0) && coeff_file.empty())
+    if ((fastpodptr->nClusters > 1) && (fastpodptr->nComponents == 1) && 
+        (compute_descriptors == 0) && coeff_file.empty())
       training_cluster_support(traindata);
   }
 
@@ -1819,9 +1820,6 @@ void FitPOD::training_cluster_support(const datastruct &data)
   const int nelements = fastpodptr->nelements;
   const int nconfig = (int) data.num_atom.size();
   const int minconf = cluster_min_configs;
-
-  if ((minconf > 0) && (nComponents != 1))
-    error->all(FLERR, "cluster_min_training_configs requires one principal component");
 
   if (comm->me == 0)
     utils::logmesg(lmp, "**************** Begin Training Cluster Support ****************\n");
