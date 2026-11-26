@@ -2194,11 +2194,8 @@ void FitPOD::least_squares_fit(const datastruct &data)
 
     // couple the coefficients of neighboring clusters along the latent axis
     const double smoothing_parameter = data.fitting_weights[18];
-    if ((smoothing_parameter > 0.0) && (fastpodptr->nClusters > 1)) {
-      if (fastpodptr->nComponents != 1)
-        error->one(FLERR, "cluster_smoothing_parameter requires one principal component");
+    if ((smoothing_parameter > 0.0) && (fastpodptr->nClusters > 1) && (fastpodptr->nComponents == 1))
       add_cluster_smoothing(desc.A, smoothing_parameter);
-    }
 
     // solving the linear system A * c = b
     int nrhs = 1, info;
