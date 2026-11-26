@@ -45,7 +45,8 @@ FitPOD::datastruct::datastruct() :
     atomtype(nullptr), hasstress(nullptr), we(nullptr), wf(nullptr), ws(nullptr),
     fitting_weights{100.0, 1.0, 0.0, 1, 1, 0, 0, 1, 1, 1, 1, 1e-10,
                     /*12 kappa*/ 0.0, /*13 escheme*/ 0.0,
-                    /*14 dE*/ 1.0,   /*15 dF*/ 1.0, /*16 Ftol2*/ 1e-8,   /*17 wzero*/ 1e-3}
+                    /*14 dE*/ 1.0,   /*15 dF*/ 1.0, /*16 Ftol2*/ 1e-8,   /*17 wzero*/ 1e-3,
+                    /*18 cluster smoothing*/ 0.0}
 {
   training = 1;
   normalizeenergy = 1;
@@ -75,7 +76,7 @@ void FitPOD::datastruct::copydatainfo(datastruct &data) const
   data.precision = precision;
   data.training = training;
   data.normalizeenergy = normalizeenergy;
-  for (int i = 0; i < 18; i++) data.fitting_weights[i] = fitting_weights[i];
+  for (int i = 0; i < 19; i++) data.fitting_weights[i] = fitting_weights[i];
   data.we_map = we_map;
   data.wf_map = wf_map;
   data.ws_map = ws_map;
@@ -106,6 +107,9 @@ FitPOD::FitPOD(LAMMPS *_lmp) : Command(_lmp), fastpodptr(nullptr)
   compute_descriptors = 0;
   save_pca_histogram = 0;
   pca_histogram_num_bins = 100;
+  kmeans_init = 0;
+  kmeans_max_iter = 100;
+  cluster_min_configs = 0;
 }
 
 void FitPOD::command(int narg, char **arg)
@@ -160,6 +164,9 @@ void FitPOD::command(int narg, char **arg)
     if (!same_env_and_train_path) {
       training_cluster_calculation(traindata);
     }
+
+    if ((fastpodptr->nClusters > 1) && (compute_descriptors == 0) && coeff_file.empty())
+      training_cluster_support(traindata);
   }
 
   if (compute_descriptors == 0) {
@@ -357,6 +364,8 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
       fitting_weights[16] = utils::numeric(FLERR,words[1],false,lmp); // |F|^2 below this = "zero force"
     if (keywd == "zero_force_weight")
       fitting_weights[17] = utils::numeric(FLERR,words[1],false,lmp); // fixed weight for those atoms
+    if (keywd == "cluster_smoothing_parameter")
+      fitting_weights[18] = utils::numeric(FLERR, words[1], false, lmp);
     if (keywd == "precision_for_pod_coefficients")
       precision = utils::inumeric(FLERR, words[1], false, lmp);
     if (keywd == "save_pod_descriptors")
@@ -367,6 +376,15 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
       save_pca_histogram = utils::inumeric(FLERR, words[1], false, lmp);
     if (keywd == "pca_histogram_num_bins")
       pca_histogram_num_bins = utils::inumeric(FLERR, words[1], false, lmp);
+    if (keywd == "kmeans_initialization") {
+      if (words[1] == "sequential") kmeans_init = 0;
+      else if (words[1] == "quantile") kmeans_init = 1;
+      else error->all(FLERR, "Unknown kmeans_initialization {} in POD data file", words[1]);
+    }
+    if (keywd == "kmeans_max_iterations")
+      kmeans_max_iter = utils::inumeric(FLERR, words[1], false, lmp);
+    if (keywd == "cluster_min_training_configs")
+      cluster_min_configs = utils::inumeric(FLERR, words[1], false, lmp);
 
     // other settings
 
@@ -450,6 +468,10 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
     utils::logmesg(lmp, "force_weight_shift: {}\n", fitting_weights[15]);
     utils::logmesg(lmp, "zero_force_tol: {}\n", fitting_weights[16]);
     utils::logmesg(lmp, "zero_force_weight: {}\n", fitting_weights[17]);
+    utils::logmesg(lmp, "cluster_smoothing_parameter: {}\n", fitting_weights[18]);
+    utils::logmesg(lmp, "kmeans_initialization: {}\n", kmeans_init ? "quantile" : "sequential");
+    utils::logmesg(lmp, "kmeans_max_iterations: {}\n", kmeans_max_iter);
+    utils::logmesg(lmp, "cluster_min_training_configs: {}\n", cluster_min_configs);
     utils::logmesg(lmp, "save pod descriptors: {}\n", save_descriptors);
     utils::logmesg(lmp, "compute pod descriptors: {}\n", compute_descriptors);
     utils::logmesg(lmp, "save pca histogram: {}\n", save_pca_histogram);
@@ -1624,18 +1646,22 @@ void FitPOD::environment_pipeline(const datastruct &data, int mode)
       DGEMM(&chn, &chn, &nComponents, &nAtoms, &Mdesc, &alpha, Proj, &nComponents, descmatrix, &Mdesc,
             &beta, pca, &nComponents);
 
-      for (int i = 0; i < nClusters * nComponents; i++) centroids[i] = 0.0;
-      for (int i = 0; i < nAtoms; i++) {
-        int m = (i * nClusters) / nAtoms;
-        for (int j = 0; j < nComponents; j++) centroids[j + nComponents * m] += pca[j + nComponents * i];
+      if (kmeans_init == 1) {
+        quantile_centroids(pca, centroids, nAtoms, nClusters, nComponents);
+      } else {
+        for (int i = 0; i < nClusters * nComponents; i++) centroids[i] = 0.0;
+        for (int i = 0; i < nAtoms; i++) {
+          int m = (i * nClusters) / nAtoms;
+          for (int j = 0; j < nComponents; j++) centroids[j + nComponents * m] += pca[j + nComponents * i];
+        }
+
+        MPI_Allreduce(MPI_IN_PLACE, centroids, nClusters * nComponents, MPI_DOUBLE, MPI_SUM, world);
+        double fac = ((double)nClusters) / ((double)nTotalAtoms);
+        for (int i = 0; i < nClusters * nComponents; i++) centroids[i] *= fac;
       }
 
-      MPI_Allreduce(MPI_IN_PLACE, centroids, nClusters * nComponents, MPI_DOUBLE, MPI_SUM, world);
-      double fac = ((double)nClusters) / ((double)nTotalAtoms);
-      for (int i = 0; i < nClusters * nComponents; i++) centroids[i] *= fac;
-
-      int max_iter = 100;
-      KmeansClustering(pca, centroids, assignments, clusterSizes, nAtoms, nClusters, nComponents, max_iter);
+      KmeansClustering(pca, centroids, assignments, clusterSizes, nAtoms, nClusters, nComponents,
+                       kmeans_max_iter);
 
       if (nComponents == 1) std::sort(centroids, centroids + nClusters);
 
@@ -1780,6 +1806,271 @@ void FitPOD::training_cluster_calculation(const datastruct &data)
     utils::logmesg(lmp, "**************** End Calculating Training K-means Clustering ****************\n");
 }
 
+// count the training configurations supporting each cluster (configurations with at least one
+// atom of that element nearest to the cluster centroid) and write them to a file.
+// Option: cluster_min_training_configs > 0 for a one-dimensional latent space:
+// merge clusters that are sparsely sampled and
+// split the best supported clusters, so the number of clusters stays the same.
+void FitPOD::training_cluster_support(const datastruct &data)
+{
+  const int nComponents = fastpodptr->nComponents;
+  const int Mdesc = fastpodptr->Mdesc;
+  const int nClusters = fastpodptr->nClusters;
+  const int nelements = fastpodptr->nelements;
+  const int nconfig = (int) data.num_atom.size();
+  const int minconf = cluster_min_configs;
+
+  if ((minconf > 0) && (nComponents != 1))
+    error->all(FLERR, "cluster_min_training_configs requires one principal component");
+
+  if (comm->me == 0)
+    utils::logmesg(lmp, "**************** Begin Training Cluster Support ****************\n");
+
+  // principal components and configuration index of every local training atom, per element
+  std::vector<std::vector<double>> lpca(nelements);
+  std::vector<std::vector<int>> lconf(nelements);
+  for (int ci = 0; ci < nconfig; ci++) {
+    if ((ci % comm->nprocs) != comm->me) continue;
+    base_descriptors_fastpod(data, ci);
+    const int natom = data.num_atom[ci];
+    const int *atomtype = &data.atomtype[data.num_atom_cumsum[ci]];
+    for (int n = 0; n < natom; n++) {
+      const int elem = atomtype[n] - 1;
+      const double *proj = &fastpodptr->Proj[nComponents * Mdesc * elem];
+      for (int c = 0; c < nComponents; c++) {
+        double v = 0.0;
+        for (int m = 0; m < Mdesc; m++) v += proj[c + nComponents * m] * desc.bd[n + natom * m];
+        lpca[elem].push_back(v);
+      }
+      lconf[elem].push_back(ci);
+    }
+  }
+
+  std::vector<int> before(nClusters * nelements, 0), after(nClusters * nelements, 0);
+  std::vector<int> atomocc(nClusters * nelements, 0);
+  int changed = 0;
+
+  for (int elem = 0; elem < nelements; elem++) {
+    // gather all training atoms of this element on rank 0
+    const int np = comm->nprocs;
+    int n = (int) lconf[elem].size();
+    std::vector<int> counts(np), displs(np);
+    MPI_Allgather(&n, 1, MPI_INT, counts.data(), 1, MPI_INT, world);
+    int ntot = 0;
+    for (int p = 0; p < np; p++) {
+      displs[p] = ntot;
+      ntot += counts[p];
+    }
+    std::vector<int> conf((comm->me == 0) ? MAX(ntot, 1) : 1);
+    MPI_Gatherv(lconf[elem].data(), n, MPI_INT, conf.data(), counts.data(), displs.data(),
+                MPI_INT, 0, world);
+    int nc = n * nComponents;
+    std::vector<int> ccounts(np), cdispls(np);
+    for (int p = 0; p < np; p++) {
+      ccounts[p] = counts[p] * nComponents;
+      cdispls[p] = displs[p] * nComponents;
+    }
+    std::vector<double> pca((comm->me == 0) ? MAX(ntot * nComponents, 1) : 1);
+    MPI_Gatherv(lpca[elem].data(), nc, MPI_DOUBLE, pca.data(), ccounts.data(), cdispls.data(),
+                MPI_DOUBLE, 0, world);
+
+    double *centroids = &fastpodptr->Centroids[nComponents * nClusters * elem];
+
+    if ((comm->me == 0) && (ntot > 0)) {
+      // number of distinct configurations among the atoms of each cluster
+      std::vector<int> mark(nconfig, -1);
+      auto support = [&](const std::vector<int> &assign, int *cnt) {
+        for (int k = 0; k < nClusters; k++) cnt[k] = 0;
+        std::fill(mark.begin(), mark.end(), -1);
+        std::vector<int> idx(ntot);
+        for (int i = 0; i < ntot; i++) idx[i] = i;
+        std::stable_sort(idx.begin(), idx.end(),
+                         [&assign](int a, int b) { return assign[a] < assign[b]; });
+        for (int i : idx) {
+          const int k = assign[i];
+          if (mark[conf[i]] != k) {
+            mark[conf[i]] = k;
+            cnt[k]++;
+          }
+        }
+      };
+
+      // nearest-centroid assignment of each training atom
+      std::vector<int> assign(ntot);
+      auto nearest = [&]() {
+        for (int i = 0; i < ntot; i++) {
+          const double *x = &pca[(size_t) i * nComponents];
+          double dmin = squareDistance(x, &centroids[0], nComponents);
+          int kbest = 0;
+          for (int k = 1; k < nClusters; k++) {
+            const double d = squareDistance(x, &centroids[nComponents * k], nComponents);
+            if (d < dmin) {
+              dmin = d;
+              kbest = k;
+            }
+          }
+          assign[i] = kbest;
+        }
+      };
+
+      nearest();
+      support(assign, &before[nClusters * elem]);
+
+      if (minconf > 0) {
+        // clusters as contiguous ranges [lo[k], lo[k+1]) of the atoms sorted along the latent axis
+        std::vector<int> order(ntot);
+        for (int i = 0; i < ntot; i++) order[i] = i;
+        std::sort(order.begin(), order.end(), [&pca](int a, int b) { return pca[a] < pca[b]; });
+        std::vector<int> lo(nClusters + 1, 0);
+        {
+          int k = 0;
+          for (int r = 0; r < ntot; r++) {
+            while ((k < nClusters) && (assign[order[r]] >= k)) lo[k++] = r;
+          }
+          while (k <= nClusters) lo[k++] = ntot;
+        }
+
+        // distinct configurations in a range; a new stamp per call avoids clearing the marks
+        std::vector<int> stamp(nconfig, -1);
+        int nstamp = 0;
+        auto range_support = [&](int r0, int r1) {
+          int c = 0;
+          for (int r = r0; r < r1; r++) {
+            if (stamp[conf[order[r]]] != nstamp) {
+              stamp[conf[order[r]]] = nstamp;
+              c++;
+            }
+          }
+          nstamp++;
+          return c;
+        };
+
+        // each pass removes the least supported cluster; the cap guards against cycling
+        for (int iter = 0; iter < 4 * nClusters; iter++) {
+          std::vector<int> cnt(nClusters);
+          for (int k = 0; k < nClusters; k++) cnt[k] = range_support(lo[k], lo[k + 1]);
+
+          int kmin = 0, kmax = 0;
+          for (int k = 1; k < nClusters; k++) {
+            if (cnt[k] < cnt[kmin]) kmin = k;
+            if (cnt[k] > cnt[kmax]) kmax = k;
+          }
+          if (cnt[kmin] >= minconf) break;
+
+          // split the best supported cluster at its median atom; both halves must keep the
+          // minimum support, otherwise the requested support cannot be reached
+          const int split = (lo[kmax] + lo[kmax + 1]) / 2;
+          if ((lo[kmax + 1] - lo[kmax] < 2) || (range_support(lo[kmax], split) < minconf) ||
+              (range_support(split, lo[kmax + 1]) < minconf)) {
+            const int nbelow = (int) std::count_if(cnt.begin(), cnt.end(),
+                                                   [minconf](int c) { return c < minconf; });
+            error->warning(FLERR,
+                           "Element {}: {} clusters have fewer than {} training configurations "
+                           "and cannot be merged further",
+                           elem + 1, nbelow, minconf);
+            break;
+          }
+
+          // merge cluster kmin into its neighbor with fewer configurations by dropping the
+          // boundary between them, then add the split boundary.  the split point lies strictly
+          // inside cluster kmax, so no cluster becomes empty.
+          std::vector<int> bnd(lo.begin() + 1, lo.end() - 1);    // nClusters-1 inner boundaries
+          int drop;
+          if (kmin == 0) drop = 0;
+          else if (kmin == nClusters - 1) drop = nClusters - 2;
+          else drop = (cnt[kmin - 1] <= cnt[kmin + 1]) ? kmin - 1 : kmin;
+          bnd.erase(bnd.begin() + drop);
+          bnd.push_back(split);
+          std::sort(bnd.begin(), bnd.end());
+          for (int k = 1; k < nClusters; k++) lo[k] = bnd[k - 1];
+          changed = 1;
+        }
+
+        // new centroids are the means of the cluster ranges
+        for (int k = 0; k < nClusters; k++) {
+          double sum = 0.0;
+          for (int r = lo[k]; r < lo[k + 1]; r++) sum += pca[order[r]];
+          if (lo[k + 1] > lo[k]) centroids[k] = sum / (double) (lo[k + 1] - lo[k]);
+        }
+        std::sort(centroids, centroids + nClusters);
+        nearest();
+      }
+      support(assign, &after[nClusters * elem]);
+      for (int i = 0; i < ntot; i++) atomocc[assign[i] + nClusters * elem]++;
+    }
+    MPI_Bcast(centroids, nComponents * nClusters, MPI_DOUBLE, 0, world);
+  }
+
+  MPI_Bcast(&changed, 1, MPI_INT, 0, world);
+  if (changed) {
+    if (fastpodptr->localeapod)
+      fastpodptr->calculateClusterEdges(nClusters, fastpodptr->nActiveClusters, nComponents,
+                                        nelements);
+  }
+
+  if (comm->me == 0) {
+    std::string filename = data.filenametag + "_cluster_training_support.pod";
+    SafeFilePtr fp = fopen(filename.c_str(), "w");
+    utils::print(fp, "# training configurations per cluster (nearest centroid)\n");
+    utils::print(fp, "# element cluster centroid configs_before configs_after\n");
+    for (int elem = 0; elem < nelements; elem++)
+      for (int k = 0; k < nClusters; k++)
+        utils::print(fp, "{} {} {:.14g} {} {}\n", elem + 1, k + 1,
+                     fastpodptr->Centroids[nComponents * (k + nClusters * elem)],
+                     before[k + nClusters * elem], after[k + nClusters * elem]);
+
+    for (int elem = 0; elem < nelements; elem++) {
+      const int *c = &after[nClusters * elem];
+      utils::logmesg(lmp, "element {}: training configurations per cluster: min {} max {}\n",
+                     elem + 1, *std::min_element(c, c + nClusters),
+                     *std::max_element(c, c + nClusters));
+    }
+
+    // the occupancy file must describe the final centroids
+    if (changed) {
+      utils::logmesg(lmp, "cluster centroids changed to meet the minimum training support; "
+                          "cluster occupancy file now counts training atoms\n");
+      std::string occname = data.filenametag + "_cluster_occupancy.pod";
+      SafeFilePtr fo = fopen(occname.c_str(), "w");
+      utils::print(fo, "cluster_occupancy: {} {}\n", nClusters, nelements);
+      for (int i = 0; i < nClusters * nelements; i++) utils::print(fo, "{}\n", atomocc[i]);
+    }
+    utils::logmesg(lmp, "**************** End Training Cluster Support ****************\n");
+  }
+}
+
+// adds lambda * w_m * (c_{k,m} - c_{k+1,m})^2 for adjacent clusters k, k+1 along the sorted
+// one-dimensional latent axis, with w_m the mean diagonal entry of descriptor m over all clusters
+// of the element, so that the penalty is independent of the scale of each descriptor
+void FitPOD::add_cluster_smoothing(double *A, double lambda)
+{
+  const int nClusters = fastpodptr->nClusters;
+  const int Mdesc = fastpodptr->Mdesc;
+  const int nl1 = fastpodptr->nl1;
+  const int nce = fastpodptr->nCoeffPerElement;
+  const int n = desc.nCoeffAll;
+
+  for (int elem = 0; elem < fastpodptr->nelements; elem++) {
+    const int c0 = nce * elem + nl1;
+    for (int m = 0; m < Mdesc; m++) {
+      double w = 0.0;
+      for (int k = 0; k < nClusters; k++) {
+        const int i = c0 + m + k * Mdesc;
+        w += A[i + n * i];
+      }
+      w *= lambda / nClusters;
+      for (int k = 0; k < nClusters - 1; k++) {
+        const int i = c0 + m + k * Mdesc;
+        const int j = i + Mdesc;
+        A[i + n * i] += w;
+        A[j + n * j] += w;
+        A[i + n * j] -= w;
+        A[j + n * i] -= w;
+      }
+    }
+  }
+}
+
 static double latticevolume(double *lattice)
 {
   double *v1 = &lattice[0];
@@ -1901,6 +2192,14 @@ void FitPOD::least_squares_fit(const datastruct &data)
       desc.A[i + nCoeffAll * i] = desc.A[i + nCoeffAll * i] * (1.0 + regularizing_parameter);
       if (desc.A[i + nCoeffAll * i] < regularizing_parameter)
         desc.A[i + nCoeffAll * i] = regularizing_parameter;
+    }
+
+    // couple the coefficients of neighboring clusters along the latent axis
+    const double smoothing_parameter = data.fitting_weights[18];
+    if ((smoothing_parameter > 0.0) && (fastpodptr->nClusters > 1)) {
+      if (fastpodptr->nComponents != 1)
+        error->one(FLERR, "cluster_smoothing_parameter requires one principal component");
+      add_cluster_smoothing(desc.A, smoothing_parameter);
     }
 
     // solving the linear system A * c = b
@@ -2687,25 +2986,26 @@ void FitPOD::assignPointsToClusters(double *points, double *centroids, int *assi
 void FitPOD::updateCentroids(double *points, double *centroids, int *assignments, int *clusterSizes,
                              int NUM_POINTS, int NUM_CLUSTERS, int DIMENSIONS)
 {
-  // Reset centroids for recalculation
-  for (int i = 0; i < NUM_CLUSTERS * DIMENSIONS; i++) { centroids[i] = 0.0; }
-
-  // Accumulate sum of points in each cluster
+  // Accumulate sum of points in each cluster in a separate buffer, so that the centroid of a
+  // cluster without points keeps its previous position instead of being reset to zero
+  std::vector<double> sums(NUM_CLUSTERS * DIMENSIONS, 0.0);
   for (int i = 0; i < NUM_POINTS; i++) {
     int cluster = assignments[i];
     for (int j = 0; j < DIMENSIONS; j++) {
-      centroids[cluster * DIMENSIONS + j] += points[i * DIMENSIONS + j];
+      sums[cluster * DIMENSIONS + j] += points[i * DIMENSIONS + j];
     }
   }
 
   // Use MPI_Allreduce to sum up the local sums and cluster sizes across all processes
-  MPI_Allreduce(MPI_IN_PLACE, centroids, NUM_CLUSTERS * DIMENSIONS, MPI_DOUBLE, MPI_SUM, world);
+  MPI_Allreduce(MPI_IN_PLACE, sums.data(), NUM_CLUSTERS * DIMENSIONS, MPI_DOUBLE, MPI_SUM, world);
   MPI_Allreduce(MPI_IN_PLACE, clusterSizes, NUM_CLUSTERS, MPI_INT, MPI_SUM, world);
 
-  // Divide by number of points to get the mean (centroid)
+  // Divide by number of points to get the mean (centroid); empty clusters are left unchanged
   for (int i = 0; i < NUM_CLUSTERS; i++) {
     if (clusterSizes[i] != 0) {
-      for (int j = 0; j < DIMENSIONS; j++) { centroids[i * DIMENSIONS + j] /= clusterSizes[i]; }
+      for (int j = 0; j < DIMENSIONS; j++) {
+        centroids[i * DIMENSIONS + j] = sums[i * DIMENSIONS + j] / clusterSizes[i];
+      }
     }
   }
 }
@@ -2715,12 +3015,67 @@ void FitPOD::KmeansClustering(double *points, double *centroids, int *assignment
                               int *clusterSizes, int NUM_POINTS, int NUM_CLUSTERS, int DIMENSIONS,
                               int MAX_ITER)
 {
-  for (int iter = 0; iter < MAX_ITER; iter++) {
+  // stop once no assignment changes: further iterations would reproduce the same centroids
+  std::vector<int> previous(NUM_POINTS, -1);
+  int iter = 0;
+  for (; iter < MAX_ITER; iter++) {
     assignPointsToClusters(points, centroids, assignments, clusterSizes, NUM_POINTS, NUM_CLUSTERS,
                            DIMENSIONS);
+    int nchanged = 0;
+    for (int i = 0; i < NUM_POINTS; i++) {
+      if (assignments[i] != previous[i]) nchanged++;
+      previous[i] = assignments[i];
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &nchanged, 1, MPI_INT, MPI_SUM, world);
+    if (nchanged == 0) break;
     updateCentroids(points, centroids, assignments, clusterSizes, NUM_POINTS, NUM_CLUSTERS,
                     DIMENSIONS);
   }
+  if (comm->me == 0) {
+    if (iter < MAX_ITER)
+      utils::logmesg(lmp, "k-means clustering converged after {} iterations\n", iter);
+    else
+      utils::logmesg(lmp, "k-means clustering did not converge within {} iterations\n", MAX_ITER);
+  }
+}
+
+// initial centroids from equal-count chunks of all points sorted along the first component;
+// for a 1-D latent space these are the means of the K quantile intervals of the data
+void FitPOD::quantile_centroids(double *points, double *centroids, int NUM_POINTS,
+                                int NUM_CLUSTERS, int DIMENSIONS)
+{
+  const int np = comm->nprocs;
+  int n = NUM_POINTS * DIMENSIONS;
+  std::vector<int> counts(np), displs(np);
+  MPI_Allgather(&n, 1, MPI_INT, counts.data(), 1, MPI_INT, world);
+  int ntot = 0;
+  for (int p = 0; p < np; p++) {
+    displs[p] = ntot;
+    ntot += counts[p];
+  }
+  std::vector<double> all((comm->me == 0) ? MAX(ntot, 1) : 1);
+  MPI_Gatherv(points, n, MPI_DOUBLE, all.data(), counts.data(), displs.data(), MPI_DOUBLE, 0,
+              world);
+
+  if (comm->me == 0) {
+    const int npoints = ntot / DIMENSIONS;
+    std::vector<int> order(npoints);
+    for (int i = 0; i < npoints; i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [&all, DIMENSIONS](int a, int b) {
+      return all[(size_t) a * DIMENSIONS] < all[(size_t) b * DIMENSIONS];
+    });
+    for (int i = 0; i < NUM_CLUSTERS * DIMENSIONS; i++) centroids[i] = 0.0;
+    for (int k = 0; k < NUM_CLUSTERS; k++) {
+      const int i0 = (int) (((long long) k * npoints) / NUM_CLUSTERS);
+      const int i1 = (int) (((long long) (k + 1) * npoints) / NUM_CLUSTERS);
+      for (int i = i0; i < i1; i++)
+        for (int j = 0; j < DIMENSIONS; j++)
+          centroids[j + DIMENSIONS * k] += all[(size_t) order[i] * DIMENSIONS + j];
+      if (i1 > i0)
+        for (int j = 0; j < DIMENSIONS; j++) centroids[j + DIMENSIONS * k] /= (double) (i1 - i0);
+    }
+  }
+  MPI_Bcast(centroids, NUM_CLUSTERS * DIMENSIONS, MPI_DOUBLE, 0, world);
 }
 
 void FitPOD::savematrix2binfile(const std::string &filename, double *A, int nrows, int ncols)

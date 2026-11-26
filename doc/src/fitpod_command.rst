@@ -193,6 +193,22 @@ in the example above):
      - 1.0e-10
      - REAL
      - a real constant specifies the regularization parameter in the least-squares fit
+   * - cluster_smoothing_parameter
+     - 0.0
+     - REAL
+     - couples the coefficients of neighboring environment clusters (see below)
+   * - kmeans_initialization
+     - sequential
+     - STRING
+     - ``sequential`` or ``quantile`` starting centroids for the k-means clustering
+   * - kmeans_max_iterations
+     - 100
+     - INT
+     - maximum number of k-means iterations
+   * - cluster_min_training_configs
+     - 0
+     - INT
+     - minimum number of training configurations for each environment cluster (see below)
    * - error_analysis_for_training_data_set
      - 0
      - BOOL
@@ -223,6 +239,7 @@ successful training, a number of output files are produced, if enabled:
 * ``<basename>_test_errors.pod`` reports errors for the test data set
 * ``<basename>_test_analysis.pod`` reports detailed errors for all test configurations
 * ``<basename>_coefficients.pod`` contains the coefficients of the POD potential
+* ``<basename>_cluster_training_support.pod`` reports the number of training configurations for each environment cluster
 
 After training the POD potential, ``Ta_param.pod`` and
 ``<basename>_coefficients.pod`` are the two files needed to use the POD
@@ -332,6 +349,63 @@ E}^{\star} \in \mathbb{R}^{J}` is a vector of with entries
 F^{\star}` is a vector of :math:`\mathcal{N}` entries obtained by
 stacking :math:`\{\boldsymbol F^{\star}_j\}_{j=1}^{J}` from top to
 bottom.
+
+Environment clusters
+""""""""""""""""""""
+
+.. versionadded:: TBD
+
+For environment-adaptive POD potentials with more than one environment
+cluster, every cluster has its own set of coefficients.  The cluster
+centroids are obtained by k-means clustering of the latent (principal
+component) descriptors of the environment configuration set.  Real data
+sets sample the latent space unevenly: the clusters at the edges of the
+latent space, which often describe high-energy atomic environments, can
+contain atoms from only a few training configurations.  The coefficients
+of such clusters are then poorly determined, and adding more clusters
+can lower the training errors while raising the test errors.  Four
+keywords in the second input file control this behavior.
+
+The *cluster_smoothing_parameter* :math:`w_S` adds the penalty
+
+.. math::
+
+    w_S \sum_{m=1}^{M_d} \bar{A}_{m} \sum_{k=1}^{K-1} \left(c_{k,m} - c_{k+1,m}\right)^2
+
+to the least-squares problem, where :math:`c_{k,m}` is the coefficient
+of base descriptor :math:`m` in cluster :math:`k`, the :math:`K`
+clusters are ordered along the latent axis, and :math:`\bar{A}_{m}` is
+the average diagonal entry of the least-squares matrix for descriptor
+:math:`m` over all clusters, which makes :math:`w_S` independent of the
+descriptor scale.  Clusters with many training configurations are
+hardly affected, while the coefficients of clusters with few training
+configurations are pulled toward those of their neighbors rather than
+toward zero.  This also reduces spurious forces caused by large
+differences between the energies predicted by neighboring clusters.
+Values between 1.0e-4 and 1.0e-1 are a reasonable starting range; a
+value of zero turns the penalty off.  This keyword requires a
+one-dimensional latent space.
+
+The *kmeans_initialization* keyword selects the starting centroids of
+the k-means clustering.  With *sequential*, the atoms are split into
+groups of equal size in the order in which they are read.  With
+*quantile*, the atoms are sorted along the first latent component
+before they are split, so the starting centroids already follow the
+distribution of the data.  The clustering stops as soon as no atom
+changes its cluster, or after *kmeans_max_iterations* iterations.
+
+After the clustering, the number of training configurations that have
+at least one atom nearest to each cluster centroid is written to the
+file ``<basename>_cluster_training_support.pod``.  This number can be
+much smaller than the number of atoms in a cluster, in particular when
+the environment configuration set contains configurations that are not
+part of the training set.  If *cluster_min_training_configs* is larger
+than zero, clusters with fewer training configurations are merged into
+their neighbor with fewer training configurations, and the clusters
+freed this way are used to split the clusters with the most training
+configurations, so the total number of clusters stays the same.  The
+cluster occupancy file is then rewritten from the training atoms.  This
+keyword requires a one-dimensional latent space.
 
 Validation
 """"""""""

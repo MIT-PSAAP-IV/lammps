@@ -119,6 +119,9 @@ class FitPOD : public Command {
   int compute_descriptors;
   int save_pca_histogram;      // 0/1 flag: write PCA descriptor histogram
   int pca_histogram_num_bins;  // number of in-span bins
+  int kmeans_init;             // 0 = chunks in data order (legacy), 1 = quantiles of sorted data
+  int kmeans_max_iter;         // maximum number of k-means iterations
+  int cluster_min_configs;     // minimum number of training configurations per cluster (0 = off)
   datastruct traindata;
   datastruct testdata;
   datastruct envdata;
@@ -152,6 +155,8 @@ class FitPOD : public Command {
                        int NUM_POINTS, int NUM_CLUSTERS, int DIMENSIONS);
   void KmeansClustering(double *points, double *centroids, int *assignments, int *clusterSizes,
                         int NUM_POINTS, int NUM_CLUSTERS, int DIMENSIONS, int MAX_ITER);
+  void quantile_centroids(double *points, double *centroids, int NUM_POINTS, int NUM_CLUSTERS,
+                          int DIMENSIONS);
 
   void savedata2textfile(const std::string &filename, const std::string &text, double *A, int n, int m, int dim);
   void savematrix2binfile(const std::string &filename, double *A, int nrows, int ncols);
@@ -202,6 +207,8 @@ class FitPOD : public Command {
   void environment_cluster_calculation(const datastruct &data);
   void environment_proj_calculation(const datastruct &data);
   void training_cluster_calculation(const datastruct &data);
+  void training_cluster_support(const datastruct &data);
+  void add_cluster_smoothing(double *A, double lambda);
   void environment_pipeline(const datastruct &data, int mode);
 // mode: 0 = env clusters (proj + kmeans),
 //       1 = projection only,
