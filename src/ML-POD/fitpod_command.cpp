@@ -105,8 +105,6 @@ FitPOD::FitPOD(LAMMPS *_lmp) : Command(_lmp), fastpodptr(nullptr)
 {
   save_descriptors = 0;
   compute_descriptors = 0;
-  save_pca_histogram = 0;
-  pca_histogram_num_bins = 100;
   kmeans_init = 0;
   kmeans_max_iter = 100;
   cluster_min_configs = 0;
@@ -145,25 +143,21 @@ void FitPOD::command(int narg, char **arg)
 
   if (!coeff_file.empty()) podArrayCopy(desc.c, fastpodptr->coeff, fastpodptr->nCoeffAll);
 
-  if (((int) envdata.data_path.size() > 1)) {
+  if ((int) envdata.data_path.size() > 1) {
     const bool same_env_and_train_path = (envdata.data_path == traindata.data_path);
 
-    if (same_env_and_train_path) {
-      // Same dataset paths: do projection + clustering once, skip training clustering pass
-      if (comm->me == 0) {
+    if (same_env_and_train_path) { // Same paths: do projection + clustering in one pass
+      if (comm->me == 0)
         utils::logmesg(lmp, "same env and train data paths, reusing env clustering descriptors.\n");
-      }
       environment_cluster_calculation(envdata);
-    } else {
-      // Different datasets: split workflow
+    } else { // Different datasets: split workflow
       environment_proj_calculation(envdata);
     }
 
     deallocate_memory_datastruct(envdata);
 
-    if (!same_env_and_train_path) {
+    if (!same_env_and_train_path)
       training_cluster_calculation(traindata);
-    }
 
     if ((fastpodptr->nClusters > 1) && (fastpodptr->nComponents == 1) && 
         (compute_descriptors == 0) && coeff_file.empty())
@@ -373,10 +367,6 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
       save_descriptors = utils::inumeric(FLERR, words[1], false, lmp);
     if (keywd == "compute_pod_descriptors")
       compute_descriptors = utils::inumeric(FLERR, words[1], false, lmp);
-    if (keywd == "save_pca_histogram")
-      save_pca_histogram = utils::inumeric(FLERR, words[1], false, lmp);
-    if (keywd == "pca_histogram_num_bins")
-      pca_histogram_num_bins = utils::inumeric(FLERR, words[1], false, lmp);
     if (keywd == "kmeans_initialization") {
       if (words[1] == "sequential") kmeans_init = 0;
       else if (words[1] == "quantile") kmeans_init = 1;
@@ -475,8 +465,6 @@ int FitPOD::read_data_file(double *fitting_weights, std::string &file_format,
     utils::logmesg(lmp, "cluster_min_training_configs: {}\n", cluster_min_configs);
     utils::logmesg(lmp, "save pod descriptors: {}\n", save_descriptors);
     utils::logmesg(lmp, "compute pod descriptors: {}\n", compute_descriptors);
-    utils::logmesg(lmp, "save pca histogram: {}\n", save_pca_histogram);
-    utils::logmesg(lmp, "pca histogram number of bins: {}\n", pca_histogram_num_bins);
     utils::logmesg(lmp, "**************** End of Data File ****************\n");
   }
 
@@ -1540,30 +1528,11 @@ void FitPOD::environment_pipeline(const datastruct &data, int mode)
   int *clusterSizes = nullptr, *assignments = nullptr;
   int *nElemAtoms = nullptr, *nElemAtomsCumSum = nullptr, *nElemAtomsCount = nullptr;
 
-  // histogram of per-atom pca descriptors over the centroid span
-  // layout per (elem, comp): nbins in-span bins plus one ghost bin on each side (nbins+2)
-  const bool do_hist = (do_kmeans && save_pca_histogram);
-  const int nbins = pca_histogram_num_bins;
-  int *pcaHist = nullptr;      // nelements*nComponents*(nbins+2)
-  double *pcaSpan = nullptr;   // nelements*nComponents*2
-
-  // per-cluster training occupancy
-  // inference-time active-learning metric can weight clusters by training density
-  int *clusterOcc = nullptr;   // nClusters*nelements
-
   memory->create(basedescmatrix, nAtoms * Mdesc, "fitpod:basedescmatrix");
   if (do_kmeans) {
     memory->create(pca, nAtoms * nComponents, "fitpod:pca");
     memory->create(clusterSizes, nClusters * nelements, "fitpod:clusterSizes");
     memory->create(assignments, nAtoms, "fitpod:assignments");
-    memory->create(clusterOcc, nClusters * nelements, "fitpod:clusterOcc");
-    for (int i = 0; i < nClusters * nelements; i++) clusterOcc[i] = 0;
-  }
-  if (do_hist) {
-    memory->create(pcaHist, nelements * nComponents * (nbins + 2), "fitpod:pcaHist");
-    memory->create(pcaSpan, nelements * nComponents * 2, "fitpod:pcaSpan");
-    for (int i = 0; i < nelements * nComponents * (nbins + 2); i++) pcaHist[i] = 0;
-    for (int i = 0; i < nelements * nComponents * 2; i++) pcaSpan[i] = 0.0;
   }
   if (do_proj) {
     memory->create(A, Mdesc * Mdesc, "fitpod:A");
@@ -1665,109 +1634,17 @@ void FitPOD::environment_pipeline(const datastruct &data, int mode)
                        kmeans_max_iter);
 
       if (nComponents == 1) std::sort(centroids, centroids + nClusters);
-
-      int *occ = &clusterOcc[nClusters * elem];
-      for (int i = 0; i < nAtoms; i++) {
-        double mind = squareDistance(&pca[nComponents * i], &centroids[0], nComponents);
-        int kbest = 0;
-        for (int j = 1; j < nClusters; j++) {
-          double d = squareDistance(&pca[nComponents * i], &centroids[nComponents * j], nComponents);
-          if (d < mind) { mind = d; kbest = j; }
-        }
-        occ[kbest] += 1;
-      }
-
-      // accumulate per-atom pca descriptors into the histogram for this element
-      // for r = r_in, maps to pca = 0
-      // ghost bins on poles
-      if (do_hist) {
-        for (int c = 0; c < nComponents; c++) {
-          double cmin = centroids[c];
-          double cmax = centroids[c];
-          for (int j = 1; j < nClusters; j++) {
-            double v = centroids[c + j * nComponents];
-            if (v < cmin) cmin = v;
-            if (v > cmax) cmax = v;
-          }
-
-          // pick the family from the dominant sign of the centroids and anchor at 0
-          bool posfamily = (cmax >= -cmin);
-          double lo = posfamily ? 0.0 : cmin;
-          double hi = posfamily ? cmax : 0.0;
-          pcaSpan[0 + 2 * (c + nComponents * elem)] = lo;
-          pcaSpan[1 + 2 * (c + nComponents * elem)] = hi;
-
-          double span = hi - lo;
-          int *hist = &pcaHist[(elem * nComponents + c) * (nbins + 2)];
-          for (int i = 0; i < nAtoms; i++) {
-            double v = pca[c + nComponents * i];
-            int bin;
-            if (v < lo) bin = 0;                // left ghost bin
-            else if (v >= hi) bin = nbins + 1;  // right ghost bin
-            else if (span > 0.0) {
-              int k = (int) ((v - lo) / span * nbins);
-              if (k < 0) k = 0;
-              if (k >= nbins) k = nbins - 1;
-              bin = k + 1;    // in-span bins are 1..nbins
-            } else {
-              bin = 1;    // zero span: all in-span atoms into first bin
-            }
-            hist[bin] += 1;
-          }
-        }
-      }
     }
   }
 
-  if (do_kmeans && localeapod) {
+  if (do_kmeans && localeapod)
     fastpodptr->calculateClusterEdges(nClusters, nActiveClusters, nComponents, nelements);
-  }
-
-  if (do_kmeans) {
-    MPI_Allreduce(MPI_IN_PLACE, clusterOcc, nClusters * nelements, MPI_INT, MPI_SUM, world);
-
-    if (comm->me == 0) {
-      std::string filename = data.filenametag + "_cluster_occupancy.pod";
-      SafeFilePtr fp = fopen(filename.c_str(), "w");
-      utils::print(fp, "cluster_occupancy: {} {}\n", nClusters, nelements);
-      for (int i = 0; i < nClusters * nelements; i++) utils::print(fp, "{}\n", clusterOcc[i]);
-    }
-  }
-  
-  if (do_hist) {
-    MPI_Allreduce(MPI_IN_PLACE, pcaHist, nelements * nComponents * (nbins + 2), MPI_INT,
-                  MPI_SUM, world);
-
-    if (comm->me == 0) {
-      std::string filename = data.filenametag + "_pca_histogram.txt";
-      SafeFilePtr fp = fopen(filename.c_str(), "w");
-      utils::print(fp, "# pca_histogram nelements nComponents nbins "
-                       "(in-span range is zero-anchored; 2 ghost bins per row: left, right)\n");
-      utils::print(fp, "{} {} {}\n", nelements, nComponents, nbins);
-      utils::print(fp, "# elem comp lo hi ghostL bin_1 ... bin_nbins ghostR\n");
-      for (int elem = 0; elem < nelements; elem++) {
-        for (int c = 0; c < nComponents; c++) {
-          double lo = pcaSpan[0 + 2 * (c + nComponents * elem)];
-          double hi = pcaSpan[1 + 2 * (c + nComponents * elem)];
-          int *hist = &pcaHist[(elem * nComponents + c) * (nbins + 2)];
-          utils::print(fp, "{} {} {:.15g} {:.15g}", elem, c, lo, hi);
-          for (int bin = 0; bin < nbins + 2; bin++) utils::print(fp, " {}", hist[bin]);
-          utils::print(fp, "\n");
-        }
-      }
-    }
-  }
 
   memory->destroy(basedescmatrix);
   if (do_kmeans) {
     memory->destroy(pca);
     memory->destroy(clusterSizes);
     memory->destroy(assignments);
-    memory->destroy(clusterOcc);
-  }
-  if (do_hist) {
-    memory->destroy(pcaHist);
-    memory->destroy(pcaSpan);
   }
   if (do_proj) {
     memory->destroy(A);
@@ -2960,7 +2837,7 @@ void FitPOD::assignPointsToClusters(double *points, double *centroids, int *assi
                                     int DIMENSIONS)
 {
   // Initialize clusterSizes to zero
-  for (int i = 0; i < NUM_CLUSTERS; i++) { clusterSizes[i] = 0; }
+  for (int i = 0; i < NUM_CLUSTERS; i++) clusterSizes[i] = 0;
 
   for (int i = 0; i < NUM_POINTS; i++) {
     double minDist = squareDistance(&points[i * DIMENSIONS], &centroids[0], DIMENSIONS);

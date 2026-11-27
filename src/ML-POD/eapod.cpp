@@ -46,7 +46,6 @@ EAPOD::EAPOD(LAMMPS *_lmp, const std::string &pod_file, const std::string &coeff
     rin(nullptr), rcut(nullptr), Proj(nullptr), Centroids(nullptr),
     invLeftClusterRcut2(nullptr), invRightClusterRcut2(nullptr),
     leftClusterEdges(nullptr), rightClusterEdges(nullptr),
-    invPcaSpan(nullptr), clusterOccupancy(nullptr),
     bd(nullptr), bdd(nullptr), pd(nullptr), pdd(nullptr),
     pn3(nullptr), pq3_m(nullptr), pq3_d(nullptr), pc3(nullptr), ps3(nullptr),
     pa4(nullptr), pb4(nullptr), pc4(nullptr),
@@ -136,8 +135,6 @@ EAPOD::~EAPOD()
   memory->destroy(invRightClusterRcut2);
   memory->destroy(leftClusterEdges);
   memory->destroy(rightClusterEdges);
-  memory->destroy(invPcaSpan);
-  memory->destroy(clusterOccupancy);
   memory->destroy(bd);
   memory->destroy(bdd);
   memory->destroy(pd);
@@ -767,87 +764,6 @@ void EAPOD::read_cluster_gram_file(const std::string &coeff_file)
   }
   if (comm->me == 0)
     utils::logmesg(lmp, "loaded cluster gram file {} (eps = {}, wF = {})\n", fname, uq_eps, uq_wF);
-}
-
-void EAPOD::read_cluster_occupancy_file(const std::string &coeff_file)
-{
-  std::string occfilename = coeff_file;
-  auto pos = occfilename.rfind("_coefficients");
-  if (pos != std::string::npos) {
-    occfilename.replace(pos, std::string("_coefficients").size(), "_cluster_occupancy");
-  } else {
-    // fallback: strip a trailing .pod (if any) and append the occupancy suffix
-    auto dot = occfilename.rfind(".pod");
-    if (dot != std::string::npos) occfilename.erase(dot);
-    occfilename += "_cluster_occupancy.pod";
-  }
-
-  int ncols = nClusters * nelements;
-
-  SafeFilePtr fpocc;
-  int missing = 0;
-  if (comm->me == 0) {
-    fpocc = utils::open_potential(occfilename, lmp, nullptr);
-    if (fpocc == nullptr) missing = 1;
-  }
-  MPI_Bcast(&missing, 1, MPI_INT, 0, world);
-  if (missing) {
-    if (comm->me == 0)
-      error->warning(FLERR, "Cluster occupancy file {} not found; active-learning density "
-                            "metric will be unweighted", occfilename);
-    return;
-  }
-
-  char line[MAXLINE], *ptr;
-  int eof = 0;
-  int nwords = 0;
-
-  // header line: "cluster_occupancy: nClusters nelements"
-  while (nwords == 0) {
-    if (comm->me == 0) {
-      ptr = fgets(line, MAXLINE, fpocc);
-      if (ptr == nullptr) eof = 1;
-    }
-    MPI_Bcast(&eof, 1, MPI_INT, 0, world);
-    if (eof) break;
-    MPI_Bcast(line, MAXLINE, MPI_CHAR, 0, world);
-    nwords = utils::count_words(utils::trim_comment(line));
-  }
-  if (nwords != 3) error->all(FLERR, "Incorrect format in cluster occupancy file");
-
-  int nc_file, nel_file;
-  try {
-    ValueTokenizer words(utils::trim_comment(line), "\"' \t\n\r\f");
-    words.next_string();    // "cluster_occupancy:"
-    nc_file = words.next_int();
-    nel_file = words.next_int();
-  } catch (TokenizerException &e) {
-    error->all(FLERR, "Incorrect format in cluster occupancy file: {}", e.what());
-    return;
-  }
-  if ((nc_file != nClusters) || (nel_file != nelements))
-    error->all(FLERR, "cluster occupancy file does not match the model (clusters/elements)");
-
-  memory->create(clusterOccupancy, ncols, "pod:clusterOccupancy");
-  for (int i = 0; i < ncols; i++) {
-    if (comm->me == 0) {
-      ptr = fgets(line, MAXLINE, fpocc);
-      if (ptr == nullptr) eof = 1;
-    }
-    MPI_Bcast(&eof, 1, MPI_INT, 0, world);
-    if (eof) error->all(FLERR, "Incorrect format in cluster occupancy file");
-    MPI_Bcast(line, MAXLINE, MPI_CHAR, 0, world);
-    try {
-      ValueTokenizer occ(utils::trim_comment(line));
-      if (occ.count() != 1) error->all(FLERR, "Incorrect format in cluster occupancy file");
-      clusterOccupancy[i] = occ.next_int();
-    } catch (TokenizerException &e) {
-      error->all(FLERR, "Incorrect format in cluster occupancy file: {}", e.what());
-    }
-  }
-
-  if (comm->me == 0)
-    utils::logmesg(lmp, "loaded cluster occupancy for active learning: {} values\n", ncols);
 }
 
 void EAPOD::peratombase_descriptors(double *bd1, double *bdd1, double *rij, double *temp,
@@ -1695,6 +1611,7 @@ void EAPOD::descriptors(double *gd, double *gdd, double *basedesc, double *probd
 
       for (int j = 0; j < nClusters; j++) {
         probdesc[i + natom*j] = pd[j];
+        if (pd[j] == 0) continue;  // skip for moe-ea-pod
         for (int m=0; m<Mdesc; m++) {
           basedesc[i + natom*m] = bd[m];
           int k = nCoeffPerElement*ti[0] + nl1 + m + j*Mdesc; // increment by nl1 because of the one-body descriptor
@@ -3312,27 +3229,6 @@ void EAPOD::calculateClusterEdges(int nClusters, double nActiveClusters, int nCo
     redges[nClusters-1] = infty;
     invlc2[0] = 0.0;
     invrc2[nClusters-1] = 0.0;
-  }
-}
-
-// precomputes: 1 / span (max centroid[j,Z] - min centroid[j,Z])
-// per-element, per-component normalization to [0,1]
-void EAPOD::calculatePcaSpan()
-{
-  for (int elem = 0; elem < nelements; elem++) {
-    double *centroids = &Centroids[nComponents*nClusters*elem];
-    double *invspan   = &invPcaSpan[nComponents*elem];
-    for (int c = 0; c < nComponents; c++) {
-      double cmin = centroids[c];
-      double cmax = centroids[c];
-      for (int j = 1; j < nClusters; j++) {
-        double v = centroids[c + j*nComponents];
-        if (v < cmin) cmin = v;
-        if (v > cmax) cmax = v;
-      }
-      double span = cmax - cmin;
-      invspan[c] = (span > 0.0) ? 1.0 / span : 1.0;
-    }
   }
 }
 

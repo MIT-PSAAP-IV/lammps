@@ -117,8 +117,6 @@ class FitPOD : public Command {
 
   int save_descriptors;
   int compute_descriptors;
-  int save_pca_histogram;      // 0/1 flag: write PCA descriptor histogram
-  int pca_histogram_num_bins;  // number of in-span bins
   int kmeans_init;             // 0 = chunks in data order (legacy), 1 = quantiles of sorted data
   int kmeans_max_iter;         // maximum number of k-means iterations
   int cluster_min_configs;     // minimum number of training configurations per cluster (0 = off)

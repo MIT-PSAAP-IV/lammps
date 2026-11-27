@@ -164,8 +164,6 @@ class EAPOD : protected Pointers {
   double *invRightClusterRcut2;  // Right-hand side squared cutoff redius for each cluster (nClusters)
   double *leftClusterEdges;   // Left-hand side edge activation position for each cluster (nClusters)
   double *rightClusterEdges;  // Right-hand side edge activation position for each cluster (nClusters)
-  double *invPcaSpan;         // 1/(span centroid) per PCA component and element type (nComponents*nelements)
-  int *clusterOccupancy;      // training-atom count per cluster and element type (nClusters*nelements)
 
   // ---- active learning: calibrated QBC + per-expert leverage ----
   int uncertaintyflag;
@@ -245,7 +243,6 @@ class EAPOD : protected Pointers {
 
   void read_pod_file(const std::string &pod_file);
   void read_model_coeff_file(const std::string &coeff_file);
-  void read_cluster_occupancy_file(const std::string &coeff_file);
 
   void read_pair_radii(double **&arr, const std::vector<std::string> &words,
                        int Ne, const char *name);
@@ -347,8 +344,6 @@ class EAPOD : protected Pointers {
                            int *ind2, int n12);
 
   void calculateClusterEdges(int nClusters, double nActiveClusters, int nComponents, int nelements);
-
-  void calculatePcaSpan();
 };
 
 }    // namespace LAMMPS_NS
